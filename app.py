@@ -7,6 +7,14 @@ import views.comportamiento as vista_com
 import views.modulos_criticos as vista_mc
 
 st.set_page_config(layout="wide", page_title="Dashboard de Competencias Académicas", page_icon="📊")
+hide_streamlit_style = """
+    <style>
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+    header {visibility: hidden;}
+    </style>
+"""
+st.markdown(hide_streamlit_style, unsafe_allow_html=True)
 
 df, error = cargar_datos()
 if error:
