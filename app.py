@@ -50,8 +50,8 @@ else:
         opciones_menu = [
             "No Competentes",
             "Comportamiento Semanal de Docentes",
-            "Módulos Críticos y Recomendaciones",
-            "Visión Directiva"
+            "Módulos Críticos y Recomendaciones"
+            #"Visión Directiva"
         ]
     else:
         opciones_menu = [

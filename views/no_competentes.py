@@ -2,7 +2,6 @@ import streamlit as st
 import polars as pl
 import matplotlib.pyplot as plt
 
-
 def graficar_barras(df, columna):
     fig, ax = plt.subplots(figsize=(10, 6))
 
@@ -20,7 +19,6 @@ def graficar_barras(df, columna):
         ax.text(v + 0.5, i, f"{n} - {v:.1f}%", va='center', fontsize=9)
 
     st.pyplot(fig)
-
 
 def mostrar(df, plantel_usuario, es_admin):
     st.subheader("📉 Top 15 Docentes y Módulos con Mayor Porcentaje de No Competencia")
@@ -56,6 +54,3 @@ def mostrar(df, plantel_usuario, es_admin):
         graficar_barras(modulos, "MODULO")
     else:
         st.info("No hay datos disponibles.")
-
-
-
