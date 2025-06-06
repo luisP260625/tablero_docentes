@@ -23,7 +23,7 @@ def mostrar(df, plantel_usuario, es_admin):
     docente = st.selectbox("👨‍🏫 Selecciona un docente", sorted(docentes))
 
     df_docente = df.filter((df["Plantel"] == plantel) & (df["DOCENTE"] == docente))
-    
+
     df_agrupado = df_docente.group_by("Semana").agg(
         pl.sum("NO COMPETENTES").alias("NC"),
         pl.sum("TOTAL ALUMNOS").alias("TA")
@@ -43,14 +43,16 @@ def mostrar(df, plantel_usuario, es_admin):
 
     ultima_semana = df["Semana"].max()
 
-    df_modulos = df_docente.filter(df_docente["Semana"] == ultima_semana).group_by("MODULO").agg(
+    # Modificar la agrupación para incluir el semestre correctamente nombrado
+    df_modulos = df_docente.filter(df_docente["Semana"] == ultima_semana).group_by(["MODULO", "SEMESTRE"]).agg(
         pl.sum("NO COMPETENTES").alias("NO_COMP"),
         pl.sum("TOTAL ALUMNOS").alias("TOTAL"),
         (pl.sum("TOTAL ALUMNOS") - pl.sum("NO COMPETENTES")).alias("COMPETENTES"),
         (pl.sum("NO COMPETENTES") / pl.sum("TOTAL ALUMNOS") * 100).alias("PORCENTAJE_NO_COMP")
     ).sort("PORCENTAJE_NO_COMP", descending=True)
 
-    df_modulos = df_modulos.select(["MODULO", "NO_COMP", "COMPETENTES", "TOTAL", "PORCENTAJE_NO_COMP"])
+    df_modulos = df_modulos.select(["MODULO", "SEMESTRE", "NO_COMP", "COMPETENTES", "TOTAL", "PORCENTAJE_NO_COMP"])
+
     st.markdown(f"### 📘 Módulos asignados al docente en la semana {ultima_semana}")
     st.dataframe(df_modulos.to_pandas(), use_container_width=True)
 

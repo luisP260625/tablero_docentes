@@ -62,7 +62,7 @@ def mostrar(df, plantel_usuario, es_admin):
     # Mostrar tabla de docentes que impartieron el módulo en la última semana
     st.markdown(f"### 👨‍🏫 Docentes que impartieron el módulo en la semana {ultima_semana}")
 
-    df_docentes = df_modulo_ultima.group_by("DOCENTE").agg(
+    df_docentes = df_modulo_ultima.group_by(["DOCENTE", "SEMESTRE"]).agg(
         pl.sum("NO COMPETENTES").alias("NO_COMP"),
         pl.sum("TOTAL ALUMNOS").alias("TOTAL")
     ).with_columns([
@@ -71,7 +71,7 @@ def mostrar(df, plantel_usuario, es_admin):
     ]).sort("PORCENTAJE_NO_COMP", descending=True)
 
     # Reordenando las columnas antes de mostrarlas
-    df_docentes = df_docentes.select(["DOCENTE", "NO_COMP", "COMPETENTES", "TOTAL", "PORCENTAJE_NO_COMP"])
+    df_docentes = df_docentes.select(["DOCENTE", "SEMESTRE","NO_COMP", "COMPETENTES", "TOTAL", "PORCENTAJE_NO_COMP"])
 
     st.dataframe(df_docentes.to_pandas(), use_container_width=True)
 
