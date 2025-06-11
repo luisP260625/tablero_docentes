@@ -1,33 +1,29 @@
 import streamlit as st
 import pandas as pd
 from io import BytesIO
-from fpdf import FPDF
 from data.logger import obtener_bitacora
 
-def exportar_pdf(df):
-    pdf = FPDF()
-    pdf.add_page()
-    pdf.set_font("Arial", size=10)
-
-    col_widths = [60, 60, 70]
-    headers = ["Usuario", "Número de accesos", "Fechas de acceso"]
-    for i, h in enumerate(headers):
-        pdf.cell(col_widths[i], 10, h, border=1)
-    pdf.ln()
-
-    for _, row in df.iterrows():
-        fechas_texto = ", ".join(row["Fechas"])
-        fechas_truncadas = fechas_texto[:60] + "..." if len(fechas_texto) > 60 else fechas_texto
-
-        pdf.cell(col_widths[0], 10, str(row["Usuario"]), border=1)
-        pdf.cell(col_widths[1], 10, str(row["Accesos"]), border=1)
-        pdf.cell(col_widths[2], 10, fechas_truncadas, border=1)
-        pdf.ln()
-
-    # ✅ Exportación segura como PDF para Streamlit
+def exportar_excel(df):
     buffer = BytesIO()
-    pdf_bytes = pdf.output(dest='S').encode('latin1')
-    buffer.write(pdf_bytes)
+    with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
+        df.to_excel(writer, index=False, sheet_name='Bitácora')
+        workbook = writer.book
+        worksheet = writer.sheets['Bitácora']
+
+        # Formato opcional de encabezado
+        format_header = workbook.add_format({
+            'bold': True,
+            'bg_color': '#D9E1F2',
+            'border': 1
+        })
+        for col_num, value in enumerate(df.columns.values):
+            worksheet.write(0, col_num, value, format_header)
+
+        # Ajuste automático de ancho de columnas
+        for i, column in enumerate(df.columns):
+            column_width = max(df[column].astype(str).map(len).max(), len(column)) + 2
+            worksheet.set_column(i, i, column_width)
+
     buffer.seek(0)
     return buffer
 
@@ -42,10 +38,10 @@ def mostrar():
 
     st.dataframe(df_bitacora, use_container_width=True)
 
-    pdf_buffer = exportar_pdf(df_bitacora)
+    excel_buffer = exportar_excel(df_bitacora)
     st.download_button(
-        label="📄 Exportar Bitácora en PDF",
-        data=pdf_buffer,
-        file_name="bitacora_conexiones.pdf",
-        mime="application/pdf"
+        label="📊 Exportar Bitácora en Excel",
+        data=excel_buffer,
+        file_name="bitacora_conexiones.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
