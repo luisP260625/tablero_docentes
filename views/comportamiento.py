@@ -35,7 +35,7 @@ def mostrar(df, plantel_usuario, es_admin):
     porcentajes = [f"{(n / t * 100):.1f}%" if t > 0 else "0%" for n, t in zip(nc, ta)]
 
     # Generar la gráfica
-    fig, ax = plt.subplots(figsize=(10, 5))
+    fig, ax = plt.subplots(figsize=(10, 8))
     bars = ax.bar(semanas, nc, color="#C7B07C", edgecolor="white")
     for i, bar in enumerate(bars):
         ax.text(bar.get_x() + bar.get_width()/2, bar.get_height(), f"{nc[i]} - {porcentajes[i]}", ha='center', va='bottom')
@@ -44,14 +44,14 @@ def mostrar(df, plantel_usuario, es_admin):
     ultima_semana = df["Semana"].max()
 
     # Modificar la agrupación para incluir el semestre correctamente nombrado
-    df_modulos = df_docente.filter(df_docente["Semana"] == ultima_semana).group_by(["MODULO", "SEMESTRE","PCAPTURA"]).agg(
+    df_modulos = df_docente.filter(df_docente["Semana"] == ultima_semana).group_by(["MODULO", "SEMESTRE"]).agg(
         pl.sum("NO COMPETENTES").alias("NO_COMP"),
         pl.sum("TOTAL ALUMNOS").alias("TOTAL"),
         (pl.sum("TOTAL ALUMNOS") - pl.sum("NO COMPETENTES")).alias("COMPETENTES"),
         (pl.sum("NO COMPETENTES") / pl.sum("TOTAL ALUMNOS") * 100).alias("PORCENTAJE_NO_COMP")
     ).sort("PORCENTAJE_NO_COMP", descending=True)
 
-    df_modulos = df_modulos.select(["MODULO", "SEMESTRE", "PCAPTURA", "NO_COMP", "COMPETENTES", "TOTAL", "PORCENTAJE_NO_COMP"])
+    df_modulos = df_modulos.select(["MODULO", "SEMESTRE", "NO_COMP", "COMPETENTES", "TOTAL", "PORCENTAJE_NO_COMP"])
 
     st.markdown(f"### 📘 Módulos asignados al docente en la semana {ultima_semana}")
     st.dataframe(df_modulos.to_pandas(), use_container_width=True)

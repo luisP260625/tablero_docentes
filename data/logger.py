@@ -1,16 +1,29 @@
-import datetime
+import os
+import pandas as pd
+from datetime import datetime
+
+LOG_FILE = "data/bitacora.csv"
 
 def registrar_acceso(usuario):
-    """Registra el acceso en un archivo de texto con fecha y hora."""
-    with open("data/accesos.log", "a") as archivo:
-        fecha_hora = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        archivo.write(f"{fecha_hora}, Usuario: {usuario}\n")
+    fecha = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(LOG_FILE, "a") as f:
+        f.write(f"{usuario},{fecha}\n")
 
 def contar_accesos(usuario):
-    """Cuenta cuántas veces ha ingresado un usuario al sistema."""
-    try:
-        with open("data/accesos.log", "r") as archivo:
-            registros = archivo.readlines()
-        return sum(1 for linea in registros if f"Usuario: {usuario}" in linea)
-    except FileNotFoundError:
-        return 0  # Si el archivo no existe, el usuario no ha ingresado aún
+    if not os.path.exists(LOG_FILE):
+        return 0
+    df = pd.read_csv(LOG_FILE, names=["Usuario", "Fecha"])
+    return df[df["Usuario"] == usuario].shape[0]
+
+def obtener_bitacora():
+    if not os.path.exists(LOG_FILE):
+        return pd.DataFrame(columns=["Usuario", "Accesos", "Fechas"])
+
+    df = pd.read_csv(LOG_FILE, names=["Usuario", "Fecha"])
+    df["Fecha"] = pd.to_datetime(df["Fecha"])
+
+    resumen = df.groupby("Usuario").agg({
+        "Fecha": [("Accesos", "count"), ("Fechas", lambda x: x.dt.strftime("%Y-%m-%d").tolist())]
+    }).reset_index()
+    resumen.columns = ["Usuario", "Accesos", "Fechas"]
+    return resumen
