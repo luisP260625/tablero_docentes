@@ -53,6 +53,11 @@ def mostrar(df, plantel_usuario, es_admin):
 
     df_modulos = df_modulos.select(["MODULO", "SEMESTRE", "NO_COMP", "COMPETENTES", "TOTAL", "PORCENTAJE_NO_COMP"])
 
+    # Filtrar filas donde TOTAL sea 0 o PORCENTAJE_NO_COMP sea nulo (None/NaN)
+    df_modulos = df_modulos.filter(
+        (pl.col("TOTAL") > 0) & (pl.col("PORCENTAJE_NO_COMP").is_not_null())
+    )
+
     st.markdown(f"### 📘 Módulos asignados al docente en la semana {ultima_semana}")
     st.dataframe(df_modulos.to_pandas(), use_container_width=True)
 
