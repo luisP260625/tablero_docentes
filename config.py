@@ -1,4 +1,7 @@
 EXCEL_FILE = "assets/Datos1.xlsx"
 SHEET_DATOS = "Datos"
 SHEET_PLANTELES = "Planteles"
+SHEET_SEMCAPTURA = "SemCaptura"
+RUTA_EXCEL_SEMCAPTURA = EXCEL_FILE
+
 

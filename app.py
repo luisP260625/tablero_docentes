@@ -96,32 +96,32 @@ else:
     # Menú dinámico
     if st.session_state.administrador:
         opciones_menu = [
-            "No Competentes",
-            "Estatal de No Competencia",
-            "Comportamiento Semanal de Docentes",
-            "Módulos Críticos y Recomendaciones",
+            "Docentes y Módulos",
+            "Estatal Docentes y Módulos",
+            "Docentes Seguimiento",
+            "Módulos Seguimiento",
             "Bitácora de Conexiones"
         ]
     else:
         opciones_menu = [
-            "No Competentes",
-            "Comportamiento Semanal de Docentes",
-            "Módulos Críticos y Recomendaciones"
+            "Docentes y Módulos",
+            "Docentes Seguimiento",
+            "Módulos Seguimiento"
         ]
 
     opcion = st.sidebar.selectbox("📌 Menú", opciones_menu)
 
     # Renderizado de vista
-    if opcion == "No Competentes":
+    if opcion == "Docentes y Módulos":
         vista_nc.mostrar(df, st.session_state.plantel_usuario, st.session_state.administrador)
 
-    elif opcion == "Estatal de No Competencia" and st.session_state.administrador:
+    elif opcion == "Estatal Docentes y Módulos" and st.session_state.administrador:
         vista_estatal.mostrar_estatal(df)
 
-    elif opcion == "Comportamiento Semanal de Docentes":
+    elif opcion == "Docentes Seguimiento":
         vista_com.mostrar(df, st.session_state.plantel_usuario, st.session_state.administrador)
 
-    elif opcion == "Módulos Críticos y Recomendaciones":
+    elif opcion == "Módulos Seguimiento":
         vista_mc.mostrar(df, st.session_state.plantel_usuario, st.session_state.administrador)
 
     elif opcion == "Bitácora de Conexiones" and st.session_state.administrador:

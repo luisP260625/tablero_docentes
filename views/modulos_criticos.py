@@ -1,16 +1,31 @@
 import streamlit as st
 import polars as pl
 import matplotlib.pyplot as plt
+import os
 from utils.helpers import to_excel
+from config import RUTA_EXCEL_SEMCAPTURA
+
+@st.cache_data
+def cargar_semcaptura():
+    if not os.path.exists(RUTA_EXCEL_SEMCAPTURA):
+        st.error("❌ No se encontró el archivo 'Datos1.xlsx' en la carpeta 'assets'.")
+        return None
+    try:
+        return pl.read_excel(RUTA_EXCEL_SEMCAPTURA, sheet_name="SemCaptura")
+    except Exception as e:
+        st.error(f"❌ Error al leer la hoja 'SemCaptura': {e}")
+        return None
 
 def mostrar(df, plantel_usuario, es_admin):
+    df_semcaptura = cargar_semcaptura()
+    if df_semcaptura is None:
+        st.stop()
+
     st.subheader("🚩 Módulos Críticos por Semana y Docente")
 
-    # Selección de plantel
     plantel = st.selectbox("🏫 Selecciona un plantel", sorted(df["Plantel"].unique())) if es_admin else plantel_usuario
     df_plantel = df.filter(pl.col("Plantel") == plantel)
 
-    # Agrupar datos y calcular porcentaje de no competentes
     modulos_criticos = df_plantel.group_by(["Semana", "MODULO", "DOCENTE"]).agg(
         pl.sum("NO COMPETENTES").alias("NO_COMP"),
         pl.sum("TOTAL ALUMNOS").alias("TOTAL")
@@ -22,14 +37,11 @@ def mostrar(df, plantel_usuario, es_admin):
         st.info("No hay módulos en el plantel seleccionado.")
         return
 
-    # Selección de módulo
     modulos_disponibles = sorted(modulos_criticos["MODULO"].unique().to_list())
     modulo = st.selectbox("📚 Selecciona un módulo crítico", modulos_disponibles)
 
-    # Filtrar datos del módulo
     df_modulo_completo = df_plantel.filter(pl.col("MODULO") == modulo)
 
-    # Gráfica de evolución semanal
     st.markdown(f"### 📊 Seguimiento semanal de No Competentes en el módulo: {modulo}")
     df_semanal = df_modulo_completo.group_by("Semana").agg(
         pl.sum("NO COMPETENTES").alias("NO_COMP"),
@@ -51,25 +63,21 @@ def mostrar(df, plantel_usuario, es_admin):
     ax.set_title(f"Evolución semanal del módulo {modulo}")
     st.pyplot(fig)
 
-    # Última semana disponible
     ultima_semana = df_modulo_completo["Semana"].max()
     df_modulo_ultima = df_modulo_completo.filter(pl.col("Semana") == ultima_semana)
 
     st.markdown(f"### 👨‍🏫 Docentes que impartieron el módulo en la semana {ultima_semana}")
-
     docentes = df_modulo_ultima["DOCENTE"].unique().to_list()
 
     for docente in docentes:
         st.markdown(f"#### 👤 Docente: {docente}")
         df_docente = df_modulo_ultima.filter(pl.col("DOCENTE") == docente)
 
-        # Primera tabla: resumen por semestre (con lógica robusta para eliminar filas vacías)
         resumen_1 = df_docente.group_by("SEMESTRE").agg(
             pl.sum("NO COMPETENTES").alias("NO_COMP"),
             pl.sum("TOTAL ALUMNOS").alias("TOTAL")
         ).with_columns([
-            (pl.col("TOTAL") - pl.col("NO_COMP")).alias("COMPETENTES")
-        ]).with_columns([
+            (pl.col("TOTAL") - pl.col("NO_COMP")).alias("COMPETENTES"),
             (pl.col("NO_COMP") / pl.when(pl.col("TOTAL") > 0).then(pl.col("TOTAL")).otherwise(1).cast(pl.Float64) * 100)
             .round(2).alias("PORCENTAJE_NO_COMP")
         ])
@@ -96,24 +104,27 @@ def mostrar(df, plantel_usuario, es_admin):
             st.markdown("**📌 Resumen por semestre**")
             st.dataframe(resumen_1_filtrado.to_pandas(), use_container_width=True)
         else:
-            st.info("📭 No hay datos relevantes en el resumen por semestre para este docente.")
+            st.info("📬 No hay datos relevantes en el resumen por semestre para este docente.")
 
-        # Segunda tabla: detalle por grupo (incluye ESTATUS)
-        columnas_detalle = [
+        # Segunda tabla: sin agrupaciones, muestra detalle completo de cada fila original
+        df_sem_grupo = df_semcaptura.filter(
+            (pl.col("Plantel") == plantel) &
+            (pl.col("DOCENTE") == docente) &
+            (pl.col("MODULO") == modulo)
+        )
+
+        columnas = [
             "GRUPO", "UAPRENDIZAJE", "RAPRENDIZAJE",
             "IEVALUAR", "IEVALUADOS", "PCAPTURA", "TOTALE", "ESTATUS"
         ]
-        resumen_2 = df_docente.select(columnas_detalle)
+
+        resumen_2 = df_sem_grupo.select(columnas).sort(["GRUPO", "RAPRENDIZAJE"])
         resumen_2_clean = resumen_2.fill_null(0)
 
         resumen_2_filtrado = resumen_2_clean.filter(
             ~(
-                (pl.col("GRUPO") == 0) &
-                (pl.col("UAPRENDIZAJE") == 0) &
-                (pl.col("RAPRENDIZAJE") == 0) &
                 (pl.col("IEVALUAR") == 0) &
                 (pl.col("IEVALUADOS") == 0) &
-                (pl.col("PCAPTURA") == 0) &
                 (pl.col("TOTALE") == 0)
             )
         )
@@ -122,12 +133,11 @@ def mostrar(df, plantel_usuario, es_admin):
             st.markdown("**📄 Detalle por grupo: El porcentaje de captura que se presenta, corresponde al conjunto de los indicadores evaluados.**")
             st.dataframe(resumen_2_filtrado.to_pandas(), use_container_width=True)
         else:
-            st.info("📭 No hay información detallada por grupo para este docente.")
+            st.info("📬 No hay información detallada por grupo para este docente.")
 
-    # Botón de descarga
     excel_data = to_excel(df_modulo_completo.to_pandas())
     st.download_button(
-        label="📥 Descargar reporte detallado del módulo",
+        label="📅 Descargar reporte detallado del módulo",
         data=excel_data,
         file_name=f"modulo_{modulo}_detalle.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
