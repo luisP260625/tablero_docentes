@@ -13,7 +13,7 @@ def mostrar_modulos_reincidentes(df):
         df.group_by(["Semana", "MODULO", "Plantel"])
         .agg(pl.mean("PORCENTAJE").alias("PORCENTAJE_SEMANA"))
         .with_columns(
-            (pl.col("PORCENTAJE_SEMANA") >= 50).cast(pl.Int8).alias("ES_CRITICO")
+            (pl.col("PORCENTAJE_SEMANA") >= 30).cast(pl.Int8).alias("ES_CRITICO")
         )
     )
 
