@@ -2,6 +2,9 @@ import streamlit as st
 from data.loader import cargar_datos
 from data.validator import validar_usuario
 from data.logger import registrar_acceso, contar_accesos
+from views.ranking_docentes_modulos import mostrar_ranking_por_plantel
+
+
 import os
 
 # Vistas
@@ -47,8 +50,6 @@ if "logueado" not in st.session_state or not st.session_state.logueado:
         st.image(ruta_imagen, use_container_width=True)
     else:
         st.warning("⚠️ No se encontró la imagen en 'utils/ImagenDashDocentes.png'.")
-
-    #st.markdown("<h1 style='text-align: center; color: #b46b42;'>SEGUIMIENTO A DOCENTES</h1>", unsafe_allow_html=True)
 
 # Cargar datos
 df, error = cargar_datos()
@@ -106,7 +107,8 @@ else:
         opciones_menu = [
             "Docentes y Módulos",
             "Docentes Seguimiento",
-            "Módulos Seguimiento"
+            "Módulos Seguimiento",
+            "Ranking por docentes y módulos"
         ]
 
     opcion = st.sidebar.selectbox("📌 Menú", opciones_menu)
@@ -126,3 +128,6 @@ else:
 
     elif opcion == "Bitácora de Conexiones" and st.session_state.administrador:
         vista_bc.mostrar()
+
+    elif opcion == "Ranking por docentes y módulos":
+        mostrar_ranking_por_plantel(df, st.session_state["plantel_usuario"])

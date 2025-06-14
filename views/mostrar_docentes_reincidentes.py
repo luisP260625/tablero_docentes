@@ -3,20 +3,27 @@ import polars as pl
 from utils.descarga import descargar_csv
 
 def mostrar_docentes_reincidentes(df):
-    st.markdown("### 🧍‍♂️ Docentes Críticos Constantes")
+    st.markdown("### 🧍‍♂️ Docentes Reincidentes a Nivel General")
 
+    # Calcular porcentaje por fila
     df = df.with_columns(
         (pl.col("NO COMPETENTES") / pl.col("TOTAL ALUMNOS") * 100).alias("PORCENTAJE")
     )
 
+    # Agrupar por DOCENTE + Semana + Plantel
     por_docente_semana = (
-        df.group_by(["Semana", "DOCENTE", "Plantel"])
-        .agg(pl.mean("PORCENTAJE").alias("PORCENTAJE_SEMANA"))
-        .with_columns(
-            (pl.col("PORCENTAJE_SEMANA") >= 30).cast(pl.Int8).alias("ES_CRITICO")
-        )
+        df.group_by(["DOCENTE", "Semana", "Plantel"])
+        .agg([
+            pl.sum("NO COMPETENTES").alias("NC"),
+            pl.sum("TOTAL ALUMNOS").alias("TA")
+        ])
+        .with_columns([
+            ((pl.col("NC") / pl.col("TA")) * 100).alias("PORCENTAJE_SEMANA"),
+            ((pl.col("NC") / pl.col("TA")) * 100 >= 30).cast(pl.Int8).alias("ES_CRITICO")
+        ])
     )
 
+    # Agrupar por DOCENTE y Plantel
     estadisticas = (
         por_docente_semana
         .group_by(["DOCENTE", "Plantel"])
@@ -31,4 +38,4 @@ def mostrar_docentes_reincidentes(df):
 
     st.dataframe(estadisticas.to_pandas())
     descargar_csv("docentes_reincidentes", estadisticas)
-    st.info("Se muestran solo docentes que han mantenido ≥50% de no competencia en todas las semanas donde aparecen.")
+    st.info("Se muestran solo docentes que han tenido ≥30% de no competencia en **todas** las semanas donde han participado, incluyendo su plantel.")
