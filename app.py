@@ -1,11 +1,11 @@
 import streamlit as st
+import os
+
+# Importación de funciones y vistas
 from data.loader import cargar_datos
 from data.validator import validar_usuario
 from data.logger import registrar_acceso, contar_accesos
 from views.ranking_docentes_modulos import mostrar_ranking_por_plantel
-
-
-import os
 
 # Vistas
 import views.no_competentes as vista_nc
@@ -51,12 +51,6 @@ if "logueado" not in st.session_state or not st.session_state.logueado:
     else:
         st.warning("⚠️ No se encontró la imagen en 'utils/ImagenDashDocentes.png'.")
 
-# Cargar datos
-df, error = cargar_datos()
-if error:
-    st.error(f"Error al cargar los datos: {error}")
-    st.stop()
-
 # Inicializar sesión
 if "logueado" not in st.session_state:
     st.session_state.update({
@@ -89,10 +83,17 @@ if not st.session_state.logueado:
 
 # Usuario logueado
 else:
+    # Botón de cerrar sesión
     if st.sidebar.button("Cerrar sesión"):
         for key in ["logueado", "plantel_usuario", "administrador"]:
             st.session_state.pop(key, None)
         st.rerun()
+
+    # Cargar datos solo si el usuario está logueado
+    df, error = cargar_datos()
+    if error:
+        st.error(f"Error al cargar los datos: {error}")
+        st.stop()
 
     # Menú dinámico
     if st.session_state.administrador:
