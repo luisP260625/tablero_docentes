@@ -37,6 +37,9 @@ def mostrar_modulos_reincidentes(df):
         .head(15)
     )
 
+    # Eliminar columna 'Total_Semanas' antes de mostrar y exportar
+    estadisticas = estadisticas.drop("Total_Semanas")
+
     st.dataframe(estadisticas.to_pandas())
     descargar_csv("modulos_reincidentes", estadisticas)
     st.info("Se muestran solo módulos que han mantenido ≥30% de no competencia en todas las semanas donde aparecen.")

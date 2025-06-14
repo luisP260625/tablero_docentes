@@ -36,6 +36,9 @@ def mostrar_docentes_reincidentes(df):
         .sort("Total_Semanas", descending=True)
     )
 
+    # Eliminar columna 'Total_Semanas' antes de mostrar y exportar
+    estadisticas = estadisticas.drop("Total_Semanas")
+
     st.dataframe(estadisticas.to_pandas())
     descargar_csv("docentes_reincidentes", estadisticas)
     st.info("Se muestran solo docentes que han tenido ≥30% de no competencia en **todas** las semanas donde han participado, incluyendo su plantel.")
