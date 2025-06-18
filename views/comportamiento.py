@@ -38,7 +38,7 @@ def mostrar(df, plantel_usuario, es_admin):
     fig, ax = plt.subplots(figsize=(10, 8))
     bars = ax.bar(semanas, nc, color="#C7B07C", edgecolor="white")
     for i, bar in enumerate(bars):
-        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height(), f"{nc[i]} - {porcentajes[i]}", ha='center', va='bottom')
+        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height(), f"{nc[i]} - {porcentajes[i]}", ha='center', va='bottom',fontsize=8,rotation=90)
     st.pyplot(fig)
 
     ultima_semana = df["Semana"].max()
