@@ -17,13 +17,17 @@ import views.bitacora_conexiones as vista_bc
 # Configuración de la página
 st.set_page_config(layout="wide", page_title="Dashboard de Competencias Académicas", page_icon="📊")
 
-# 🔁 Reset de sesión vía URL (temporal)
-if st.query_params.get("reset") == "1":
-    for key in list(st.session_state.keys()):
-        del st.session_state[key]
+# 🔁 Reset de sesión (manejo seguro)
+if "reset_pending" not in st.session_state and st.query_params.get("reset") == "1":
+    st.session_state["reset_pending"] = True
+    st.stop()
+
+if st.session_state.get("reset_pending", False):
+    st.session_state.clear()
+    st.session_state["reset_pending"] = False
     st.experimental_rerun()
 
-# Estilos dinámicos
+# Estilos dinámicos según estado
 if "logueado" not in st.session_state or not st.session_state.logueado:
     fondo_color = "#f4f6fa"
     texto_color = "#b46b42"
@@ -64,10 +68,6 @@ if "logueado" not in st.session_state:
         "plantel_usuario": None,
         "administrador": False
     })
-
-# Debug: mostrar estado de sesión actual
-st.sidebar.caption("Debug → Estado de sesión")
-st.sidebar.write("Logueado:", st.session_state.logueado)
 
 # Pantalla de inicio de sesión
 if not st.session_state.logueado:
@@ -142,4 +142,3 @@ else:
 
     elif opcion == "Ranking por docentes y módulos":
         mostrar_ranking_por_plantel(df, st.session_state["plantel_usuario"])
-
