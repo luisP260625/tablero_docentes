@@ -1,6 +1,13 @@
 import streamlit as st
 import os
 
+# --- MANEJO FIABLE DE RESET VIA URL ---
+reset = st.query_params.get("reset") == "1"
+if reset:
+    st.session_state.clear()
+    st.query_params.clear()
+    st.rerun()
+
 # Importación de funciones y vistas
 from data.loader import cargar_datos
 from data.validator import validar_usuario
@@ -16,16 +23,6 @@ import views.bitacora_conexiones as vista_bc
 
 # Configuración de la página
 st.set_page_config(layout="wide", page_title="Dashboard de Competencias Académicas", page_icon="📊")
-
-# 🔁 Reset de sesión (manejo seguro)
-if "reset_pending" not in st.session_state and st.query_params.get("reset") == "1":
-    st.session_state["reset_pending"] = True
-    st.stop()
-
-if st.session_state.get("reset_pending", False):
-    st.session_state.clear()
-    st.session_state["reset_pending"] = False
-    st.experimental_rerun()
 
 # Estilos dinámicos según estado
 if "logueado" not in st.session_state or not st.session_state.logueado:
