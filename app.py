@@ -1,6 +1,9 @@
 import streamlit as st
 import os
 
+# --- Confirmación de ejecución del archivo correcto ---
+st.info("🛠️ Este es el archivo app.py que se está ejecutando.")
+
 # --- MANEJO FIABLE DE RESET VIA URL ---
 reset = st.query_params.get("reset") == "1"
 if reset:
@@ -8,26 +11,24 @@ if reset:
     st.query_params.clear()
     st.rerun()
 
-# Importación de funciones y vistas
+# --- IMPORTACIÓN DE FUNCIONES Y VISTAS ---
 from data.loader import cargar_datos
 from data.validator import validar_usuario
 from data.logger import registrar_acceso, contar_accesos
 from views.ranking_docentes_modulos import mostrar_ranking_por_plantel
-
-# Vistas
 import views.no_competentes as vista_nc
 import views.comportamiento as vista_com
 import views.modulos_criticos as vista_mc
 import views.mostrar_estatal as vista_estatal
 import views.bitacora_conexiones as vista_bc
 
-# Configuración de la página
+# --- CONFIGURACIÓN DE LA PÁGINA ---
 st.set_page_config(layout="wide", page_title="Dashboard de Competencias Académicas", page_icon="📊")
 
-# 🔍 DEBUG: Mostrar contenido actual de session_state
+# --- DEBUG: Mostrar contenido actual de session_state ---
 st.sidebar.write("🛠️ Debug sesión:", dict(st.session_state))
 
-# Estilos dinámicos según estado
+# --- ESTILOS DINÁMICOS SEGÚN ESTADO ---
 if "logueado" not in st.session_state or not st.session_state.logueado:
     fondo_color = "#f4f6fa"
     texto_color = "#b46b42"
@@ -53,7 +54,7 @@ custom_styles = f"""
 """
 st.markdown(custom_styles, unsafe_allow_html=True)
 
-# Mostrar imagen antes del login
+# --- MOSTRAR IMAGEN INICIAL ---
 if "logueado" not in st.session_state or not st.session_state.logueado:
     ruta_imagen = "utils/ImagenDashDocentes.png"
     if os.path.exists(ruta_imagen):
@@ -61,7 +62,7 @@ if "logueado" not in st.session_state or not st.session_state.logueado:
     else:
         st.warning("⚠️ No se encontró la imagen en 'utils/ImagenDashDocentes.png'.")
 
-# Inicializar variables de sesión
+# --- INICIALIZACIÓN DE VARIABLES DE SESIÓN ---
 if "logueado" not in st.session_state:
     st.session_state.update({
         "logueado": False,
@@ -69,11 +70,13 @@ if "logueado" not in st.session_state:
         "administrador": False
     })
 
-# Pantalla de inicio de sesión
+# --- LOGIN ---
 if not st.session_state.logueado:
     st.sidebar.title("🔒 Inicio de sesión")
     usuario = st.sidebar.text_input("Usuario")
     contrasena = st.sidebar.text_input("Contraseña", type="password")
+
+    st.warning("🧪 Login activo pero aún no ingresado")  # Diagnóstico visible
 
     if st.sidebar.button("Iniciar sesión"):
         ok, plantel, es_admin = validar_usuario(usuario, contrasena)
@@ -91,9 +94,8 @@ if not st.session_state.logueado:
         else:
             st.sidebar.error("Acceso denegado. Verifica tus credenciales.")
 
-# Usuario logueado
+# --- CONTENIDO DEL DASHBOARD ---
 else:
-    # Botón para cerrar sesión
     if st.sidebar.button("Cerrar sesión"):
         for key in ["logueado", "plantel_usuario", "administrador"]:
             st.session_state.pop(key, None)
