@@ -24,6 +24,9 @@ import views.bitacora_conexiones as vista_bc
 # Configuración de la página
 st.set_page_config(layout="wide", page_title="Dashboard de Competencias Académicas", page_icon="📊")
 
+# 🔍 DEBUG: Mostrar contenido actual de session_state
+st.sidebar.write("🛠️ Debug sesión:", dict(st.session_state))
+
 # Estilos dinámicos según estado
 if "logueado" not in st.session_state or not st.session_state.logueado:
     fondo_color = "#f4f6fa"
