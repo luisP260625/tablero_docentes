@@ -4,14 +4,14 @@ import os
 # --- Confirmación de ejecución del archivo correcto ---
 st.info("🛠️ Este es el archivo app.py que se está ejecutando.")
 
-# --- MANEJO FIABLE DE RESET VIA URL ---
+# --- RESET SEGURO VIA URL ---
 reset = st.query_params.get("reset") == "1"
 if reset:
     st.session_state.clear()
     st.query_params.clear()
     st.rerun()
 
-# --- IMPORTACIÓN DE FUNCIONES Y VISTAS ---
+# --- IMPORTACIONES ---
 from data.loader import cargar_datos
 from data.validator import validar_usuario
 from data.logger import registrar_acceso, contar_accesos
@@ -22,13 +22,13 @@ import views.modulos_criticos as vista_mc
 import views.mostrar_estatal as vista_estatal
 import views.bitacora_conexiones as vista_bc
 
-# --- CONFIGURACIÓN DE LA PÁGINA ---
+# --- CONFIGURACIÓN DE PÁGINA ---
 st.set_page_config(layout="wide", page_title="Dashboard de Competencias Académicas", page_icon="📊")
 
-# --- DEBUG: Mostrar contenido actual de session_state ---
+# --- DEBUG: Mostrar estado actual ---
 st.sidebar.write("🛠️ Debug sesión:", dict(st.session_state))
 
-# --- ESTILOS DINÁMICOS SEGÚN ESTADO ---
+# --- ESTILOS PERSONALIZADOS ---
 if "logueado" not in st.session_state or not st.session_state.logueado:
     fondo_color = "#f4f6fa"
     texto_color = "#b46b42"
@@ -36,7 +36,7 @@ else:
     fondo_color = "white"
     texto_color = "black"
 
-custom_styles = f"""
+st.markdown(f"""
     <style>
     #MainMenu, footer, header {{visibility: hidden;}}
     .stApp {{
@@ -51,10 +51,9 @@ custom_styles = f"""
         width: 320px !important;
     }}
     </style>
-"""
-st.markdown(custom_styles, unsafe_allow_html=True)
+""", unsafe_allow_html=True)
 
-# --- MOSTRAR IMAGEN INICIAL ---
+# --- MOSTRAR IMAGEN DE PORTADA SI NO ESTÁ LOGUEADO ---
 if "logueado" not in st.session_state or not st.session_state.logueado:
     ruta_imagen = "utils/ImagenDashDocentes.png"
     if os.path.exists(ruta_imagen):
@@ -73,10 +72,12 @@ if "logueado" not in st.session_state:
 # --- LOGIN ---
 if not st.session_state.logueado:
     st.sidebar.title("🔒 Inicio de sesión")
-    usuario = st.sidebar.text_input("Usuario")
-    contrasena = st.sidebar.text_input("Contraseña", type="password")
+    st.sidebar.markdown("Ingresa tus credenciales para continuar.")
 
-    st.warning("🧪 Login activo pero aún no ingresado")  # Diagnóstico visible
+    usuario = st.sidebar.text_input("👤 Usuario", key="login_usuario")
+    contrasena = st.sidebar.text_input("🔑 Contraseña", type="password", key="login_contrasena")
+
+    st.warning("🧪 Login activo pero aún no ingresado")
 
     if st.sidebar.button("Iniciar sesión"):
         ok, plantel, es_admin = validar_usuario(usuario, contrasena)
@@ -94,7 +95,7 @@ if not st.session_state.logueado:
         else:
             st.sidebar.error("Acceso denegado. Verifica tus credenciales.")
 
-# --- CONTENIDO DEL DASHBOARD ---
+# --- DASHBOARD PRINCIPAL ---
 else:
     if st.sidebar.button("Cerrar sesión"):
         for key in ["logueado", "plantel_usuario", "administrador"]:
@@ -126,7 +127,7 @@ else:
 
     opcion = st.sidebar.selectbox("📌 Menú", opciones_menu)
 
-    # Renderizado de vista
+    # Mostrar vista correspondiente
     if opcion == "Docentes y Módulos":
         vista_nc.mostrar(df, st.session_state.plantel_usuario, st.session_state.administrador)
 
