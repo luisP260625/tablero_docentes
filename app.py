@@ -17,6 +17,12 @@ import views.bitacora_conexiones as vista_bc
 # Configuración de la página
 st.set_page_config(layout="wide", page_title="Dashboard de Competencias Académicas", page_icon="📊")
 
+# 🔁 Reset de sesión vía URL (temporal)
+if st.query_params.get("reset") == "1":
+    for key in list(st.session_state.keys()):
+        del st.session_state[key]
+    st.experimental_rerun()
+
 # Estilos dinámicos
 if "logueado" not in st.session_state or not st.session_state.logueado:
     fondo_color = "#f4f6fa"
@@ -51,13 +57,17 @@ if "logueado" not in st.session_state or not st.session_state.logueado:
     else:
         st.warning("⚠️ No se encontró la imagen en 'utils/ImagenDashDocentes.png'.")
 
-# Inicializar sesión
+# Inicializar variables de sesión
 if "logueado" not in st.session_state:
     st.session_state.update({
         "logueado": False,
         "plantel_usuario": None,
         "administrador": False
     })
+
+# Debug: mostrar estado de sesión actual
+st.sidebar.caption("Debug → Estado de sesión")
+st.sidebar.write("Logueado:", st.session_state.logueado)
 
 # Pantalla de inicio de sesión
 if not st.session_state.logueado:
@@ -83,13 +93,13 @@ if not st.session_state.logueado:
 
 # Usuario logueado
 else:
-    # Botón de cerrar sesión
+    # Botón para cerrar sesión
     if st.sidebar.button("Cerrar sesión"):
         for key in ["logueado", "plantel_usuario", "administrador"]:
             st.session_state.pop(key, None)
         st.rerun()
 
-    # Cargar datos solo si el usuario está logueado
+    # Cargar datos
     df, error = cargar_datos()
     if error:
         st.error(f"Error al cargar los datos: {error}")
@@ -132,3 +142,4 @@ else:
 
     elif opcion == "Ranking por docentes y módulos":
         mostrar_ranking_por_plantel(df, st.session_state["plantel_usuario"])
+
