@@ -55,7 +55,7 @@ st.markdown(custom_styles, unsafe_allow_html=True)
 
 # Mostrar imagen antes del login
 if "logueado" not in st.session_state or not st.session_state.logueado:
-    ruta_imagen = "utils/ImagenDashDocentes.png"
+    ruta_imagen = "utils/ImagenDashDocentesxx.png"
     if os.path.exists(ruta_imagen):
         st.image(ruta_imagen, use_container_width=True)
     else:
