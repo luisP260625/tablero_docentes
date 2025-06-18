@@ -18,7 +18,7 @@ import views.bitacora_conexiones as vista_bc
 st.set_page_config(layout="wide", page_title="Dashboard de Competencias Académicas", page_icon="📊")
 
 # Estilos dinámicos
-if "logueado" not in st.session_state or not st.session_state.logueado:
+if not st.session_state.get("logueado", False):
     fondo_color = "#f4f6fa"
     texto_color = "#b46b42"
 else:
@@ -43,14 +43,6 @@ custom_styles = f"""
 """
 st.markdown(custom_styles, unsafe_allow_html=True)
 
-# Mostrar imagen antes del login
-if "logueado" not in st.session_state or not st.session_state.logueado:
-    ruta_imagen = "utils/ImagenDashDocentes.png"
-    if os.path.exists(ruta_imagen):
-        st.image(ruta_imagen, use_container_width=True)
-    else:
-        st.warning("⚠️ No se encontró la imagen en 'utils/ImagenDashDocentes.png'.")
-
 # Inicializar sesión
 if "logueado" not in st.session_state:
     st.session_state.update({
@@ -59,7 +51,7 @@ if "logueado" not in st.session_state:
         "administrador": False
     })
 
-# Pantalla de inicio de sesión
+# Mostrar solo formulario de login si no está logueado
 if not st.session_state.logueado:
     st.sidebar.title("🔒 Inicio de sesión")
     usuario = st.sidebar.text_input("Usuario")
@@ -70,7 +62,6 @@ if not st.session_state.logueado:
         if ok:
             registrar_acceso(usuario)
             num_accesos = contar_accesos(usuario)
-            st.sidebar.info(f"{usuario} ha ingresado {num_accesos} veces")
 
             st.session_state.update({
                 "logueado": True,
@@ -80,13 +71,13 @@ if not st.session_state.logueado:
             st.rerun()
         else:
             st.sidebar.error("Acceso denegado. Verifica tus credenciales.")
+    st.stop()  # Evita mostrar cualquier otra cosa si no ha iniciado sesión
 
 # Usuario logueado
-else:
+if st.session_state.logueado:
     # Botón de cerrar sesión
     if st.sidebar.button("Cerrar sesión"):
-        for key in ["logueado", "plantel_usuario", "administrador"]:
-            st.session_state.pop(key, None)
+        st.session_state.clear()
         st.rerun()
 
     # Cargar datos solo si el usuario está logueado
@@ -95,7 +86,7 @@ else:
         st.error(f"Error al cargar los datos: {error}")
         st.stop()
 
-    # Menú dinámico
+    # Menú dinámico según si es administrador
     if st.session_state.administrador:
         opciones_menu = [
             "Docentes y Módulos",
