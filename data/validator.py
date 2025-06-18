@@ -6,7 +6,7 @@ import streamlit as st
 @st.cache_data(ttl=600)
 def validar_usuario(user, password):
     # Caso especial hardcodeado para admin
-    if user.lower() == "admin" and password == "admin":
+    if user.lower() == "admin" and password == "administrador":
         return True, "ADMIN", True
 
     try:
