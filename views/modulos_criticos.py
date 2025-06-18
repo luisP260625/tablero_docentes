@@ -42,7 +42,7 @@ def mostrar(df, plantel_usuario, es_admin):
 
     df_modulo_completo = df_plantel.filter(pl.col("MODULO") == modulo)
 
-    st.markdown(f"### 📊 Seguimiento semanal de No Competentes en el módulo: {modulo}")
+    st.markdown(f"### 📊 Seguimiento semanal del módulo: {modulo}")
     df_semanal = df_modulo_completo.group_by("Semana").agg(
         pl.sum("NO COMPETENTES").alias("NO_COMP"),
         pl.sum("TOTAL ALUMNOS").alias("TOTAL")
@@ -55,12 +55,13 @@ def mostrar(df, plantel_usuario, es_admin):
     ta = df_semanal["TOTAL"]
     porcentajes = [f"{(n / t * 100):.1f}%" if t > 0 else "0%" for n, t in zip(nc, ta)]
 
-    fig, ax = plt.subplots(figsize=(10, 5))
+    fig, ax = plt.subplots(figsize=(8, 3))
     bars = ax.bar(semanas, nc, color="firebrick", edgecolor="firebrick")
     for i, bar in enumerate(bars):
-        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height(), f"{nc[i]} - {porcentajes[i]}", ha='center', va='bottom')
-    ax.set_ylabel("No Competentes")
-    ax.set_title(f"Evolución semanal del módulo {modulo}")
+        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height()*1.03, f"{nc[i]} - {porcentajes[i]}", ha='center', va='bottom',rotation=90,fontsize=8)
+        ax.spines['right'].set_visible(False)
+        ax.spines['top'].set_visible(False) 
+        ax.set_ylabel("No Competentes")
     st.pyplot(fig)
 
     ultima_semana = df_modulo_completo["Semana"].max()

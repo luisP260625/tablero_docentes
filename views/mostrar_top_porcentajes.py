@@ -17,7 +17,8 @@ def graficar_barras(df, columna):
 
     for i, (v, n) in enumerate(zip(porcentajes, no_comp)):
         ax.text(v + 0.5, i, f"{n}\n{v:.1f}%", va='center', fontsize=8)
-
+        ax.spines['right'].set_visible(False)
+        ax.spines['top'].set_visible(False) 
     st.pyplot(fig)
 
 # Función principal (ya NO contiene selectbox)

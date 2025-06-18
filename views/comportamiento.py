@@ -16,7 +16,7 @@ def generar_excel(df_docente):
     return excel_buffer
 
 def mostrar(df, plantel_usuario, es_admin):
-    st.subheader("📈 Evolución Semanal del Desempeño Docente")
+    st.subheader("📈 Seguimiento Semanal del Desempeño Docente")
 
     plantel = st.selectbox("🏫 Selecciona un plantel", sorted(df["Plantel"].unique())) if es_admin else plantel_usuario
     docentes = df.filter(df["Plantel"] == plantel)["DOCENTE"].unique().to_list()
@@ -35,10 +35,12 @@ def mostrar(df, plantel_usuario, es_admin):
     porcentajes = [f"{(n / t * 100):.1f}%" if t > 0 else "0%" for n, t in zip(nc, ta)]
 
     # Generar la gráfica
-    fig, ax = plt.subplots(figsize=(10, 8))
+    fig, ax = plt.subplots(figsize=(8, 3))
     bars = ax.bar(semanas, nc, color="#C7B07C", edgecolor="white")
     for i, bar in enumerate(bars):
-        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height(), f"{nc[i]} - {porcentajes[i]}", ha='center', va='bottom',fontsize=8,rotation=90)
+        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height()*1.02, f"{nc[i]} - {porcentajes[i]}", ha='center', va='bottom',fontsize=8,rotation=90)
+        ax.spines['right'].set_visible(False)
+        ax.spines['top'].set_visible(False) 
     st.pyplot(fig)
 
     ultima_semana = df["Semana"].max()
