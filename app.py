@@ -1,10 +1,14 @@
 import streamlit as st
 import os
 
-# Diagnóstico inicial
+# ---------------------------
+# 🔧 Debug: limpiar sesión (solo para desarrollo)
+# st.session_state.clear()  # Descomenta si quieres forzar logout en cada carga
+# ---------------------------
+
 st.write("🛠️ Iniciando aplicación Streamlit...")
 
-# Validación de importaciones críticas
+# Importaciones protegidas con try/except para ver errores
 try:
     from data.loader import cargar_datos
     st.success("✅ Módulo loader cargado.")
@@ -34,17 +38,17 @@ try:
 except Exception as e:
     st.error(f"❌ Error al importar vistas: {e}")
 
-# Configuración visual
+# Configuración de la página
 st.set_page_config(layout="wide", page_title="Dashboard de Competencias Académicas", page_icon="📊")
 
-# Validación de imagen
+# Imagen inicial
 ruta_imagen = "utils/ImagenDashDocentes.png"
 if os.path.exists(ruta_imagen):
     st.image(ruta_imagen, use_container_width=True)
 else:
-    st.warning(f"⚠️ No se encontró la imagen: {ruta_imagen}")
+    st.warning(f"⚠️ Imagen no encontrada: {ruta_imagen}")
 
-# Inicialización de sesión
+# Inicializar estado de sesión si no está
 if "logueado" not in st.session_state:
     st.session_state.update({
         "logueado": False,
@@ -52,7 +56,13 @@ if "logueado" not in st.session_state:
         "administrador": False
     })
 
-# Estilo dinámico
+# Botón de reinicio manual de sesión (solo para pruebas)
+if st.sidebar.button("🔄 Reiniciar sesión (debug)"):
+    for key in ["logueado", "plantel_usuario", "administrador"]:
+        st.session_state.pop(key, None)
+    st.rerun()
+
+# Estilos visuales
 fondo_color = "#f4f6fa" if not st.session_state.logueado else "white"
 texto_color = "#b46b42" if not st.session_state.logueado else "black"
 
@@ -73,7 +83,9 @@ st.markdown(f"""
     </style>
 """, unsafe_allow_html=True)
 
-# Pantalla de login
+# -----------------------------------------
+# 🔐 FORMULARIO DE LOGIN
+# -----------------------------------------
 if not st.session_state.logueado:
     st.sidebar.title("🔒 Inicio de sesión")
     usuario = st.sidebar.text_input("Usuario")
@@ -96,24 +108,23 @@ if not st.session_state.logueado:
             else:
                 st.sidebar.error("❌ Acceso denegado. Verifica tus credenciales.")
         except Exception as e:
-            st.sidebar.error(f"❌ Error durante el login: {e}")
+            st.sidebar.error(f"❌ Error en login: {e}")
 else:
-    # Botón de logout
+    # Botón de logout real
     if st.sidebar.button("Cerrar sesión"):
         for key in ["logueado", "plantel_usuario", "administrador"]:
             st.session_state.pop(key, None)
         st.rerun()
 
-    # Cargar datos si está logueado
+    # Si está logueado, cargar datos
     try:
         df, error = cargar_datos()
         if error:
             st.error(f"❌ Error al cargar datos: {error}")
             st.stop()
         else:
-            st.success("✅ Datos cargados correctamente.")
-            # Aquí agregarías tus vistas como:
+            st.success("✅ Datos cargados.")
+            # Aquí puedes activar vistas reales, por ejemplo:
             # mostrar_ranking_por_plantel(df)
     except Exception as e:
-        st.error(f"❌ Fallo al ejecutar lógica principal: {e}")
-
+        st.error(f"❌ Fallo en lógica de contenido: {e}")
