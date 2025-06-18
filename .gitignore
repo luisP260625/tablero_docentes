@@ -1,0 +1,21 @@
+# Archivos Python compilados
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Archivos de log
+*.log
+
+# Archivos de entorno
+.env
+*.env
+
+# Archivos temporales y backups
+*.tmp
+*.bak
+~$*
+
+# Archivos del sistema
+Thumbs.db
+.DS_Store
