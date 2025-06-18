@@ -1,10 +1,19 @@
 import streamlit as st
 import os
 
-# ⚠️ SOLO PARA PRUEBAS: Forzar que siempre se vea el login
-st.session_state.clear()
-
 st.write("🛠️ Iniciando aplicación Streamlit...")
+
+# Inicializar variables si no existen
+if "logueado" not in st.session_state:
+    st.session_state.logueado = False
+    st.session_state.plantel_usuario = None
+    st.session_state.administrador = False
+
+# Botón de reinicio manual siempre visible
+if st.sidebar.button("🔄 Reiniciar sesión (debug)"):
+    for key in ["logueado", "plantel_usuario", "administrador"]:
+        st.session_state.pop(key, None)
+    st.rerun()
 
 # Importaciones protegidas
 try:
@@ -36,31 +45,15 @@ try:
 except Exception as e:
     st.error(f"❌ Error al importar vistas: {e}")
 
-# Configuración de la página
+# Configuración visual
 st.set_page_config(layout="wide", page_title="Dashboard de Competencias Académicas", page_icon="📊")
-
-# Imagen inicial
 ruta_imagen = "utils/ImagenDashDocentes.png"
 if os.path.exists(ruta_imagen):
     st.image(ruta_imagen, use_container_width=True)
 else:
     st.warning(f"⚠️ Imagen no encontrada: {ruta_imagen}")
 
-# Inicializar estado si no existe
-if "logueado" not in st.session_state:
-    st.session_state.update({
-        "logueado": False,
-        "plantel_usuario": None,
-        "administrador": False
-    })
-
-# 🔁 Botón manual para reiniciar sesión (solo durante pruebas)
-if st.sidebar.button("🔄 Reiniciar sesión (debug)"):
-    for key in ["logueado", "plantel_usuario", "administrador"]:
-        st.session_state.pop(key, None)
-    st.rerun()
-
-# Estilos
+# Estilos visuales
 fondo_color = "#f4f6fa" if not st.session_state.logueado else "white"
 texto_color = "#b46b42" if not st.session_state.logueado else "black"
 
@@ -94,7 +87,6 @@ if not st.session_state.logueado:
                 registrar_acceso(usuario)
                 num_accesos = contar_accesos(usuario)
                 st.sidebar.info(f"{usuario} ha ingresado {num_accesos} veces")
-
                 st.session_state.update({
                     "logueado": True,
                     "plantel_usuario": plantel,
@@ -104,7 +96,7 @@ if not st.session_state.logueado:
             else:
                 st.sidebar.error("❌ Acceso denegado. Verifica tus credenciales.")
         except Exception as e:
-            st.sidebar.error(f"❌ Error durante el login: {e}")
+            st.sidebar.error(f"❌ Error en login: {e}")
 else:
     st.sidebar.success("✅ Sesión activa")
     if st.sidebar.button("Cerrar sesión"):
@@ -119,7 +111,7 @@ else:
             st.stop()
         else:
             st.success("✅ Datos cargados correctamente.")
-            # Aquí puedes mostrar el contenido real del dashboard:
+            # Aquí se mostrarían vistas reales
             # mostrar_ranking_por_plantel(df)
     except Exception as e:
-        st.error(f"❌ Fallo en la lógica principal: {e}")
+        st.error(f"❌ Error en lógica principal: {e}")
