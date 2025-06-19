@@ -12,15 +12,13 @@ import views.bitacora_conexiones as vista_bc
 
 st.markdown("""
     <style>
-    /* Oculta los íconos específicos del header superior derecho */
-    [data-testid="stToolbar"] > div:nth-child(3),
-    [data-testid="stToolbar"] > div:nth-child(4),
-    [data-testid="stToolbar"] > div:nth-child(5),
-    [data-testid="stToolbar"] > div:nth-child(6) {
+    /* Oculta cada ícono dentro de la barra superior sin afectar el menú lateral */
+    [data-testid="stToolbar"] button {
         display: none !important;
     }
     </style>
 """, unsafe_allow_html=True)
+
 
 
 # ----------------------------
