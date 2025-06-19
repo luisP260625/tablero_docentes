@@ -12,15 +12,12 @@ import views.bitacora_conexiones as vista_bc
 
 st.markdown("""
     <style>
-    /* Oculta solo los íconos del toolbar (parte superior derecha) */
-    div[data-testid="stToolbar"] {
+    /* Selecciona cada icono manualmente y los oculta */
+    [data-testid="stToolbar"] button[kind="icon"] {
         display: none !important;
     }
-
-    /* NO ocultamos header ni sidebar */
     </style>
 """, unsafe_allow_html=True)
-
 
 # ----------------------------
 # Inicializar sesión
