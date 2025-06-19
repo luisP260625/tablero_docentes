@@ -12,20 +12,12 @@ import views.bitacora_conexiones as vista_bc
 
 st.markdown("""
     <style>
-    /* Oculta íconos superiores: Share, estrella, lápiz, GitHub, menú */
+    /* Oculta solo los íconos del toolbar (parte superior derecha) */
     div[data-testid="stToolbar"] {
-        visibility: hidden;
+        display: none !important;
     }
 
-    /* Asegura que el encabezado visual no se elimine completamente */
-    header[data-testid="stHeader"] {
-        visibility: hidden;
-    }
-
-    /* Mantén funcional el sidebar ocultable (≡ botón) */
-    section[data-testid="stSidebar"] {
-        transition: all 0.3s ease-in-out;
-    }
+    /* NO ocultamos header ni sidebar */
     </style>
 """, unsafe_allow_html=True)
 
