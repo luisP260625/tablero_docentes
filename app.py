@@ -62,6 +62,7 @@ if error:
     st.error(f"❌ Error al cargar los datos: {error}")
     st.stop()
 
+
 # ----------------------------
 # Menú según rol
 # ----------------------------

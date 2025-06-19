@@ -3,7 +3,7 @@ import pandas as pd
 import polars as pl
 from config import EXCEL_FILE, SHEET_DATOS
 
-@st.cache_data(ttl=600)  # cachea por 10 minutos
+@st.cache_data(ttl=600)  # cache por 10 minutos
 def cargar_datos():
     try:
         xls = pd.ExcelFile(EXCEL_FILE)
