@@ -1,6 +1,7 @@
 import streamlit as st
 from data.validator import validar_usuario
 from data.loader import cargar_datos
+from data.logger import registrar_acceso
 
 # Importar vistas
 from views.ranking_docentes_modulos import mostrar_ranking_por_plantel
@@ -32,7 +33,7 @@ if "logueado" not in st.session_state:
     })
 
 # ----------------------------
-# Login con imagen 
+# Login con formulario alineado a la izquierda y banner al centro
 # ----------------------------
 if not st.session_state.logueado:
     col1, col2 = st.columns([1, 2])
@@ -50,16 +51,17 @@ if not st.session_state.logueado:
                     "plantel_usuario": plantel,
                     "administrador": es_admin
                 })
+                registrar_acceso(usuario)  # Registro en bitácora, archivo de excel. 
                 st.success("✅ ¡Sesión iniciada!")
                 st.rerun()
             else:
-                st.error("❌ Autenticación Incorrecta")
+                st.error("❌ Credenciales incorrectas")
 
     with col2:
         try:
             st.image("utils/ImagenDashDocentes.png", use_container_width=True)
         except Exception:
-            st.warning("⚠️ IMAGEN NO DISPONIBLE.")
+            st.warning("⚠️ Imagen no disponible o no encontrada.")
 
     st.stop()
 
@@ -79,32 +81,32 @@ if st.sidebar.button("Cerrar sesión"):
 # ----------------------------
 df, error = cargar_datos()
 if error:
-    st.error(f"❌ Error,no se pueden cargar los datos: {error}")
+    st.error(f"❌ Error al cargar los datos: {error}")
     st.stop()
 
 # ----------------------------
-# Menú desplegable
+# Menú desplegable según rol
 # ----------------------------
 if st.session_state.administrador:
     opciones = [
         "Docentes y Módulos",
+        "Estatal Docentes y Módulos",
         "Docentes Seguimiento",
         "Módulos Seguimiento",
-        "Estatal Docentes y Módulos",
         "Bitácora de Conexiones"
     ]
 else:
     opciones = [
+        "Ranking por docentes y módulos",
         "Docentes y Módulos",
         "Docentes Seguimiento",
-        "Módulos Seguimiento",
-        "Ranking por docentes y módulos"
+        "Módulos Seguimiento"
     ]
 
-opcion = st.sidebar.selectbox("Menú Principal", opciones)
+opcion = st.sidebar.selectbox("Menú", opciones)
 
 # ----------------------------
-# VISTAS DISPONIBLES
+# Mostrar vistas
 # ----------------------------
 if opcion == "Docentes y Módulos":
     vista_nc.mostrar(df, st.session_state.plantel_usuario, st.session_state.administrador)
