@@ -1,7 +1,18 @@
 import streamlit as st
 from data.validator import validar_usuario
+from data.loader import cargar_datos
 
+# Importar vistas
+from views.ranking_docentes_modulos import mostrar_ranking_por_plantel
+import views.no_competentes as vista_nc
+import views.comportamiento as vista_com
+import views.modulos_criticos as vista_mc
+import views.mostrar_estatal as vista_estatal
+import views.bitacora_conexiones as vista_bc
+
+# ----------------------------
 # Inicializar sesión
+# ----------------------------
 if "logueado" not in st.session_state:
     st.session_state.update({
         "logueado": False,
@@ -9,7 +20,9 @@ if "logueado" not in st.session_state:
         "administrador": False
     })
 
-# LOGIN
+# ----------------------------
+# Login
+# ----------------------------
 if not st.session_state.logueado:
     st.title("🔐 Inicio de sesión")
 
@@ -30,7 +43,9 @@ if not st.session_state.logueado:
             st.error("❌ Credenciales incorrectas")
     st.stop()
 
-# SESIÓN ACTIVA
+# ----------------------------
+# Cierre de sesión
+# ----------------------------
 st.sidebar.success("✅ Sesión activa")
 st.sidebar.info(f"👤 {'Administrador' if st.session_state.administrador else f'Plantel: {st.session_state.plantel_usuario}'}")
 
@@ -39,11 +54,52 @@ if st.sidebar.button("Cerrar sesión"):
         st.session_state.pop(key, None)
     st.rerun()
 
-# MENÚ SEGÚN ROL
+# ----------------------------
+# Cargar datos
+# ----------------------------
+df, error = cargar_datos()
+if error:
+    st.error(f"❌ Error al cargar los datos: {error}")
+    st.stop()
+
+# ----------------------------
+# Menú según rol
+# ----------------------------
 if st.session_state.administrador:
-    opcion = st.sidebar.radio("Menú administrador", ["Estatal", "Bitácora", "Configuraciones"])
-    st.write(f"🔧 Vista seleccionada: {opcion}")
+    opcion = st.sidebar.radio("Menú administrador", [
+        "Docentes y Módulos",
+        "Estatal Docentes y Módulos",
+        "Docentes Seguimiento",
+        "Módulos Seguimiento",
+        "Bitácora de Conexiones"
+    ])
 else:
-    opcion = st.sidebar.radio("Menú plantel", ["Ranking", "No competentes", "Comportamiento", "Críticos"])
-    st.write(f"🏫 Vista seleccionada: {opcion} del plantel {st.session_state.plantel_usuario}")
+    opcion = st.sidebar.radio("Menú plantel", [
+        "Ranking por docentes y módulos",
+        "Docentes y Módulos",
+        "Docentes Seguimiento",
+        "Módulos Seguimiento"
+    ])
+
+# ----------------------------
+# Mostrar vistas
+# ----------------------------
+if opcion == "Docentes y Módulos":
+    vista_nc.mostrar(df, st.session_state.plantel_usuario, st.session_state.administrador)
+
+elif opcion == "Estatal Docentes y Módulos" and st.session_state.administrador:
+    vista_estatal.mostrar_estatal(df)
+
+elif opcion == "Docentes Seguimiento":
+    vista_com.mostrar(df, st.session_state.plantel_usuario, st.session_state.administrador)
+
+elif opcion == "Módulos Seguimiento":
+    vista_mc.mostrar(df, st.session_state.plantel_usuario, st.session_state.administrador)
+
+elif opcion == "Bitácora de Conexiones" and st.session_state.administrador:
+    vista_bc.mostrar()
+
+elif opcion == "Ranking por docentes y módulos":
+    mostrar_ranking_por_plantel(df, st.session_state.plantel_usuario)
+
 
