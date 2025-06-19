@@ -12,12 +12,16 @@ import views.bitacora_conexiones as vista_bc
 
 st.markdown("""
     <style>
-    /* Selecciona cada icono manualmente y los oculta */
-    [data-testid="stToolbar"] button[kind="icon"] {
+    /* Oculta los íconos específicos del header superior derecho */
+    [data-testid="stToolbar"] > div:nth-child(3),
+    [data-testid="stToolbar"] > div:nth-child(4),
+    [data-testid="stToolbar"] > div:nth-child(5),
+    [data-testid="stToolbar"] > div:nth-child(6) {
         display: none !important;
     }
     </style>
 """, unsafe_allow_html=True)
+
 
 # ----------------------------
 # Inicializar sesión
