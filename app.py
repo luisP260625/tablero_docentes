@@ -10,10 +10,11 @@ import views.modulos_criticos as vista_mc
 import views.mostrar_estatal as vista_estatal
 import views.bitacora_conexiones as vista_bc
 
+
 st.markdown("""
     <style>
-    /* Oculta cada ícono dentro de la barra superior sin afectar el menú lateral */
-    [data-testid="stToolbar"] button {
+    /* Oculta solo los íconos individuales dentro del toolbar */
+    [data-testid="stToolbar"] > div:nth-child(n+2) {
         display: none !important;
     }
     </style>
