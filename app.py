@@ -10,6 +10,13 @@ import views.modulos_criticos as vista_mc
 import views.mostrar_estatal as vista_estatal
 import views.bitacora_conexiones as vista_bc
 
+st.markdown("""
+    <style>
+    header {visibility: hidden;}
+    </style>
+""", unsafe_allow_html=True)
+
+
 # ----------------------------
 # Inicializar sesión
 # ----------------------------
