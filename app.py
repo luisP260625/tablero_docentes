@@ -75,14 +75,14 @@ if st.session_state.administrador:
     ])
 else:
     opcion = st.sidebar.radio("Menú plantel", [
-        "Ranking por docentes y módulos",
         "Docentes y Módulos",
         "Docentes Seguimiento",
-        "Módulos Seguimiento"
+        "Módulos Seguimiento",
+        "Ranking por docentes y módulos"
     ])
 
 # ----------------------------
-# Mostrar vistas
+# Mostrar vistas según opción
 # ----------------------------
 if opcion == "Docentes y Módulos":
     vista_nc.mostrar(df, st.session_state.plantel_usuario, st.session_state.administrador)
@@ -101,5 +101,6 @@ elif opcion == "Bitácora de Conexiones" and st.session_state.administrador:
 
 elif opcion == "Ranking por docentes y módulos":
     mostrar_ranking_por_plantel(df, st.session_state.plantel_usuario)
+
 
 
