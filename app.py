@@ -13,13 +13,6 @@ import views.mostrar_estatal as vista_estatal
 import views.bitacora_conexiones as vista_bc
 
 # ----------------------------
-# Reiniciar bitácora (una sola vez)
-# ----------------------------
-BITACORA_PATH = "data/bitacora.csv"
-if os.path.exists(BITACORA_PATH):
-    open(BITACORA_PATH, "w").close()
-
-# ----------------------------
 # Inicializar sesión
 # ----------------------------
 if "logueado" not in st.session_state:
