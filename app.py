@@ -10,6 +10,25 @@ import views.modulos_criticos as vista_mc
 import views.mostrar_estatal as vista_estatal
 import views.bitacora_conexiones as vista_bc
 
+st.markdown("""
+    <style>
+    /* Oculta íconos superiores: Share, estrella, lápiz, GitHub, menú */
+    div[data-testid="stToolbar"] {
+        visibility: hidden;
+    }
+
+    /* Asegura que el encabezado visual no se elimine completamente */
+    header[data-testid="stHeader"] {
+        visibility: hidden;
+    }
+
+    /* Mantén funcional el sidebar ocultable (≡ botón) */
+    section[data-testid="stSidebar"] {
+        transition: all 0.3s ease-in-out;
+    }
+    </style>
+""", unsafe_allow_html=True)
+
 
 # ----------------------------
 # Inicializar sesión
