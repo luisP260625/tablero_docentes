@@ -10,6 +10,7 @@ import views.modulos_criticos as vista_mc
 import views.mostrar_estatal as vista_estatal
 import views.bitacora_conexiones as vista_bc
 
+st.set_page_config(page_title="Tablero Docente", layout="wide")
 
 st.markdown("""
     <style>
@@ -19,8 +20,6 @@ st.markdown("""
     }
     </style>
 """, unsafe_allow_html=True)
-
-
 
 # ----------------------------
 # Inicializar sesión
@@ -33,33 +32,42 @@ if "logueado" not in st.session_state:
     })
 
 # ----------------------------
-# Login
+# Login con imagen 
 # ----------------------------
 if not st.session_state.logueado:
-    st.title("🔐 Inicio de sesión")
+    col1, col2 = st.columns([1, 2])
 
-    usuario = st.text_input("Usuario")
-    contrasena = st.text_input("Contraseña", type="password")
+    with col1:
+        st.title("🔐 Inicio de sesión")
+        usuario = st.text_input("Usuario")
+        contrasena = st.text_input("Contraseña", type="password")
 
-    if st.button("Iniciar sesión"):
-        ok, plantel, es_admin = validar_usuario(usuario, contrasena)
-        if ok:
-            st.session_state.update({
-                "logueado": True,
-                "plantel_usuario": plantel,
-                "administrador": es_admin
-            })
-            st.success("✅ ¡Sesión iniciada!")
-            st.rerun()
-        else:
-            st.error("❌ Credenciales incorrectas")
+        if st.button("Iniciar sesión"):
+            ok, plantel, es_admin = validar_usuario(usuario, contrasena)
+            if ok:
+                st.session_state.update({
+                    "logueado": True,
+                    "plantel_usuario": plantel,
+                    "administrador": es_admin
+                })
+                st.success("✅ ¡Sesión iniciada!")
+                st.rerun()
+            else:
+                st.error("❌ Autenticación Incorrecta")
+
+    with col2:
+        try:
+            st.image("utils/ImagenDashDocentes.png", use_container_width=True)
+        except Exception:
+            st.warning("⚠️ IMAGEN NO DISPONIBLE.")
+
     st.stop()
 
 # ----------------------------
 # Cierre de sesión
 # ----------------------------
 st.sidebar.success("✅ Sesión activa")
-st.sidebar.info(f"👤 {'Administrador' if st.session_state.administrador else f'Plantel: {st.session_state.plantel_usuario}'}")
+st.sidebar.info(f"👤 {'Administrador' if st.session_state.administrador else f'Plantel: {st.session_state.plantel_usuario}'})")
 
 if st.sidebar.button("Cerrar sesión"):
     for key in ["logueado", "plantel_usuario", "administrador"]:
@@ -71,30 +79,32 @@ if st.sidebar.button("Cerrar sesión"):
 # ----------------------------
 df, error = cargar_datos()
 if error:
-    st.error(f"❌ Error al cargar los datos: {error}")
+    st.error(f"❌ Error,no se pueden cargar los datos: {error}")
     st.stop()
 
 # ----------------------------
-# Menú según rol
+# Menú desplegable
 # ----------------------------
 if st.session_state.administrador:
-    opcion = st.sidebar.radio("Menú administrador", [
+    opciones = [
         "Docentes y Módulos",
-        "Estatal Docentes y Módulos",
         "Docentes Seguimiento",
         "Módulos Seguimiento",
+        "Estatal Docentes y Módulos",
         "Bitácora de Conexiones"
-    ])
+    ]
 else:
-    opcion = st.sidebar.radio("Menú plantel", [
-        "Ranking por docentes y módulos",
+    opciones = [
         "Docentes y Módulos",
         "Docentes Seguimiento",
-        "Módulos Seguimiento"
-    ])
+        "Módulos Seguimiento",
+        "Ranking por docentes y módulos"
+    ]
+
+opcion = st.sidebar.selectbox("Menú Principal", opciones)
 
 # ----------------------------
-# Mostrar vistas
+# VISTAS DISPONIBLES
 # ----------------------------
 if opcion == "Docentes y Módulos":
     vista_nc.mostrar(df, st.session_state.plantel_usuario, st.session_state.administrador)
@@ -113,5 +123,3 @@ elif opcion == "Bitácora de Conexiones" and st.session_state.administrador:
 
 elif opcion == "Ranking por docentes y módulos":
     mostrar_ranking_por_plantel(df, st.session_state.plantel_usuario)
-
-
