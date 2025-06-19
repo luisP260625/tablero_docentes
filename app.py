@@ -1,8 +1,6 @@
 import streamlit as st
-import os
 from data.validator import validar_usuario
 from data.loader import cargar_datos
-from data.logger import registrar_acceso, contar_accesos
 
 # Importar vistas
 from views.ranking_docentes_modulos import mostrar_ranking_por_plantel
@@ -11,17 +9,6 @@ import views.comportamiento as vista_com
 import views.modulos_criticos as vista_mc
 import views.mostrar_estatal as vista_estatal
 import views.bitacora_conexiones as vista_bc
-
-# ----------------------------
-# Ocultar solo el encabezado visual de Streamlit
-# ----------------------------
-st.markdown("""
-    <style>
-    header[data-testid="stHeader"] {
-        display: none;
-    }
-    </style>
-""", unsafe_allow_html=True)
 
 
 # ----------------------------
@@ -33,33 +20,6 @@ if "logueado" not in st.session_state:
         "plantel_usuario": None,
         "administrador": False
     })
-
-# ----------------------------
-# Estilos dinámicos
-# ----------------------------
-if not st.session_state.logueado:
-    fondo_color = "#f4f6fa"
-    texto_color = "#b46b42"
-else:
-    fondo_color = "white"
-    texto_color = "black"
-
-custom_styles = f"""
-    <style>
-    .stApp {{
-        background-color: {fondo_color};
-    }}
-    .block-container {{
-        padding-top: 2rem;
-        padding-bottom: 2rem;
-        color: {texto_color};
-    }}
-    section[data-testid="stSidebar"] {{
-        width: 320px !important;
-    }}
-    </style>
-"""
-st.markdown(custom_styles, unsafe_allow_html=True)
 
 # ----------------------------
 # Login
@@ -78,7 +38,6 @@ if not st.session_state.logueado:
                 "plantel_usuario": plantel,
                 "administrador": es_admin
             })
-            registrar_acceso(usuario)
             st.success("✅ ¡Sesión iniciada!")
             st.rerun()
         else:
@@ -117,14 +76,14 @@ if st.session_state.administrador:
     ])
 else:
     opcion = st.sidebar.radio("Menú plantel", [
+        "Ranking por docentes y módulos",
         "Docentes y Módulos",
         "Docentes Seguimiento",
-        "Módulos Seguimiento",
-        "Ranking por docentes y módulos"
+        "Módulos Seguimiento"
     ])
 
 # ----------------------------
-# Mostrar vistas según opción
+# Mostrar vistas
 # ----------------------------
 if opcion == "Docentes y Módulos":
     vista_nc.mostrar(df, st.session_state.plantel_usuario, st.session_state.administrador)
@@ -143,3 +102,5 @@ elif opcion == "Bitácora de Conexiones" and st.session_state.administrador:
 
 elif opcion == "Ranking por docentes y módulos":
     mostrar_ranking_por_plantel(df, st.session_state.plantel_usuario)
+
+
