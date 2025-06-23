@@ -1,5 +1,7 @@
 import os
 import pandas as pd
+import streamlit as st
+
 from datetime import datetime
 
 LOG_FILE = "data/bitacora.csv"
@@ -21,6 +23,11 @@ def obtener_bitacora():
 
     df = pd.read_csv(LOG_FILE, names=["Usuario", "Fecha"])
     df["Fecha"] = pd.to_datetime(df["Fecha"])
+    st.write("LOG_FILE path:", LOG_FILE)
+    st.write("Contenido del archivo:")
+    with open(LOG_FILE) as f:
+        st.text(f.read())
+
 
     resumen = df.groupby("Usuario").agg({
         "Fecha": [("Accesos", "count"), ("Fechas", lambda x: x.dt.strftime("%Y-%m-%d").tolist())]
