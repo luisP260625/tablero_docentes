@@ -5,6 +5,7 @@ from data.logger import registrar_acceso
 
 # Importar vistas
 from views.ranking_docentes_modulos import mostrar_ranking_por_plantel
+from views.indicadores_academicos import mostrar_indicadores_academicos
 import views.no_competentes as vista_nc
 import views.comportamiento as vista_com
 import views.modulos_criticos as vista_mc
@@ -15,7 +16,6 @@ st.set_page_config(page_title="Tablero Docente", layout="wide")
 
 st.markdown("""
     <style>
-    /* Oculta solo los íconos individuales dentro del toolbar */
     [data-testid="stToolbar"] > div:nth-child(n+2) {
         display: none !important;
     }
@@ -33,7 +33,7 @@ if "logueado" not in st.session_state:
     })
 
 # ----------------------------
-# Login con formulario alineado a la izquierda y banner al centro
+# Login
 # ----------------------------
 if not st.session_state.logueado:
     col1, col2 = st.columns([1, 2])
@@ -51,7 +51,7 @@ if not st.session_state.logueado:
                     "plantel_usuario": plantel,
                     "administrador": es_admin
                 })
-                registrar_acceso(usuario)  # Registro en bitácora, archivo de excel. 
+                registrar_acceso(usuario)
                 st.success("✅ ¡Sesión iniciada!")
                 st.rerun()
             else:
@@ -66,12 +66,39 @@ if not st.session_state.logueado:
     st.stop()
 
 # ----------------------------
-# Cierre de sesión
+# Sidebar reorganizado
 # ----------------------------
 st.sidebar.success("✅ Sesión activa")
-st.sidebar.info(f"👤 {'Administrador' if st.session_state.administrador else f'Plantel: {st.session_state.plantel_usuario}'})")
 
-if st.sidebar.button("Cerrar sesión"):
+# Bienvenida personalizada
+if st.session_state.administrador:
+    st.sidebar.info("👤 Bienvenido: Administrador")
+else:
+    st.sidebar.info(f"👤 Bienvenido: Plantel {st.session_state.plantel_usuario}")
+
+# Menú principal
+if st.session_state.administrador:
+    opciones = [
+        "Docentes y Módulos",
+        "Estatal Docentes y Módulos",
+        "Docentes Seguimiento",
+        "Módulos Seguimiento",
+        "Indicadores Académicos",
+        "Bitácora de Conexiones"
+    ]
+else:
+    opciones = [
+        "Ranking por docentes y módulos",
+        "Docentes y Módulos",
+        "Docentes Seguimiento",
+        "Módulos Seguimiento",
+        "Indicadores Académicos"
+    ]
+
+opcion = st.sidebar.selectbox("📂 MENÚ PRINCIPAL", opciones)
+
+# Botón de cierre de sesión
+if st.sidebar.button("🚪 Cerrar sesión"):
     for key in ["logueado", "plantel_usuario", "administrador"]:
         st.session_state.pop(key, None)
     st.rerun()
@@ -83,27 +110,6 @@ df, error = cargar_datos()
 if error:
     st.error(f"❌ Error al cargar los datos: {error}")
     st.stop()
-
-# ----------------------------
-# Menú desplegable según rol
-# ----------------------------
-if st.session_state.administrador:
-    opciones = [
-        "Docentes y Módulos",
-        "Estatal Docentes y Módulos",
-        "Docentes Seguimiento",
-        "Módulos Seguimiento",
-        "Bitácora de Conexiones"
-    ]
-else:
-    opciones = [
-        "Ranking por docentes y módulos",
-        "Docentes y Módulos",
-        "Docentes Seguimiento",
-        "Módulos Seguimiento"
-    ]
-
-opcion = st.sidebar.selectbox("Menú", opciones)
 
 # ----------------------------
 # Mostrar vistas
@@ -125,3 +131,6 @@ elif opcion == "Bitácora de Conexiones" and st.session_state.administrador:
 
 elif opcion == "Ranking por docentes y módulos":
     mostrar_ranking_por_plantel(df, st.session_state.plantel_usuario)
+
+elif opcion == "Indicadores Académicos":
+    mostrar_indicadores_academicos()  
