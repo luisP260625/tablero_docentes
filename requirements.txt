@@ -7,3 +7,4 @@ xlsxwriter
 openpyxl
 fpdf2
 fastexcel
+plotly
