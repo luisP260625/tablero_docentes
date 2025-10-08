@@ -1,73 +1,189 @@
+# views/comportamiento.py
 import streamlit as st
-import polars as pl
 import pandas as pd
 import matplotlib.pyplot as plt
-from io import BytesIO
+from typing import Optional, Any, List
 
-def generar_excel(df_docente):
-    df_pandas = df_docente.to_pandas()
+# ====== Nombres reales en tu Excel (Datos1.xlsx - hoja "Datos") ======
+COL_PLANTEL_REAL = "Plantel"
+COL_DOCENTE_REAL = "DOCENTE"
+COL_SEMANA_REAL  = "Semana"
 
-    # Crear un archivo en memoria
-    excel_buffer = BytesIO()
-    with pd.ExcelWriter(excel_buffer, engine='xlsxwriter') as writer:
-        df_pandas.to_excel(writer, sheet_name="Seguimiento Docente", index=False)
 
-    excel_buffer.seek(0)
-    return excel_buffer
+# ------------------ utilidades ------------------
+def _to_pandas(df: Any) -> Optional[pd.DataFrame]:
+    """
+    Convierte df a pandas.DataFrame si viene en otro formato (p. ej. polars).
+    """
+    if df is None:
+        return None
+    if isinstance(df, pd.DataFrame):
+        return df.copy()
 
-def mostrar(df, plantel_usuario, es_admin):
-    st.subheader("📈 Seguimiento Semanal del Desempeño Docente")
+    # Intento con polars
+    try:
+        import polars as pl  # type: ignore
+        if isinstance(df, pl.DataFrame):
+            return df.to_pandas()
+    except Exception:
+        pass
 
-    plantel = st.selectbox("🏫 Selecciona un plantel", sorted(df["Plantel"].unique())) if es_admin else plantel_usuario
-    docentes = df.filter(df["Plantel"] == plantel)["DOCENTE"].unique().to_list()
-    docente = st.selectbox("👨‍🏫 Selecciona un docente", sorted(docentes))
+    # Intento genérico
+    try:
+        return pd.DataFrame(df)
+    except Exception:
+        return None
 
-    df_docente = df.filter((df["Plantel"] == plantel) & (df["DOCENTE"] == docente))
 
-    df_agrupado = df_docente.group_by("Semana").agg(
-        pl.sum("NO COMPETENTES").alias("NC"),
-        pl.sum("TOTAL ALUMNOS").alias("TA")
-    ).sort("Semana")
+def _validar_columnas(base: pd.DataFrame, requeridas: List[str]) -> List[str]:
+    """Devuelve lista de columnas faltantes respecto a 'requeridas'."""
+    return [c for c in requeridas if c not in base.columns]
 
-    semanas = df_agrupado["Semana"]
-    nc = df_agrupado["NC"]
-    ta = df_agrupado["TA"]
-    porcentajes = [f"{(n / t * 100):.1f}%" if t > 0 else "0%" for n, t in zip(nc, ta)]
 
-    # Generar la gráfica
-    fig, ax = plt.subplots(figsize=(8, 3))
-    bars = ax.bar(semanas, nc, color="#C7B07C", edgecolor="white")
-    for i, bar in enumerate(bars):
-        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height()*1.02, f"{nc[i]} - {porcentajes[i]}", ha='center', va='bottom',fontsize=8,rotation=90)
-        ax.spines['right'].set_visible(False)
-        ax.spines['top'].set_visible(False) 
+def _render_grafico_semanal(df_filtrado: pd.DataFrame, titulo: str = "") -> None:
+    """
+    Gráfico de barras categóricas por semana (NO histograma).
+    - Solo muestra semanas existentes.
+    - Color de barra #c3b08f.
+    - Sin etiqueta de eje Y.
+    - Etiquetas 'conteo - porcentaje' con margen para que no se salgan.
+    """
+    if df_filtrado is None or df_filtrado.shape[0] == 0:
+        st.info("Sin datos para el filtro actual.")
+        return
+
+    df_plot = df_filtrado.copy()
+
+    # Normaliza la columna 'semana' a entero (ya llega renombrada)
+    if "semana" not in df_plot.columns:
+        st.error("No se encontró la columna 'semana' en los datos.")
+        return
+
+    df_plot["semana"] = pd.to_numeric(df_plot["semana"], errors="coerce")
+    df_plot = df_plot.dropna(subset=["semana"])
+    if df_plot.shape[0] == 0:
+        st.info("Sin datos para el filtro actual.")
+        return
+
+    df_plot["semana"] = df_plot["semana"].astype(int)
+
+    conteo = df_plot["semana"].value_counts().sort_index()
+    if conteo.shape[0] == 0:
+        st.info("Sin datos para el filtro actual.")
+        return
+
+    semanas = conteo.index.to_list()   # p. ej. [5] o [5, 6]
+    cantidades = conteo.values
+    total = cantidades.sum()
+
+    # --- Gráfico ---
+    fig, ax = plt.subplots(figsize=(8, 4))
+
+    # Color solicitado
+    bar_color = "#c3b08f"
+    ax.bar(semanas, cantidades, width=0.6, align="center", color=bar_color)
+
+    # Título y ejes
+    if titulo:
+        ax.set_title(titulo)
+
+    ax.set_xlabel("Semana")
+    # ax.set_ylabel("Cantidad de registros")  # <- Eliminado a petición
+
+    # Ticks solo de semanas existentes
+    ax.set_xticks(semanas)
+
+    # Margen superior para que las etiquetas no se salgan
+    y_max = max(cantidades) if len(cantidades) > 0 else 0
+    # Asegura ~20% de cabeza libre; mínimo +1 para casos de barra única
+    margen = max(1, int(round(y_max * 0.2))) if y_max > 0 else 1
+    ax.set_ylim(0, y_max + margen)
+
+    # Etiquetas sobre cada barra, centradas, dentro del área del gráfico
+    for x, y in zip(semanas, cantidades):
+        pct = (y / total) if total else 0.0
+        ax.annotate(
+            f"{y} - {pct:.1%}",
+            xy=(x, y),
+            xytext=(0, 5),  # 5 puntos arriba del tope de la barra
+            textcoords="offset points",
+            ha="center",
+            va="bottom",
+        )
+
+    # Opcional: limpiar bordes superiores/derechos para look más limpio
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+    fig.tight_layout()
     st.pyplot(fig)
 
-    ultima_semana = df["Semana"].max()
 
-    # Modificar la agrupación para incluir el semestre correctamente nombrado
-    df_modulos = df_docente.filter(df_docente["Semana"] == ultima_semana).group_by(["MODULO", "SEMESTRE"]).agg(
-        pl.sum("NO COMPETENTES").alias("NO_COMP"),
-        pl.sum("TOTAL ALUMNOS").alias("TOTAL"),
-        (pl.sum("TOTAL ALUMNOS") - pl.sum("NO COMPETENTES")).alias("COMPETENTES"),
-        (pl.sum("NO COMPETENTES") / pl.sum("TOTAL ALUMNOS") * 100).alias("PORCENTAJE_NO_COMP")
-    ).sort("PORCENTAJE_NO_COMP", descending=True)
+# ------------------ interfaz pública ------------------
+def mostrar(
+    df: Any,
+    plantel_usuario: Optional[str] = None,
+    es_admin: bool = False,
+) -> None:
+    """
+    Punto de entrada desde app.py
+    - df: DataFrame (pandas o polars) con los datos completos.
+    - plantel_usuario: plantel del usuario (si no es admin, se fija a éste).
+    - es_admin: True si el usuario puede elegir cualquier plantel.
+    """
+    base = _to_pandas(df)
+    if base is None or base.shape[0] == 0:
+        st.warning("No hay datos para mostrar.")
+        return
 
-    df_modulos = df_modulos.select(["MODULO", "SEMESTRE", "NO_COMP", "COMPETENTES", "TOTAL", "PORCENTAJE_NO_COMP"])
+    # ---- Validación de columnas reales de tu archivo ----
+    faltantes = _validar_columnas(
+        base,
+        [COL_PLANTEL_REAL, COL_DOCENTE_REAL, COL_SEMANA_REAL],
+    )
+    if faltantes:
+        st.error("Faltan columnas requeridas en los datos: " + ", ".join(faltantes))
+        with st.expander("Columnas disponibles en el DataFrame"):
+            st.write(list(base.columns))
+        return
 
-    # Filtrar filas donde TOTAL sea 0 o PORCENTAJE_NO_COMP sea nulo (None/NaN)
-    df_modulos = df_modulos.filter(
-        (pl.col("TOTAL") > 0) & (pl.col("PORCENTAJE_NO_COMP").is_not_null())
+    # ---------- selección de plantel ----------
+    if es_admin:
+        planteles = sorted(base[COL_PLANTEL_REAL].dropna().astype(str).unique().tolist())
+        if planteles:
+            default_idx = planteles.index(plantel_usuario) if plantel_usuario in planteles else 0
+        else:
+            planteles, default_idx = [""], 0
+
+        sel_plantel = st.selectbox(
+            "Selecciona un plantel",
+            planteles,
+            index=default_idx,
+            key="cmp_sel_plantel_comportamiento",
+        )
+    else:
+        # Usuario no admin: fijamos su plantel y lo mostramos bloqueado
+        sel_plantel = plantel_usuario
+        st.text_input("Plantel", sel_plantel or "", disabled=True, key="cmp_plantel_ro_comportamiento")
+
+    df_plantel = base[base[COL_PLANTEL_REAL].astype(str) == str(sel_plantel)] if sel_plantel else base.copy()
+
+    # ---------- selección de docente ----------
+    docentes = sorted(df_plantel[COL_DOCENTE_REAL].dropna().astype(str).unique().tolist())
+    if not docentes:
+        st.info("No hay docentes para el plantel seleccionado.")
+        return
+
+    sel_docente = st.selectbox(
+        "Selecciona un docente",
+        docentes,
+        key="cmp_sel_docente_comportamiento",
     )
 
-    st.markdown(f"### 📘 Módulos asignados al docente en la semana {ultima_semana}")
-    st.dataframe(df_modulos.to_pandas(), use_container_width=True)
+    df_filtrado = df_plantel[df_plantel[COL_DOCENTE_REAL].astype(str) == str(sel_docente)].copy()
 
-    # Agregar botón de descarga sin eliminar la gráfica
-    excel_buffer = generar_excel(df_docente)
-    st.download_button(
-        label="📥 Descargar seguimiento en Excel",
-        data=excel_buffer,
-        file_name=f"seguimiento_{docente}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
+    # Renombra la columna de semana a 'semana' para el motor de la gráfica
+    df_filtrado = df_filtrado.rename(columns={COL_SEMANA_REAL: "semana"})
+
+    # ---------- gráfica semanal (barras categóricas + formato solicitado) ----------
+    _render_grafico_semanal(df_filtrado, titulo=f"Comportamiento semanal - {sel_docente}")

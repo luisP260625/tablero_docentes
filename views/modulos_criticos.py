@@ -1,3 +1,4 @@
+# views/modulo_semcaptura.py  (o el nombre que uses para este módulo)
 import streamlit as st
 import polars as pl
 import matplotlib.pyplot as plt
@@ -23,15 +24,25 @@ def mostrar(df, plantel_usuario, es_admin):
 
     st.subheader("🚩 Módulos Críticos por Semana y Docente")
 
-    plantel = st.selectbox("🏫 Selecciona un plantel", sorted(df["Plantel"].unique())) if es_admin else plantel_usuario
+    # --- filtros base ---
+    plantel = (
+        st.selectbox("🏫 Selecciona un plantel", sorted(df["Plantel"].unique()))
+        if es_admin else plantel_usuario
+    )
     df_plantel = df.filter(pl.col("Plantel") == plantel)
 
-    modulos_criticos = df_plantel.group_by(["Semana", "MODULO", "DOCENTE"]).agg(
-        pl.sum("NO COMPETENTES").alias("NO_COMP"),
-        pl.sum("TOTAL ALUMNOS").alias("TOTAL")
-    ).with_columns(
-        (pl.col("NO_COMP") / pl.col("TOTAL").cast(pl.Float64) * 100).fill_nan(0).fill_null(0).alias("PORCENTAJE")
-    ).sort(["Semana", "PORCENTAJE"], descending=True)
+    modulos_criticos = (
+        df_plantel.group_by(["Semana", "MODULO", "DOCENTE"])
+        .agg(
+            pl.sum("NO COMPETENTES").alias("NO_COMP"),
+            pl.sum("TOTAL ALUMNOS").alias("TOTAL"),
+        )
+        .with_columns(
+            (pl.col("NO_COMP") / pl.col("TOTAL").cast(pl.Float64) * 100)
+            .fill_nan(0).fill_null(0).alias("PORCENTAJE")
+        )
+        .sort(["Semana", "PORCENTAJE"], descending=True)
+    )
 
     if modulos_criticos.is_empty():
         st.info("No hay módulos en el plantel seleccionado.")
@@ -42,29 +53,68 @@ def mostrar(df, plantel_usuario, es_admin):
 
     df_modulo_completo = df_plantel.filter(pl.col("MODULO") == modulo)
 
+    # ================== GRÁFICA SEMANAL (ACTUALIZADA) ==================
     st.markdown(f"### 📊 Seguimiento semanal del módulo: {modulo}")
-    df_semanal = df_modulo_completo.group_by("Semana").agg(
-        pl.sum("NO COMPETENTES").alias("NO_COMP"),
-        pl.sum("TOTAL ALUMNOS").alias("TOTAL")
-    ).sort("Semana").with_columns(
-        (pl.col("NO_COMP") / pl.col("TOTAL").cast(pl.Float64) * 100).fill_nan(0).fill_null(0).alias("PORCENTAJE")
+
+    df_semanal = (
+        df_modulo_completo.group_by("Semana")
+        .agg(
+            pl.sum("NO COMPETENTES").alias("NO_COMP"),
+            pl.sum("TOTAL ALUMNOS").alias("TOTAL"),
+        )
+        .sort("Semana")
+        .with_columns(
+            (pl.col("NO_COMP") / pl.col("TOTAL").cast(pl.Float64) * 100)
+            .fill_nan(0).fill_null(0).alias("PORCENTAJE")
+        )
     )
 
-    semanas = df_semanal["Semana"]
-    nc = df_semanal["NO_COMP"]
-    ta = df_semanal["TOTAL"]
+    # Datos para la gráfica
+    semanas = [int(s) for s in df_semanal["Semana"].to_list()]                  # solo semanas existentes
+    nc = df_semanal["NO_COMP"].to_list()
+    ta = df_semanal["TOTAL"].to_list()
     porcentajes = [f"{(n / t * 100):.1f}%" if t > 0 else "0%" for n, t in zip(nc, ta)]
 
     fig, ax = plt.subplots(figsize=(8, 3))
-    bars = ax.bar(semanas, nc, color="firebrick", edgecolor="firebrick")
-    for i, bar in enumerate(bars):
-        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height()*1.03, f"{nc[i]} - {porcentajes[i]}", ha='center', va='bottom',rotation=90,fontsize=8)
-        ax.spines['right'].set_visible(False)
-        ax.spines['top'].set_visible(False) 
-        ax.set_ylabel("No Competentes")
-    st.pyplot(fig)
+    bar_color = "#9f2241"                                                      # color solicitado
+    bars = ax.bar(semanas, nc, width=0.6, align="center", color=bar_color, edgecolor=bar_color)
 
-    ultima_semana = df_modulo_completo["Semana"].max()
+    # Ticks SOLO de semanas presentes + límites para evitar 4.6, 4.7, ...
+    if len(semanas) > 0:
+        ax.set_xticks(semanas)
+        ax.set_xlim(min(semanas) - 0.5, max(semanas) + 0.5)
+
+    # Margen superior para que no se salgan las etiquetas
+    y_max = max(nc) if nc else 0
+    margen = max(1, int(round(y_max * 0.2))) if y_max > 0 else 1
+    ax.set_ylim(0, y_max + margen)
+
+    # Etiquetas "conteo - porcentaje" rotadas (dentro del área)
+    total = sum(nc) if nc else 0
+    for i, bar in enumerate(bars):
+        ax.annotate(
+            f"{nc[i]} - {porcentajes[i]}",
+            xy=(bar.get_x() + bar.get_width() / 2, bar.get_height()),
+            xytext=(0, 5),
+            textcoords="offset points",
+            ha="center",
+            va="bottom",
+            rotation=90,
+            fontsize=8,
+        )
+
+    # Limpieza visual y SIN etiqueta de eje Y
+    ax.spines['right'].set_visible(False)
+    ax.spines['top'].set_visible(False)
+    ax.set_xlabel("Semana")
+    # ax.set_ylabel("No Competentes")  # <- eliminado
+
+    fig.tight_layout()
+    st.pyplot(fig)
+    # ================== FIN GRÁFICA SEMANAL ==================
+
+    # Última semana con actividad
+    ultima_semana = int(df_modulo_completo["Semana"].max())
     df_modulo_ultima = df_modulo_completo.filter(pl.col("Semana") == ultima_semana)
 
     st.markdown(f"### 👨‍🏫 Docentes que impartieron el módulo en la semana {ultima_semana}")
@@ -74,28 +124,36 @@ def mostrar(df, plantel_usuario, es_admin):
         st.markdown(f"#### 👤 Docente: {docente}")
         df_docente = df_modulo_ultima.filter(pl.col("DOCENTE") == docente)
 
-        resumen_1 = df_docente.group_by("SEMESTRE").agg(
-            pl.sum("NO COMPETENTES").alias("NO_COMP"),
-            pl.sum("TOTAL ALUMNOS").alias("TOTAL")
-        ).with_columns([
-            (pl.col("TOTAL") - pl.col("NO_COMP")).alias("COMPETENTES"),
-            (pl.col("NO_COMP") / pl.when(pl.col("TOTAL") > 0).then(pl.col("TOTAL")).otherwise(1).cast(pl.Float64) * 100)
-            .round(2).alias("PORCENTAJE_NO_COMP")
-        ])
+        # Resumen por semestre
+        resumen_1 = (
+            df_docente.group_by("SEMESTRE")
+            .agg(
+                pl.sum("NO COMPETENTES").alias("NO_COMP"),
+                pl.sum("TOTAL ALUMNOS").alias("TOTAL"),
+            )
+            .with_columns([
+                (pl.col("TOTAL") - pl.col("NO_COMP")).alias("COMPETENTES"),
+                (
+                    pl.col("NO_COMP")
+                    / pl.when(pl.col("TOTAL") > 0).then(pl.col("TOTAL")).otherwise(1).cast(pl.Float64)
+                    * 100
+                ).round(2).alias("PORCENTAJE_NO_COMP"),
+            ])
+        )
 
         resumen_1_clean = resumen_1.fill_null(0).with_columns([
             pl.col("NO_COMP").cast(pl.Float64),
             pl.col("COMPETENTES").cast(pl.Float64),
             pl.col("TOTAL").cast(pl.Float64),
-            pl.col("PORCENTAJE_NO_COMP").cast(pl.Float64)
+            pl.col("PORCENTAJE_NO_COMP").cast(pl.Float64),
         ])
 
         resumen_1_limpio = resumen_1_clean.with_columns([
             (
-                (pl.col("NO_COMP") == 0) &
-                (pl.col("COMPETENTES") == 0) &
-                (pl.col("TOTAL") == 0) &
-                ((pl.col("PORCENTAJE_NO_COMP") == 0) | (pl.col("PORCENTAJE_NO_COMP").is_null()))
+                (pl.col("NO_COMP") == 0)
+                & (pl.col("COMPETENTES") == 0)
+                & (pl.col("TOTAL") == 0)
+                & ((pl.col("PORCENTAJE_NO_COMP") == 0) | (pl.col("PORCENTAJE_NO_COMP").is_null()))
             ).alias("FILA_VACIA")
         ])
 
@@ -107,16 +165,16 @@ def mostrar(df, plantel_usuario, es_admin):
         else:
             st.info("📬 No hay datos relevantes en el resumen por semestre para este docente.")
 
-        # Segunda tabla: sin agrupaciones, muestra detalle completo de cada fila original
+        # Detalle por grupo (sin perder funcionalidad)
         df_sem_grupo = df_semcaptura.filter(
-            (pl.col("Plantel") == plantel) &
-            (pl.col("DOCENTE") == docente) &
-            (pl.col("MODULO") == modulo)
+            (pl.col("Plantel") == plantel)
+            & (pl.col("DOCENTE") == docente)
+            & (pl.col("MODULO") == modulo)
         )
 
         columnas = [
             "GRUPO", "UAPRENDIZAJE", "RAPRENDIZAJE",
-            "IEVALUAR", "IEVALUADOS", "PCAPTURA", "TOTALE", "ESTATUS"
+            "IEVALUAR", "IEVALUADOS", "PCAPTURA", "TOTALE", "ESTATUS",
         ]
 
         resumen_2 = df_sem_grupo.select(columnas).sort(["GRUPO", "RAPRENDIZAJE"])
@@ -124,9 +182,9 @@ def mostrar(df, plantel_usuario, es_admin):
 
         resumen_2_filtrado = resumen_2_clean.filter(
             ~(
-                (pl.col("IEVALUAR") == 0) &
-                (pl.col("IEVALUADOS") == 0) &
-                (pl.col("TOTALE") == 0)
+                (pl.col("IEVALUAR") == 0)
+                & (pl.col("IEVALUADOS") == 0)
+                & (pl.col("TOTALE") == 0)
             )
         )
 
@@ -136,10 +194,12 @@ def mostrar(df, plantel_usuario, es_admin):
         else:
             st.info("📬 No hay información detallada por grupo para este docente.")
 
+    # Exportar Excel del módulo completo (sin cambios)
     excel_data = to_excel(df_modulo_completo.to_pandas())
     st.download_button(
         label="📅 Descargar reporte detallado del módulo",
         data=excel_data,
         file_name=f"modulo_{modulo}_detalle.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+
