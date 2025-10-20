@@ -3,6 +3,8 @@ import streamlit as st
 import pandas as pd
 import matplotlib.pyplot as plt
 from typing import Optional, Any, List
+import io
+import unicodedata
 
 # ====== Nombres EXACTOS en tu Excel (hoja "Datos") ======
 COL_PLANTEL   = "Plantel"
@@ -72,7 +74,7 @@ def _grafica_semanal(sem_df: pd.DataFrame, titulo: str, color_hex: str = "#c3b08
     ax.set_ylim(0, y_max + margen)
 
     # etiquetas “NO_COMP - %”
-    LABEL_FONTSIZE = 8  # antes el tamaño era mayor por d
+    LABEL_FONTSIZE = 8
     for i, bar in enumerate(bars):
         ax.annotate(
             f"{no_comp[i]} - {porcent[i]*100:.1f}%",
@@ -121,6 +123,106 @@ def _tabla_modulos_ultima_semana(df_docente: pd.DataFrame) -> pd.DataFrame:
     return agg
 
 
+# ====== helpers Excel ======
+def _slugify_filename(text: str) -> str:
+    """Convierte 'José Pérez / 3A' -> 'Jose_Perez__3A' y limpia caracteres inválidos."""
+    if not isinstance(text, str):
+        text = str(text or "")
+    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+    return "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in text).strip("_")
+
+
+def _auto_width_xlsx(ws, df: pd.DataFrame, start_col=0):
+    """Ajusta el ancho de columnas en xlsxwriter según contenido."""
+    for idx, col in enumerate(df.columns, start=start_col):
+        try:
+            max_len_vals = df[col].astype(str).map(len).max() if not df.empty else 0
+        except Exception:
+            max_len_vals = 0
+        header_len = len(str(col))
+        width = min(max(max_len_vals, header_len) + 2, 60)
+        try:
+            ws.set_column(idx, idx, width)
+        except Exception:
+            pass
+
+
+def _excel_comportamiento_bytes(
+    *,
+    plantel: str,
+    docente: str,
+    semanas_df: pd.DataFrame,      # columnas: semana, no_comp, total
+    tabla_modulos_df: pd.DataFrame # columnas renombradas: Modulo, semestre, no_com, competentes, total, porcentaje_no_comp
+) -> bytes:
+    """Crea un Excel con dos hojas: 'Comportamiento semanal' y 'Módulos última semana', más metadatos."""
+    buffer = io.BytesIO()
+    try:
+        writer = pd.ExcelWriter(buffer, engine="xlsxwriter")
+    except Exception:
+        writer = pd.ExcelWriter(buffer)  # fallback
+
+    with writer:
+        # ---- Hoja 1: Comportamiento semanal ----
+        hoja1 = "Comportamiento semanal"
+        # metadatos
+        if semanas_df is not None and not semanas_df.empty:
+            semanas_ord = semanas_df["semana"].dropna().astype(int).sort_values().tolist()
+            sem_min = min(semanas_ord)
+            sem_max = max(semanas_ord)
+            sem_list_str = ", ".join(str(s) for s in semanas_ord)
+        else:
+            sem_min = ""
+            sem_max = ""
+            sem_list_str = ""
+
+        meta1 = pd.DataFrame(
+            {
+                "Campo": ["Plantel", "Docente", "Semana mínima", "Semana máxima", "Semanas con datos", "Nota"],
+                "Valor": [plantel, docente, sem_min, sem_max, sem_list_str,
+                          "El porcentaje corresponde a NO_COMP/TOTAL por semana."]
+            }
+        )
+        meta1.to_excel(writer, sheet_name=hoja1, index=False, startrow=0)
+
+        # cuerpo: semanas con % calculado
+        if semanas_df is not None and not semanas_df.empty:
+            semanas_out = semanas_df.copy()
+            semanas_out["porcentaje_no_comp"] = semanas_out.apply(
+                lambda r: (r["no_comp"] / r["total"] * 100) if r["total"] else 0.0, axis=1
+            ).round(1)
+            semanas_out = semanas_out[["semana", "no_comp", "total", "porcentaje_no_comp"]]
+            startrow = len(meta1) + 2
+            semanas_out.to_excel(writer, sheet_name=hoja1, index=False, startrow=startrow)
+        wb = writer.book
+        ws1 = writer.sheets[hoja1]
+        try:
+            fmt_bold = wb.add_format({"bold": True, "font_size": 12})
+            ws1.write(0, 0, "Campo", fmt_bold)
+            ws1.write(0, 1, "Valor", fmt_bold)
+        except Exception:
+            pass
+        if semanas_df is not None and not semanas_df.empty:
+            _auto_width_xlsx(ws1, semanas_out, start_col=0)
+
+        # ---- Hoja 2: Módulos última semana ----
+        hoja2 = "Módulos última semana"
+        meta2 = pd.DataFrame({"Campo": ["Plantel", "Docente"], "Valor": [plantel, docente]})
+        meta2.to_excel(writer, sheet_name=hoja2, index=False, startrow=0)
+        startrow2 = len(meta2) + 2
+        tabla_out = tabla_modulos_df.copy() if tabla_modulos_df is not None else pd.DataFrame()
+        tabla_out.to_excel(writer, sheet_name=hoja2, index=False, startrow=startrow2)
+        ws2 = writer.sheets[hoja2]
+        try:
+            ws2.write(0, 0, "Campo", fmt_bold)
+            ws2.write(0, 1, "Valor", fmt_bold)
+        except Exception:
+            pass
+        _auto_width_xlsx(ws2, tabla_out, start_col=0)
+
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
 # ------------------ interfaz pública ------------------
 def mostrar(
     df: Any,
@@ -131,6 +233,7 @@ def mostrar(
     Usa EXCLUSIVAMENTE la hoja 'Datos' (df) para:
       - Graficar NO COMPETENTES por semana (% sobre TOTAL).
       - Mostrar la tabla de módulos del docente (última semana).
+      - Generar Excel con ambas secciones + semanas transcurridas.
     """
     base = _to_pandas(df)
     if base is None or base.shape[0] == 0:
@@ -152,7 +255,9 @@ def mostrar(
     if es_admin:
         planteles = sorted(base[COL_PLANTEL].dropna().astype(str).unique().tolist())
         default_idx = planteles.index(plantel_usuario) if plantel_usuario in planteles else 0
-        sel_plantel = st.selectbox("Selecciona un plantel", planteles, index=default_idx, key="cmp_sel_plantel_comportamiento")
+        sel_plantel = st.selectbox(
+            "Selecciona un plantel", planteles, index=default_idx, key="cmp_sel_plantel_comportamiento"
+        )
     else:
         sel_plantel = plantel_usuario
         st.text_input("Plantel", sel_plantel or "", disabled=True, key="cmp_plantel_ro_comportamiento")
@@ -186,3 +291,21 @@ def mostrar(
     st.markdown("**Módulos que ofrece el docente (última semana disponible)**")
     tabla = _tabla_modulos_ultima_semana(df_docente)
     st.dataframe(tabla, use_container_width=True)
+
+    # ================== Botón Excel (docente) ==================
+    docente_slug = _slugify_filename(sel_docente)
+    nombre_excel = f"{docente_slug}_comportamiento.xlsx"
+    excel_bytes = _excel_comportamiento_bytes(
+        plantel=str(sel_plantel or ""),
+        docente=str(sel_docente or ""),
+        semanas_df=sem,
+        tabla_modulos_df=tabla,
+    )
+    st.download_button(
+        label="⬇️ Crear/Descargar Excel del docente",
+        data=excel_bytes,
+        file_name=nombre_excel,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        help="Genera un Excel con el comportamiento semanal y la tabla de módulos de la última semana.",
+        key="cmp_btn_excel_docente"
+    )

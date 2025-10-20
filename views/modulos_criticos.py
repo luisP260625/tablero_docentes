@@ -1,8 +1,11 @@
-# views/modulo_semcaptura.py  (o el nombre que uses para este módulo)
+# views/modulo_semcaptura.py
 import streamlit as st
 import polars as pl
 import matplotlib.pyplot as plt
 import os
+import io
+import pandas as pd
+import unicodedata
 from utils.helpers import to_excel
 from config import RUTA_EXCEL_SEMCAPTURA
 
@@ -16,6 +19,81 @@ def cargar_semcaptura():
     except Exception as e:
         st.error(f"❌ Error al leer la hoja 'SemCaptura': {e}")
         return None
+
+# ========= Helpers Excel por docente =========
+def _slugify_filename(text: str) -> str:
+    """Convierte 'José Pérez / 3A' -> 'Jose_Perez__3A' y limpia caracteres inválidos."""
+    if not isinstance(text, str):
+        text = str(text or "")
+    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+    return "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in text).strip("_")
+
+def _auto_width_xlsx(ws, df: pd.DataFrame, start_col=0):
+    """Ajuste sencillo de ancho de columnas según contenido."""
+    for idx, col in enumerate(df.columns, start=start_col):
+        try:
+            max_len_vals = df[col].astype(str).map(len).max() if not df.empty else 0
+        except Exception:
+            max_len_vals = 0
+        header_len = len(str(col))
+        width = min(max(max_len_vals, header_len) + 2, 60)
+        ws.set_column(idx, idx, width)
+
+def _excel_docente_bytes(
+    detalle_df: pd.DataFrame,
+    resumen_semestre_df: pd.DataFrame | None,
+    docente: str,
+    modulo: str,
+    plantel: str,
+    semana: int | str,
+) -> bytes:
+    """Crea un Excel en memoria con 'Detalle por grupo' y opcional 'Resumen por semestre'."""
+    buffer = io.BytesIO()
+    # Intentamos xlsxwriter; si no, usamos openpyxl
+    try:
+        writer = pd.ExcelWriter(buffer, engine="xlsxwriter")
+    except Exception:
+        writer = pd.ExcelWriter(buffer)  # que pandas elija engine disponible
+
+    with writer:
+        # --- Hoja: Detalle por grupo ---
+        sheet_detalle = "Detalle por grupo"
+        meta = pd.DataFrame(
+            {
+                "Campo": ["Docente", "Plantel", "Módulo", "Semana"],
+                "Valor": [docente, plantel, modulo, semana],
+            }
+        )
+        meta.to_excel(writer, sheet_name=sheet_detalle, index=False, startrow=0)
+        startrow = len(meta) + 2  # dejar una fila en blanco
+        detalle_df.to_excel(writer, sheet_name=sheet_detalle, index=False, startrow=startrow)
+
+        wb = writer.book
+        ws_det = writer.sheets[sheet_detalle]
+
+        # Estilos simples
+        try:
+            fmt_title = wb.add_format({"bold": True, "font_size": 12})
+            ws_det.write(0, 0, "Campo", fmt_title)
+            ws_det.write(0, 1, "Valor", fmt_title)
+            ws_det.freeze_panes(startrow, 0)
+        except Exception:
+            pass
+
+        # Auto ancho de columnas (para tabla)
+        _auto_width_xlsx(ws_det, detalle_df, start_col=0)
+
+        # --- Hoja: Resumen por semestre (opcional) ---
+        if resumen_semestre_df is not None and not resumen_semestre_df.empty:
+            sheet_resumen = "Resumen por semestre"
+            resumen_semestre_df.to_excel(writer, sheet_name=sheet_resumen, index=False)
+            ws_res = writer.sheets[sheet_resumen]
+            _auto_width_xlsx(ws_res, resumen_semestre_df, start_col=0)
+
+    buffer.seek(0)
+    return buffer.getvalue()
+# ========= Fin helpers Excel =========
+
 
 def mostrar(df, plantel_usuario, es_admin):
     df_semcaptura = cargar_semcaptura()
@@ -69,28 +147,20 @@ def mostrar(df, plantel_usuario, es_admin):
         )
     )
 
-    # Datos para la gráfica
-    semanas = [int(s) for s in df_semanal["Semana"].to_list()]                  # solo semanas existentes
+    semanas = [int(s) for s in df_semanal["Semana"].to_list()]
     nc = df_semanal["NO_COMP"].to_list()
     ta = df_semanal["TOTAL"].to_list()
     porcentajes = [f"{(n / t * 100):.1f}%" if t > 0 else "0%" for n, t in zip(nc, ta)]
 
     fig, ax = plt.subplots(figsize=(8, 3))
-    bar_color = "#9f2241"                                                      # color solicitado
+    bar_color = "#9f2241"
     bars = ax.bar(semanas, nc, width=0.6, align="center", color=bar_color, edgecolor=bar_color)
-
-    # Ticks SOLO de semanas presentes + límites para evitar 4.6, 4.7, ...
     if len(semanas) > 0:
         ax.set_xticks(semanas)
         ax.set_xlim(min(semanas) - 0.5, max(semanas) + 0.5)
-
-    # Margen superior para que no se salgan las etiquetas
     y_max = max(nc) if nc else 0
     margen = max(1, int(round(y_max * 0.2))) if y_max > 0 else 1
     ax.set_ylim(0, y_max + margen)
-
-    # Etiquetas "conteo - porcentaje" rotadas (dentro del área)
-    total = sum(nc) if nc else 0
     for i, bar in enumerate(bars):
         ax.annotate(
             f"{nc[i]} - {porcentajes[i]}",
@@ -102,13 +172,9 @@ def mostrar(df, plantel_usuario, es_admin):
             rotation=90,
             fontsize=8,
         )
-
-    # Limpieza visual y SIN etiqueta de eje Y
     ax.spines['right'].set_visible(False)
     ax.spines['top'].set_visible(False)
     ax.set_xlabel("Semana")
-    # ax.set_ylabel("No Competentes")  # <- eliminado
-
     fig.tight_layout()
     st.pyplot(fig)
     # ================== FIN GRÁFICA SEMANAL ==================
@@ -124,7 +190,7 @@ def mostrar(df, plantel_usuario, es_admin):
         st.markdown(f"#### 👤 Docente: {docente}")
         df_docente = df_modulo_ultima.filter(pl.col("DOCENTE") == docente)
 
-        # Resumen por semestre
+        # Resumen por semestre (para hoja opcional en Excel)
         resumen_1 = (
             df_docente.group_by("SEMESTRE")
             .agg(
@@ -165,7 +231,7 @@ def mostrar(df, plantel_usuario, es_admin):
         else:
             st.info("📬 No hay datos relevantes en el resumen por semestre para este docente.")
 
-        # Detalle por grupo (sin perder funcionalidad)
+        # Detalle por grupo (base para Excel)
         df_sem_grupo = df_semcaptura.filter(
             (pl.col("Plantel") == plantel)
             & (pl.col("DOCENTE") == docente)
@@ -191,15 +257,33 @@ def mostrar(df, plantel_usuario, es_admin):
         if not resumen_2_filtrado.is_empty():
             st.markdown("**📄 Detalle por grupo: El porcentaje de captura que se presenta, corresponde al conjunto de los indicadores evaluados.**")
             st.dataframe(resumen_2_filtrado.to_pandas(), use_container_width=True)
+
+            # ========= Botón Excel por DOCENTE =========
+            docente_slug = _slugify_filename(docente)
+            archivo_nombre = f"{docente_slug}_porcentajeCaptura.xlsx"
+
+            detalle_pd = resumen_2_filtrado.to_pandas()
+            resumen_sem_pd = resumen_1_filtrado.to_pandas() if not resumen_1_filtrado.is_empty() else None
+
+            excel_bytes = _excel_docente_bytes(
+                detalle_df=detalle_pd,
+                resumen_semestre_df=resumen_sem_pd,
+                docente=docente,
+                modulo=modulo,
+                plantel=plantel,
+                semana=ultima_semana,
+            )
+
+            st.download_button(
+                label="⬇️ Crear/Descargar Excel del docente",
+                data=excel_bytes,
+                file_name=archivo_nombre,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                help="Crea un archivo Excel con el Detalle por grupo y (si aplica) el Resumen por semestre.",
+            )
+            # ========= Fin Botón Excel =========
+
         else:
             st.info("📬 No hay información detallada por grupo para este docente.")
 
-    # Exportar Excel del módulo completo (sin cambios)
-    excel_data = to_excel(df_modulo_completo.to_pandas())
-    st.download_button(
-        label="📅 Descargar reporte detallado del módulo",
-        data=excel_data,
-        file_name=f"modulo_{modulo}_detalle.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
 

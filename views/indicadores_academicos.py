@@ -1,3 +1,4 @@
+# views/indicadores_academicos.py  (usa el nombre de tu módulo)
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -5,10 +6,11 @@ from io import BytesIO
 from datetime import datetime
 
 # =========================
-# Carga de datos (igual)
+# Carga de datos
 # =========================
 @st.cache_data
 def cargar_datos():
+    # Asegúrate de que en "Reprobacion" exista la columna 'pRelativo'
     df_reprobacion = pd.read_excel("assets/Datos1.xlsx", sheet_name="Reprobacion")
     df_matricula   = pd.read_excel("assets/Datos1.xlsx", sheet_name="Matricula", usecols=["Plantel", "matriculaTotal"])
     return df_reprobacion, df_matricula
@@ -17,6 +19,9 @@ def cargar_datos():
 # Exportadores
 # =========================
 def exportar_excel(df, filename="seguimiento_filtrado.xlsx"):
+    """
+    Exporta EXACTAMENTE las columnas del DataFrame recibido (incluyendo pRelativo si está presente).
+    """
     output = BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         df.to_excel(writer, index=False, sheet_name="NO_COMPETENTES")
@@ -80,10 +85,7 @@ def mostrar_indicadores_academicos():
 
     df_reprobacion, df_matricula = cargar_datos()
 
-    # ⚠️ df_reprobacion se asume como el universo de NO competentes (hoja "Reprobacion").
-    #    Si en el futuro se agregan "competentes", aquí habría que filtrar.
-
-    # --- Agregación para tabla/gráfica ---
+    # --- Agregación para tabla/gráfica (igual que antes) ---
     df_modulos = df_reprobacion.groupby(["Plantel", "matricula"]).size().reset_index(name="modulos_reprobados")
     df_modulos["categoria"] = df_modulos["modulos_reprobados"].apply(lambda x: str(x) if x <= 10 else "11 o más")
 
@@ -138,29 +140,38 @@ def mostrar_indicadores_academicos():
         )
         st.plotly_chart(fig, use_container_width=True)
 
-        # ---------- NUEVO: impresión / exportación por plantel ----------
+        # ---------- Exportar / imprimir por plantel (con pRelativo al final) ----------
         st.markdown("---")
         st.subheader("🖨️ Imprimir / exportar NO competentes por plantel")
 
         planteles_disponibles = sorted(df_reprobacion["Plantel"].dropna().unique().tolist())
         plantel_sel = st.selectbox("Selecciona un plantel", planteles_disponibles)
 
+        # Columnas base + pRelativo al final si existe
         columnas_exportar = ["ESTUDIANTE", "matricula", "CARRERA", "MODULO", "DOCENTE", "grado", "cvegrupo"]
         df_print = df_reprobacion[df_reprobacion["Plantel"] == plantel_sel].copy()
-        faltantes_cols = [c for c in columnas_exportar if c not in df_print.columns]
-        if faltantes_cols:
-            # Si faltan columnas, solo usa las que existan
-            cols_ok = [c for c in columnas_exportar if c in df_print.columns]
-        else:
-            cols_ok = columnas_exportar
 
-        df_print = df_print[["Plantel"] + cols_ok] if "Plantel" in df_print.columns else df_print[cols_ok]
+        # Aseguramos pRelativo como float si existe
+        if "pRelativo" in df_print.columns:
+            df_print["pRelativo"] = pd.to_numeric(df_print["pRelativo"], errors="coerce")
+
+        faltantes_cols = [c for c in columnas_exportar if c not in df_print.columns]
+        cols_ok = [c for c in columnas_exportar if c in df_print.columns]
+
+        # Orden final con pRelativo al final si existe
+        if "pRelativo" in df_print.columns:
+            orden_final = (["Plantel"] if "Plantel" in df_print.columns else []) + cols_ok + ["pRelativo"]
+        else:
+            orden_final = (["Plantel"] if "Plantel" in df_print.columns else []) + cols_ok
+
+        df_print = df_print[orden_final]
 
         if df_print.empty:
             st.info(f"ℹ️ No hay registros de NO competentes para **{plantel_sel}**.")
         else:
             st.dataframe(df_print, use_container_width=True, height=360)
-            # Botón Excel
+
+            # Botón Excel (incluye pRelativo si existe)
             archivo_xlsx = exportar_excel(df_print, filename=f"no_competentes_{plantel_sel}.xlsx")
             st.download_button(
                 label="📤 Descargar Excel (NO competentes)",
@@ -169,7 +180,8 @@ def mostrar_indicadores_academicos():
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True
             )
-            # Botón HTML imprimible
+
+            # Botón HTML imprimible (incluye pRelativo si existe)
             archivo_html = exportar_html_imprimible(
                 df_print,
                 titulo="Estudiantes NO competentes",
@@ -185,7 +197,7 @@ def mostrar_indicadores_academicos():
             )
 
     # =========================
-    # PLANTEL
+    # PLANTEL (no administrador)
     # =========================
     else:
         plantel_usuario = st.session_state["plantel_usuario"]
@@ -193,7 +205,7 @@ def mostrar_indicadores_academicos():
         st.subheader(f"📋 Estudiantes del plantel: {plantel_usuario}")
         st.dataframe(tabla_filtrada, use_container_width=True)
 
-        # 🔹 Seguimiento semanal
+        # 🔹 Seguimiento semanal (sin cambios)
         df_seguimiento = pd.read_excel("assets/Datos1.xlsx", sheet_name="Seguimiento")
         df_plantel = df_seguimiento[df_seguimiento["Plantel"] == plantel_usuario]
 
@@ -232,12 +244,29 @@ def mostrar_indicadores_academicos():
         matricula_plantel = df_matricula[df_matricula["Plantel"] == plantel_usuario]["matriculaTotal"].values[0]
         st.markdown(f"### 🎓 Matrícula total del plantel {plantel_usuario}: **{matricula_plantel:,}**")
 
-        # 🔹 Exportación / impresión (NO competentes del plantel actual)
+        # 🔹 Exportación / impresión (NO competentes del plantel actual, con pRelativo al final)
         columnas_exportar = ["ESTUDIANTE", "matricula", "CARRERA", "MODULO", "DOCENTE", "grado", "cvegrupo"]
         df_exportar = df_reprobacion[df_reprobacion["Plantel"] == plantel_usuario].copy()
+
+        # Aseguramos pRelativo como float si existe
+        if "pRelativo" in df_exportar.columns:
+            df_exportar["pRelativo"] = pd.to_numeric(df_exportar["pRelativo"], errors="coerce")
+
         faltantes_cols = [c for c in columnas_exportar if c not in df_exportar.columns]
         cols_ok = [c for c in columnas_exportar if c in df_exportar.columns]
-        df_exportar = df_exportar[["Plantel"] + cols_ok] if "Plantel" in df_exportar.columns else df_exportar[cols_ok]
+
+        if "Plantel" in df_exportar.columns:
+            base_cols = ["Plantel"] + cols_ok
+        else:
+            base_cols = cols_ok
+
+        # Orden final con pRelativo al final si existe
+        if "pRelativo" in df_exportar.columns:
+            orden_final = base_cols + ["pRelativo"]
+        else:
+            orden_final = base_cols
+
+        df_exportar = df_exportar[orden_final]
 
         st.markdown("### 📄 Estudiantes NO competentes (detalle)")
         if df_exportar.empty:
