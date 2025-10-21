@@ -1,4 +1,4 @@
-# views/indicadores_academicos.py  (usa el nombre de tu módulo)
+# views/indicadores_academicos.py
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -10,22 +10,40 @@ from datetime import datetime
 # =========================
 @st.cache_data
 def cargar_datos():
-    # Asegúrate de que en "Reprobacion" exista la columna 'pRelativo'
+    # La hoja se llama 'Reprobacion' en el archivo fuente (no se cambia)
     df_reprobacion = pd.read_excel("assets/Datos1.xlsx", sheet_name="Reprobacion")
     df_matricula   = pd.read_excel("assets/Datos1.xlsx", sheet_name="Matricula", usecols=["Plantel", "matriculaTotal"])
     return df_reprobacion, df_matricula
+
+# =========================
+# Utilidades
+# =========================
+METRICAS_ORDEN = ["pEspecifico", "pAlcanzado", "pRelativo"]
+
+def asegurar_metricas(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Asegura que existan las columnas pEspecifico, pAlcanzado, pRelativo (en ese orden),
+    y las convierte a numéricas cuando sea posible. Si alguna no existe, se crea vacía.
+    """
+    for col in METRICAS_ORDEN:
+        if col not in df.columns:
+            df[col] = pd.NA
+        else:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
 
 # =========================
 # Exportadores
 # =========================
 def exportar_excel(df, filename="seguimiento_filtrado.xlsx"):
     """
-    Exporta EXACTAMENTE las columnas del DataFrame recibido (incluyendo pRelativo si está presente).
+    Exporta EXACTAMENTE las columnas del DataFrame recibido
+    (incluyendo pEspecifico, pAlcanzado, pRelativo si están presentes).
     """
     output = BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         df.to_excel(writer, index=False, sheet_name="NO_COMPETENTES")
-        # Ajuste de ancho básico
+        # Ajuste de ancho básico por columna
         worksheet = writer.sheets["NO_COMPETENTES"]
         for idx, col in enumerate(df.columns, 1):
             width = min(max(12, int(df[col].astype(str).str.len().mean() + 5)), 40)
@@ -85,22 +103,34 @@ def mostrar_indicadores_academicos():
 
     df_reprobacion, df_matricula = cargar_datos()
 
-    # --- Agregación para tabla/gráfica (igual que antes) ---
-    df_modulos = df_reprobacion.groupby(["Plantel", "matricula"]).size().reset_index(name="modulos_reprobados")
-    df_modulos["categoria"] = df_modulos["modulos_reprobados"].apply(lambda x: str(x) if x <= 10 else "11 o más")
+    # --- Agregación para tabla/gráfica ---
+    # Cada fila en df_reprobacion representa un módulo "no competente" para un estudiante (Plantel, matricula)
+    df_modulos = (
+        df_reprobacion
+        .groupby(["Plantel", "matricula"])
+        .size()
+        .reset_index(name="modulos_nc")
+    )
+    df_modulos["categoria"] = df_modulos["modulos_nc"].apply(lambda x: str(x) if x <= 10 else "11 o más")
 
     resumen = df_modulos.groupby(["Plantel", "categoria"]).size().reset_index(name="total_estudiantes")
-    tabla = resumen.pivot(index="Plantel", columns="categoria", values="total_estudiantes").fillna(0).astype(int)
-    tabla["Total estudiantes reprobados"] = tabla.sum(axis=1)
+    tabla = (
+        resumen.pivot(index="Plantel", columns="categoria", values="total_estudiantes")
+        .fillna(0)
+        .astype(int)
+    )
+    # Estudiantes NO competentes = estudiantes únicos con >= 1 módulo no competente
+    tabla["Total estudiantes no competentes"] = tabla.sum(axis=1)
     tabla = tabla.merge(df_matricula, on="Plantel", how="left")
-    tabla["% Estudiantes reprobados"] = (tabla["Total estudiantes reprobados"] / tabla["matriculaTotal"]) * 100
-    tabla["% Estudiantes reprobados"] = tabla["% Estudiantes reprobados"].round(2)
+    tabla["% Estudiantes no competentes"] = (tabla["Total estudiantes no competentes"] / tabla["matriculaTotal"]) * 100
+    tabla["% Estudiantes no competentes"] = tabla["% Estudiantes no competentes"].round(2)
 
+    # Orden de columnas para mostrar
     orden_columnas = (
         ["Plantel", "matriculaTotal"] +
         [str(i) for i in range(1, 11) if str(i) in tabla.columns] +
         (["11 o más"] if "11 o más" in tabla.columns else []) +
-        ["Total estudiantes reprobados", "% Estudiantes reprobados"]
+        ["Total estudiantes no competentes", "% Estudiantes no competentes"]
     )
     tabla = tabla.reset_index()
     columnas_presentes = [col for col in orden_columnas if col in tabla.columns]
@@ -113,57 +143,50 @@ def mostrar_indicadores_academicos():
         st.subheader("📋 Estudiantes agrupados por módulos cursados")
         st.dataframe(tabla, use_container_width=True)
 
-        total_general = tabla["Total estudiantes reprobados"].sum()
+        total_general = tabla["Total estudiantes no competentes"].sum()
         porcentaje_promedio = round((total_general / tabla["matriculaTotal"].sum()) * 100, 2)
-        st.markdown(f"### 👥 Total general de estudiantes: **{total_general:,}**")
+        st.markdown(f"### 👥 Total general de estudiantes NO competentes: **{total_general:,}**")
         st.markdown(f"### 📊 Porcentaje respecto a matrícula: **{porcentaje_promedio}%**")
 
-        tabla_ordenada = tabla.sort_values(by="% Estudiantes reprobados", ascending=False)
+        tabla_ordenada = tabla.sort_values(by="% Estudiantes no competentes", ascending=False)
         tabla_ordenada["etiqueta"] = (
-            tabla_ordenada["Total estudiantes reprobados"].astype(str)
-            + " - " + tabla_ordenada["% Estudiantes reprobados"].astype(str) + "%"
+            tabla_ordenada["Total estudiantes no competentes"].astype(str)
+            + " - " + tabla_ordenada["% Estudiantes no competentes"].astype(str) + "%"
         )
 
         fig = px.bar(
             tabla_ordenada,
             x="Plantel",
-            y="% Estudiantes reprobados",
+            y="% Estudiantes no competentes",
             text="etiqueta",
-            title="Porcentaje de estudiantes por plantel",
+            title="Porcentaje de estudiantes NO competentes por plantel",
         )
-        fig.update_traces(textangle=0, textposition='auto', textfont=dict(size=14))
+        fig.update_traces(marker_color="#FFC107", textangle=0, textposition='auto', textfont=dict(size=14))
         fig.update_layout(
             xaxis_tickangle=-45,
-            yaxis_title="% de estudiantes",
+            yaxis_title="% de estudiantes NO competentes",
             xaxis_title="Plantel",
             height=600
         )
         st.plotly_chart(fig, use_container_width=True)
 
-        # ---------- Exportar / imprimir por plantel (con pRelativo al final) ----------
+        # ---------- Imprimir / exportar NO competentes por plantel ----------
         st.markdown("---")
         st.subheader("🖨️ Imprimir / exportar NO competentes por plantel")
 
         planteles_disponibles = sorted(df_reprobacion["Plantel"].dropna().unique().tolist())
         plantel_sel = st.selectbox("Selecciona un plantel", planteles_disponibles)
 
-        # Columnas base + pRelativo al final si existe
-        columnas_exportar = ["ESTUDIANTE", "matricula", "CARRERA", "MODULO", "DOCENTE", "grado", "cvegrupo"]
+        # Columnas base + métricas al final en orden específico
+        columnas_base = ["ESTUDIANTE", "matricula", "CARRERA", "MODULO", "DOCENTE", "grado", "cvegrupo"]
         df_print = df_reprobacion[df_reprobacion["Plantel"] == plantel_sel].copy()
 
-        # Aseguramos pRelativo como float si existe
-        if "pRelativo" in df_print.columns:
-            df_print["pRelativo"] = pd.to_numeric(df_print["pRelativo"], errors="coerce")
+        # Asegurar métricas y su orden
+        df_print = asegurar_metricas(df_print)
 
-        faltantes_cols = [c for c in columnas_exportar if c not in df_print.columns]
-        cols_ok = [c for c in columnas_exportar if c in df_print.columns]
-
-        # Orden final con pRelativo al final si existe
-        if "pRelativo" in df_print.columns:
-            orden_final = (["Plantel"] if "Plantel" in df_print.columns else []) + cols_ok + ["pRelativo"]
-        else:
-            orden_final = (["Plantel"] if "Plantel" in df_print.columns else []) + cols_ok
-
+        # Columnas finales (visibles y exportadas)
+        cols_presentes_base = [c for c in columnas_base if c in df_print.columns]
+        orden_final = (["Plantel"] if "Plantel" in df_print.columns else []) + cols_presentes_base + METRICAS_ORDEN
         df_print = df_print[orden_final]
 
         if df_print.empty:
@@ -171,7 +194,7 @@ def mostrar_indicadores_academicos():
         else:
             st.dataframe(df_print, use_container_width=True, height=360)
 
-            # Botón Excel (incluye pRelativo si existe)
+            # Excel (incluye pEspecifico, pAlcanzado, pRelativo)
             archivo_xlsx = exportar_excel(df_print, filename=f"no_competentes_{plantel_sel}.xlsx")
             st.download_button(
                 label="📤 Descargar Excel (NO competentes)",
@@ -181,7 +204,7 @@ def mostrar_indicadores_academicos():
                 use_container_width=True
             )
 
-            # Botón HTML imprimible (incluye pRelativo si existe)
+            # HTML imprimible (incluye métricas)
             archivo_html = exportar_html_imprimible(
                 df_print,
                 titulo="Estudiantes NO competentes",
@@ -205,7 +228,7 @@ def mostrar_indicadores_academicos():
         st.subheader(f"📋 Estudiantes del plantel: {plantel_usuario}")
         st.dataframe(tabla_filtrada, use_container_width=True)
 
-        # 🔹 Seguimiento semanal (sin cambios)
+        # 🔹 Seguimiento semanal
         df_seguimiento = pd.read_excel("assets/Datos1.xlsx", sheet_name="Seguimiento")
         df_plantel = df_seguimiento[df_seguimiento["Plantel"] == plantel_usuario]
 
@@ -232,7 +255,7 @@ def mostrar_indicadores_academicos():
             title=f"Seguimiento semanal – {plantel_usuario}",
             labels={"Cantidad": "Estudiantes"}
         )
-        fig.update_traces(textposition="outside")
+        fig.update_traces(marker_color="#FFC107", textposition="outside")
         fig.update_layout(
             xaxis_title="Semana",
             yaxis_title="Cantidad de estudiantes",
@@ -244,31 +267,30 @@ def mostrar_indicadores_academicos():
         matricula_plantel = df_matricula[df_matricula["Plantel"] == plantel_usuario]["matriculaTotal"].values[0]
         st.markdown(f"### 🎓 Matrícula total del plantel {plantel_usuario}: **{matricula_plantel:,}**")
 
-        # 🔹 Exportación / impresión (NO competentes del plantel actual, con pRelativo al final)
-        columnas_exportar = ["ESTUDIANTE", "matricula", "CARRERA", "MODULO", "DOCENTE", "grado", "cvegrupo"]
+        # 🔹 Exportación / impresión (NO competentes del plantel actual)
+        columnas_base = ["ESTUDIANTE", "matricula", "CARRERA", "MODULO", "DOCENTE", "grado", "cvegrupo"]
         df_exportar = df_reprobacion[df_reprobacion["Plantel"] == plantel_usuario].copy()
 
-        # Aseguramos pRelativo como float si existe
-        if "pRelativo" in df_exportar.columns:
-            df_exportar["pRelativo"] = pd.to_numeric(df_exportar["pRelativo"], errors="coerce")
+        # Asegurar métricas y su orden
+        df_exportar = asegurar_metricas(df_exportar)
 
-        faltantes_cols = [c for c in columnas_exportar if c not in df_exportar.columns]
-        cols_ok = [c for c in columnas_exportar if c in df_exportar.columns]
-
+        # Columnas finales
+        cols_presentes_base = [c for c in columnas_base if c in df_exportar.columns]
         if "Plantel" in df_exportar.columns:
-            base_cols = ["Plantel"] + cols_ok
+            base_cols = ["Plantel"] + cols_presentes_base
         else:
-            base_cols = cols_ok
-
-        # Orden final con pRelativo al final si existe
-        if "pRelativo" in df_exportar.columns:
-            orden_final = base_cols + ["pRelativo"]
-        else:
-            orden_final = base_cols
-
+            base_cols = cols_presentes_base
+        orden_final = base_cols + METRICAS_ORDEN
         df_exportar = df_exportar[orden_final]
 
-        st.markdown("### 📄 Estudiantes NO competentes (detalle)")
+        # 🔹 Contador X para el título (coincide con "Total estudiantes no competentes")
+        if not tabla_filtrada.empty and "Total estudiantes no competentes" in tabla_filtrada.columns:
+            total_nc = int(tabla_filtrada["Total estudiantes no competentes"].iloc[0])
+        else:
+            # Respaldo: contar estudiantes únicos por matricula en Reprobacion para el plantel
+            total_nc = df_reprobacion[df_reprobacion["Plantel"] == plantel_usuario]["matricula"].nunique()
+
+        st.markdown(f"### 📄 Estudiantes NO competentes {total_nc} (Detalle)")
         if df_exportar.empty:
             st.info("ℹ️ No hay registros de NO competentes para este plantel.")
         else:
