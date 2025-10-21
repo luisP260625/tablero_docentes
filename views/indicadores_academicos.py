@@ -137,17 +137,10 @@ def mostrar_indicadores_academicos():
     tabla = tabla[columnas_presentes]
 
     # =========================
-    # ADMIN
+    # ADMIN (orden solicitado)
     # =========================
     if st.session_state["administrador"]:
-        st.subheader("📋 Estudiantes agrupados por módulos cursados")
-        st.dataframe(tabla, use_container_width=True)
-
-        total_general = tabla["Total estudiantes no competentes"].sum()
-        porcentaje_promedio = round((total_general / tabla["matriculaTotal"].sum()) * 100, 2)
-        st.markdown(f"### 👥 Total general de estudiantes NO competentes: **{total_general:,}**")
-        st.markdown(f"### 📊 Porcentaje respecto a matrícula: **{porcentaje_promedio}%**")
-
+        # 1) Porcentaje de estudiantes NO competentes por plantel (GRÁFICA)
         tabla_ordenada = tabla.sort_values(by="% Estudiantes no competentes", ascending=False)
         tabla_ordenada["etiqueta"] = (
             tabla_ordenada["Total estudiantes no competentes"].astype(str)
@@ -170,7 +163,18 @@ def mostrar_indicadores_academicos():
         )
         st.plotly_chart(fig, use_container_width=True)
 
-        # ---------- Imprimir / exportar NO competentes por plantel ----------
+        # 2) Estudiantes agrupados por módulos NO competentes (TABLA)
+        st.subheader("📋 Estudiantes agrupados por módulos NO competentes")
+        st.dataframe(tabla, use_container_width=True)
+
+        # 3) Total general de estudiantes NO competentes (Cantidad)
+        # 4) Porcentaje respecto a la matrícula (Porcentaje)
+        total_general = tabla["Total estudiantes no competentes"].sum()
+        porcentaje_promedio = round((total_general / tabla["matriculaTotal"].sum()) * 100, 2)
+        st.markdown(f"### 👥 Total general de estudiantes NO competentes: **{total_general:,}**")
+        st.markdown(f"### 📊 Porcentaje respecto a la matrícula: **{porcentaje_promedio}%**")
+
+        # 5) Imprimir / exportar NO competentes por plantel (filtro + tabla)
         st.markdown("---")
         st.subheader("🖨️ Imprimir / exportar NO competentes por plantel")
 
@@ -189,46 +193,52 @@ def mostrar_indicadores_academicos():
         orden_final = (["Plantel"] if "Plantel" in df_print.columns else []) + cols_presentes_base + METRICAS_ORDEN
         df_print = df_print[orden_final]
 
+        # ✅ Contador X para el detalle del plantel seleccionado
+        fila_sel = tabla[tabla["Plantel"] == plantel_sel]
+        if not fila_sel.empty and "Total estudiantes no competentes" in fila_sel.columns:
+            total_nc_admin = int(fila_sel["Total estudiantes no competentes"].iloc[0])
+        else:
+            total_nc_admin = df_print["matricula"].nunique() if "matricula" in df_print.columns else len(df_print)
+
         if df_print.empty:
             st.info(f"ℹ️ No hay registros de NO competentes para **{plantel_sel}**.")
         else:
+            st.markdown(f"### 📄 Estudiantes NO competentes {total_nc_admin} (Detalle) — {plantel_sel}")
             st.dataframe(df_print, use_container_width=True, height=360)
 
-            # Excel (incluye pEspecifico, pAlcanzado, pRelativo)
-            archivo_xlsx = exportar_excel(df_print, filename=f"no_competentes_{plantel_sel}.xlsx")
-            st.download_button(
-                label="📤 Descargar Excel (NO competentes)",
-                data=archivo_xlsx,
-                file_name=f"no_competentes_{plantel_sel}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True
-            )
-
-            # HTML imprimible (incluye métricas)
-            archivo_html = exportar_html_imprimible(
-                df_print,
-                titulo="Estudiantes NO competentes",
-                subtitulo=f"Plantel: {plantel_sel}",
-                filename=f"no_competentes_{plantel_sel}.html"
-            )
-            st.download_button(
-                label="🖨️ Descargar HTML para imprimir (Ctrl+P → PDF)",
-                data=archivo_html,
-                file_name=f"no_competentes_{plantel_sel}.html",
-                mime="text/html",
-                use_container_width=True
-            )
+            # 6) Botones: Descargar Excel y Descargar HTML
+            col1, col2 = st.columns(2)
+            with col1:
+                archivo_xlsx = exportar_excel(df_print, filename=f"no_competentes_{plantel_sel}.xlsx")
+                st.download_button(
+                    label="📤 Descargar Excel",
+                    data=archivo_xlsx,
+                    file_name=f"no_competentes_{plantel_sel}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True
+                )
+            with col2:
+                archivo_html = exportar_html_imprimible(
+                    df_print,
+                    titulo="Estudiantes NO competentes",
+                    subtitulo=f"Plantel: {plantel_sel}",
+                    filename=f"no_competentes_{plantel_sel}.html"
+                )
+                st.download_button(
+                    label="🖨️ Descargar HTML",
+                    data=archivo_html,
+                    file_name=f"no_competentes_{plantel_sel}.html",
+                    mime="text/html",
+                    use_container_width=True
+                )
 
     # =========================
-    # PLANTEL (no administrador)
+    # PLANTEL (no administrador) — orden solicitado
     # =========================
     else:
         plantel_usuario = st.session_state["plantel_usuario"]
-        tabla_filtrada = tabla[tabla["Plantel"] == plantel_usuario]
-        st.subheader(f"📋 Estudiantes del plantel: {plantel_usuario}")
-        st.dataframe(tabla_filtrada, use_container_width=True)
 
-        # 🔹 Seguimiento semanal
+        # 1) Seguimiento semanal (GRÁFICA)
         df_seguimiento = pd.read_excel("assets/Datos1.xlsx", sheet_name="Seguimiento")
         df_plantel = df_seguimiento[df_seguimiento["Plantel"] == plantel_usuario]
 
@@ -247,12 +257,12 @@ def mostrar_indicadores_academicos():
         df_semana["Porcentaje"] = df_semana["Porcentaje"].round(2)
         df_semana["Etiqueta"] = df_semana["Cantidad"].astype(int).astype(str) + " - " + df_semana["Porcentaje"].astype(str) + "%"
 
+        st.subheader(f"📈 Seguimiento semanal – {plantel_usuario}")
         fig = px.bar(
             df_semana,
             x="Semana",
             y="Cantidad",
             text="Etiqueta",
-            title=f"Seguimiento semanal – {plantel_usuario}",
             labels={"Cantidad": "Estudiantes"}
         )
         fig.update_traces(marker_color="#FFC107", textposition="outside")
@@ -263,11 +273,16 @@ def mostrar_indicadores_academicos():
         )
         st.plotly_chart(fig, use_container_width=True)
 
-        # 🔹 Matrícula total
+        # 2) Estudiantes del plantel (TABLA)
+        tabla_filtrada = tabla[tabla["Plantel"] == plantel_usuario]
+        st.subheader(f"📋 Estudiantes del plantel: {plantel_usuario}")
+        st.dataframe(tabla_filtrada, use_container_width=True)
+
+        # 3) Matrícula total del plantel
         matricula_plantel = df_matricula[df_matricula["Plantel"] == plantel_usuario]["matriculaTotal"].values[0]
         st.markdown(f"### 🎓 Matrícula total del plantel {plantel_usuario}: **{matricula_plantel:,}**")
 
-        # 🔹 Exportación / impresión (NO competentes del plantel actual)
+        # 4) Estudiantes NO competentes (Detalle) — TABLA con contador X
         columnas_base = ["ESTUDIANTE", "matricula", "CARRERA", "MODULO", "DOCENTE", "grado", "cvegrupo"]
         df_exportar = df_reprobacion[df_reprobacion["Plantel"] == plantel_usuario].copy()
 
@@ -276,37 +291,34 @@ def mostrar_indicadores_academicos():
 
         # Columnas finales
         cols_presentes_base = [c for c in columnas_base if c in df_exportar.columns]
-        if "Plantel" in df_exportar.columns:
-            base_cols = ["Plantel"] + cols_presentes_base
-        else:
-            base_cols = cols_presentes_base
+        base_cols = (["Plantel"] if "Plantel" in df_exportar.columns else []) + cols_presentes_base
         orden_final = base_cols + METRICAS_ORDEN
         df_exportar = df_exportar[orden_final]
 
-        # 🔹 Contador X para el título (coincide con "Total estudiantes no competentes")
+        # ✅ Contador X para el título (coincide con "Total estudiantes no competentes")
         if not tabla_filtrada.empty and "Total estudiantes no competentes" in tabla_filtrada.columns:
             total_nc = int(tabla_filtrada["Total estudiantes no competentes"].iloc[0])
         else:
             # Respaldo: contar estudiantes únicos por matricula en Reprobacion para el plantel
             total_nc = df_reprobacion[df_reprobacion["Plantel"] == plantel_usuario]["matricula"].nunique()
 
-        st.markdown(f"### 📄 Estudiantes NO competentes {total_nc} (Detalle)")
+        st.subheader(f"📄 Estudiantes NO competentes {total_nc} (Detalle)")
         if df_exportar.empty:
             st.info("ℹ️ No hay registros de NO competentes para este plantel.")
         else:
             st.dataframe(df_exportar, use_container_width=True, height=360)
 
+            # 5) Botones: Exportar estudiantes a Excel / Descargar HTML para imprimir
             col_a, col_b = st.columns(2)
             with col_a:
-                if st.button("📤 Exportar estudiantes a Excel"):
-                    archivo = exportar_excel(df_exportar, filename=f"estudiantes_{plantel_usuario}.xlsx")
-                    st.success("✅ Archivo Excel generado.")
-                    st.download_button(
-                        label="⬇️ Descargar Excel",
-                        data=archivo,
-                        file_name=f"estudiantes_{plantel_usuario}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    )
+                archivo = exportar_excel(df_exportar, filename=f"estudiantes_{plantel_usuario}.xlsx")
+                st.download_button(
+                    label="📤 Exportar estudiantes a Excel",
+                    data=archivo,
+                    file_name=f"estudiantes_{plantel_usuario}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True
+                )
             with col_b:
                 archivo_html = exportar_html_imprimible(
                     df_exportar,
@@ -315,8 +327,9 @@ def mostrar_indicadores_academicos():
                     filename=f"no_competentes_{plantel_usuario}.html"
                 )
                 st.download_button(
-                    label="🖨️ Descargar HTML para imprimir (Ctrl+P → PDF)",
+                    label="🖨️ Descargar HTML para imprimir",
                     data=archivo_html,
                     file_name=f"no_competentes_{plantel_usuario}.html",
-                    mime="text/html"
+                    mime="text/html",
+                    use_container_width=True
                 )

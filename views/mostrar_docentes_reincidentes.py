@@ -32,7 +32,7 @@ def mostrar_docentes_reincidentes(df):
             pl.sum("ES_CRITICO").alias("Semanas_Criticas"),
             pl.mean("PORCENTAJE_SEMANA").alias("PROMEDIO")
         ])
-        .filter((pl.col("Total_Semanas") == pl.col("Semanas_Criticas")) & (pl.col("Total_Semanas") > 1))
+        .filter((pl.col("Total_Semanas") == pl.col("Semanas_Criticas")) & (pl.col("Total_Semanas") >= 2))
         .sort("Total_Semanas", descending=True)
     )
 
