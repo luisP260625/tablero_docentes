@@ -32,6 +32,31 @@ def asegurar_metricas(df: pd.DataFrame) -> pd.DataFrame:
             df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
 
+def agregar_fila_total(tabla: pd.DataFrame) -> pd.DataFrame:
+    """
+    Devuelve la tabla con una fila 'TOTAL' al final, sumando todas las columnas numéricas.
+    El porcentaje total se calcula como total_nc / total_matricula * 100 (no se suman porcentajes).
+    """
+    df = tabla.copy()
+    numeric_cols = df.select_dtypes(include="number").columns.tolist()
+
+    total_row = {col: (df[col].sum() if col in numeric_cols else "") for col in df.columns}
+    # Etiqueta de la primera columna de texto
+    if "Plantel" in df.columns:
+        total_row["Plantel"] = "TOTAL"
+
+    # Recalcular porcentaje total correctamente si existen las columnas necesarias
+    if (
+        "% Estudiantes no competentes" in df.columns
+        and "Total estudiantes no competentes" in df.columns
+        and "matriculaTotal" in df.columns
+    ):
+        total_nc = df["Total estudiantes no competentes"].sum()
+        total_matricula = df["matriculaTotal"].sum()
+        total_row["% Estudiantes no competentes"] = round((total_nc / total_matricula) * 100, 2) if total_matricula else 0
+
+    return pd.concat([df, pd.DataFrame([total_row])], ignore_index=True)
+
 # =========================
 # Exportadores
 # =========================
@@ -163,9 +188,10 @@ def mostrar_indicadores_academicos():
         )
         st.plotly_chart(fig, use_container_width=True)
 
-        # 2) Estudiantes agrupados por módulos NO competentes (TABLA)
+        # 2) Estudiantes agrupados por módulos NO competentes (TABLA) + TOTAL
         st.subheader("📋 Estudiantes agrupados por módulos NO competentes")
-        st.dataframe(tabla, use_container_width=True)
+        tabla_con_total = agregar_fila_total(tabla)
+        st.dataframe(tabla_con_total, use_container_width=True)
 
         # 3) Total general de estudiantes NO competentes (Cantidad)
         # 4) Porcentaje respecto a la matrícula (Porcentaje)
