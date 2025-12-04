@@ -71,7 +71,10 @@ def exportar_excel(df, filename="seguimiento_filtrado.xlsx"):
         # Ajuste de ancho básico por columna
         worksheet = writer.sheets["NO_COMPETENTES"]
         for idx, col in enumerate(df.columns, 1):
-            width = min(max(12, int(df[col].astype(str).str.len().mean() + 5)), 40)
+            try:
+                width = min(max(12, int(df[col].astype(str).str.len().mean() + 5)), 40)
+            except Exception:
+                width = 20
             worksheet.set_column(idx-1, idx-1, width)
     output.seek(0)
     return output
@@ -162,7 +165,7 @@ def mostrar_indicadores_academicos():
     tabla = tabla[columnas_presentes]
 
     # =========================
-    # ADMIN (orden solicitado)
+    # ADMIN
     # =========================
     if st.session_state["administrador"]:
         # 1) Porcentaje de estudiantes NO competentes por plantel (GRÁFICA)
@@ -192,6 +195,32 @@ def mostrar_indicadores_academicos():
         st.subheader("📋 Estudiantes agrupados por módulos NO competentes")
         tabla_con_total = agregar_fila_total(tabla)
         st.dataframe(tabla_con_total, use_container_width=True)
+
+        # ✅ Botones de impresión/exportación de la tabla agrupada (sin controles de orden)
+        col_imp_xlsx, col_imp_html = st.columns(2)
+        with col_imp_xlsx:
+            archivo_xlsx_agrupada = exportar_excel(tabla_con_total, filename="agrupados_no_competentes.xlsx")
+            st.download_button(
+                label="📤 Descargar Excel (tabla agrupada)",
+                data=archivo_xlsx_agrupada,
+                file_name="agrupados_no_competentes.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True
+            )
+        with col_imp_html:
+            archivo_html_agrupada = exportar_html_imprimible(
+                tabla_con_total,
+                titulo="Estudiantes agrupados por módulos NO competentes",
+                subtitulo="(Vista agrupada con TOTAL)",
+                filename="agrupados_no_competentes.html"
+            )
+            st.download_button(
+                label="🖨️ Descargar HTML (tabla agrupada)",
+                data=archivo_html_agrupada,
+                file_name="agrupados_no_competentes.html",
+                mime="text/html",
+                use_container_width=True
+            )
 
         # 3) Total general de estudiantes NO competentes (Cantidad)
         # 4) Porcentaje respecto a la matrícula (Porcentaje)
@@ -229,7 +258,8 @@ def mostrar_indicadores_academicos():
         if df_print.empty:
             st.info(f"ℹ️ No hay registros de NO competentes para **{plantel_sel}**.")
         else:
-            st.markdown(f"### 📄 Estudiantes NO competentes {total_nc_admin} (Detalle) — {plantel_sel}")
+            # 🔶 Ícono anaranjado en Estudiantes NO competentes (Detalle)
+            st.markdown(f"### ⚠️ Estudiantes NO competentes {total_nc_admin} (Detalle) — {plantel_sel}")
             st.dataframe(df_print, use_container_width=True, height=360)
 
             # 6) Botones: Descargar Excel y Descargar HTML
@@ -258,8 +288,32 @@ def mostrar_indicadores_academicos():
                     use_container_width=True
                 )
 
+            # =========================
+            # 🚨 Estudiantes sin registro de Calificaciones
+            # =========================
+            df_sin_registro = df_print[df_print["pEspecifico"] == 0].copy() if "pEspecifico" in df_print.columns else pd.DataFrame()
+
+            # Ícono de alerta roja, SIN el texto (pEspecifico = 0)
+            st.subheader("🚨 Estudiantes sin registro de Calificaciones")
+            if df_sin_registro.empty:
+                st.info(f"ℹ️ No hay registros con pEspecifico = 0 para **{plantel_sel}**.")
+            else:
+                st.dataframe(df_sin_registro, use_container_width=True, height=360)
+
+                archivo_sin_registro = exportar_excel(
+                    df_sin_registro,
+                    filename=f"sin_registro_calificaciones_{plantel_sel}.xlsx"
+                )
+                st.download_button(
+                    label="📤 Sin registro de Calificaciones",
+                    data=archivo_sin_registro,
+                    file_name=f"sin_registro_calificaciones_{plantel_sel}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True
+                )
+
     # =========================
-    # PLANTEL (no administrador) — orden solicitado
+    # PLANTEL (no administrador)
     # =========================
     else:
         plantel_usuario = st.session_state["plantel_usuario"]
@@ -328,7 +382,8 @@ def mostrar_indicadores_academicos():
             # Respaldo: contar estudiantes únicos por matricula en Reprobacion para el plantel
             total_nc = df_reprobacion[df_reprobacion["Plantel"] == plantel_usuario]["matricula"].nunique()
 
-        st.subheader(f"📄 Estudiantes NO competentes {total_nc} (Detalle)")
+        # 🔶 Ícono anaranjado en Estudiantes NO competentes (Detalle)
+        st.subheader(f"⚠️ Estudiantes NO competentes {total_nc} (Detalle)")
         if df_exportar.empty:
             st.info("ℹ️ No hay registros de NO competentes para este plantel.")
         else:
@@ -359,3 +414,27 @@ def mostrar_indicadores_academicos():
                     mime="text/html",
                     use_container_width=True
                 )
+
+        # =========================
+        # 🚨 Estudiantes sin registro de Calificaciones – Plantel
+        # =========================
+        df_sin_registro_plantel = df_exportar[df_exportar["pEspecifico"] == 0].copy() if "pEspecifico" in df_exportar.columns else pd.DataFrame()
+
+        # Ícono de alerta roja, SIN (pEspecifico = 0) en el texto
+        st.subheader("🚨 Estudiantes sin registro de Calificaciones")
+        if df_sin_registro_plantel.empty:
+            st.info("ℹ️ No hay registros con pEspecifico = 0 para este plantel.")
+        else:
+            st.dataframe(df_sin_registro_plantel, use_container_width=True, height=360)
+
+            archivo_sin_registro_plantel = exportar_excel(
+                df_sin_registro_plantel,
+                filename=f"sin_registro_calificaciones_{plantel_usuario}.xlsx"
+            )
+            st.download_button(
+                label="📤 Sin registro de Calificaciones",
+                data=archivo_sin_registro_plantel,
+                file_name=f"sin_registro_calificaciones_{plantel_usuario}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True
+            )
