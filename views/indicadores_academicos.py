@@ -293,8 +293,20 @@ def mostrar_indicadores_academicos():
             # =========================
             df_sin_registro = df_print[df_print["pEspecifico"] == 0].copy() if "pEspecifico" in df_print.columns else pd.DataFrame()
 
-            # Ícono de alerta roja, SIN el texto (pEspecifico = 0)
-            st.subheader("🚨 Estudiantes sin registro de Calificaciones")
+            # Contador de ESTUDIANTES (matrículas únicas) sin registro
+            if df_sin_registro.empty:
+                total_sin_registro = 0
+            else:
+                if "matricula" in df_sin_registro.columns:
+                    total_sin_registro = df_sin_registro["matricula"].nunique()
+                else:
+                    total_sin_registro = len(df_sin_registro)
+
+            # Ícono de alerta roja con contador, igual que Estudiantes NO competentes
+            st.markdown(
+                f"### 🚨 Estudiantes sin registro de Calificaciones {total_sin_registro} (Detalle) — {plantel_sel}"
+            )
+
             if df_sin_registro.empty:
                 st.info(f"ℹ️ No hay registros con pEspecifico = 0 para **{plantel_sel}**.")
             else:
@@ -418,10 +430,26 @@ def mostrar_indicadores_academicos():
         # =========================
         # 🚨 Estudiantes sin registro de Calificaciones – Plantel
         # =========================
-        df_sin_registro_plantel = df_exportar[df_exportar["pEspecifico"] == 0].copy() if "pEspecifico" in df_exportar.columns else pd.DataFrame()
+        df_sin_registro_plantel = (
+            df_exportar[df_exportar["pEspecifico"] == 0].copy()
+            if "pEspecifico" in df_exportar.columns
+            else pd.DataFrame()
+        )
 
-        # Ícono de alerta roja, SIN (pEspecifico = 0) en el texto
-        st.subheader("🚨 Estudiantes sin registro de Calificaciones")
+        # Contador de ESTUDIANTES (matrículas únicas) sin registro en el plantel
+        if df_sin_registro_plantel.empty:
+            total_sin_registro_plantel = 0
+        else:
+            if "matricula" in df_sin_registro_plantel.columns:
+                total_sin_registro_plantel = df_sin_registro_plantel["matricula"].nunique()
+            else:
+                total_sin_registro_plantel = len(df_sin_registro_plantel)
+
+        # Ícono de alerta roja con contador, igualando el estilo de NO competentes
+        st.subheader(
+            f"🚨 Estudiantes sin registro de Calificaciones {total_sin_registro_plantel} (Detalle)"
+        )
+
         if df_sin_registro_plantel.empty:
             st.info("ℹ️ No hay registros con pEspecifico = 0 para este plantel.")
         else:
