@@ -1,30 +1,38 @@
 # views/indicadores_academicos.py
 import streamlit as st
 import pandas as pd
-import plotly.express as px
+import plotly.graph_objects as go
 from io import BytesIO
 from datetime import datetime
+
+# =========================
+# CONFIG (tamaños de texto)
+# =========================
+LABEL_FONT_SIZE_ADMIN = 15     # <- tamaño etiquetas gráfica admin (prueba 9, 10, 11, 12)
+LABEL_FONT_SIZE_PLANTEL = 15   # <- tamaño etiquetas gráfica plantel (prueba 9, 10, 11, 12)
+
+# Multiplicador para dar "aire" arriba y que no se corte la etiqueta
+Y_AXIS_PADDING_MULT = 1.35
 
 # =========================
 # Carga de datos
 # =========================
 @st.cache_data
 def cargar_datos():
-    # La hoja se llama 'Reprobacion' en el archivo fuente (no se cambia)
     df_reprobacion = pd.read_excel("assets/Datos1.xlsx", sheet_name="Reprobacion")
-    df_matricula   = pd.read_excel("assets/Datos1.xlsx", sheet_name="Matricula", usecols=["Plantel", "matriculaTotal"])
+    df_matricula = pd.read_excel(
+        "assets/Datos1.xlsx", sheet_name="Matricula", usecols=["Plantel", "matriculaTotal"]
+    )
     return df_reprobacion, df_matricula
+
 
 # =========================
 # Utilidades
 # =========================
 METRICAS_ORDEN = ["pEspecifico", "pAlcanzado", "pRelativo"]
 
+
 def asegurar_metricas(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Asegura que existan las columnas pEspecifico, pAlcanzado, pRelativo (en ese orden),
-    y las convierte a numéricas cuando sea posible. Si alguna no existe, se crea vacía.
-    """
     for col in METRICAS_ORDEN:
         if col not in df.columns:
             df[col] = pd.NA
@@ -32,20 +40,15 @@ def asegurar_metricas(df: pd.DataFrame) -> pd.DataFrame:
             df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
 
+
 def agregar_fila_total(tabla: pd.DataFrame) -> pd.DataFrame:
-    """
-    Devuelve la tabla con una fila 'TOTAL' al final, sumando todas las columnas numéricas.
-    El porcentaje total se calcula como total_nc / total_matricula * 100 (no se suman porcentajes).
-    """
     df = tabla.copy()
     numeric_cols = df.select_dtypes(include="number").columns.tolist()
 
     total_row = {col: (df[col].sum() if col in numeric_cols else "") for col in df.columns}
-    # Etiqueta de la primera columna de texto
     if "Plantel" in df.columns:
         total_row["Plantel"] = "TOTAL"
 
-    # Recalcular porcentaje total correctamente si existen las columnas necesarias
     if (
         "% Estudiantes no competentes" in df.columns
         and "Total estudiantes no competentes" in df.columns
@@ -53,34 +56,32 @@ def agregar_fila_total(tabla: pd.DataFrame) -> pd.DataFrame:
     ):
         total_nc = df["Total estudiantes no competentes"].sum()
         total_matricula = df["matriculaTotal"].sum()
-        total_row["% Estudiantes no competentes"] = round((total_nc / total_matricula) * 100, 2) if total_matricula else 0
+        total_row["% Estudiantes no competentes"] = round(
+            (total_nc / total_matricula) * 100, 2
+        ) if total_matricula else 0
 
     return pd.concat([df, pd.DataFrame([total_row])], ignore_index=True)
+
 
 # =========================
 # Exportadores
 # =========================
 def exportar_excel(df, filename="seguimiento_filtrado.xlsx"):
-    """
-    Exporta EXACTAMENTE las columnas del DataFrame recibido
-    (incluyendo pEspecifico, pAlcanzado, pRelativo si están presentes).
-    """
     output = BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         df.to_excel(writer, index=False, sheet_name="NO_COMPETENTES")
-        # Ajuste de ancho básico por columna
         worksheet = writer.sheets["NO_COMPETENTES"]
         for idx, col in enumerate(df.columns, 1):
             try:
                 width = min(max(12, int(df[col].astype(str).str.len().mean() + 5)), 40)
             except Exception:
                 width = 20
-            worksheet.set_column(idx-1, idx-1, width)
+            worksheet.set_column(idx - 1, idx - 1, width)
     output.seek(0)
     return output
 
+
 def exportar_html_imprimible(df: pd.DataFrame, titulo: str, subtitulo: str = "", filename: str = "no_competentes.html") -> BytesIO:
-    """Genera un HTML listo para imprimir (Ctrl+P → PDF) con estilos básicos."""
     ahora = datetime.now().strftime("%Y-%m-%d %H:%M")
     css = """
     <style>
@@ -123,6 +124,7 @@ def exportar_html_imprimible(df: pd.DataFrame, titulo: str, subtitulo: str = "",
     b.seek(0)
     return b
 
+
 # =========================
 # Vista principal
 # =========================
@@ -132,7 +134,6 @@ def mostrar_indicadores_academicos():
     df_reprobacion, df_matricula = cargar_datos()
 
     # --- Agregación para tabla/gráfica ---
-    # Cada fila en df_reprobacion representa un módulo "no competente" para un estudiante (Plantel, matricula)
     df_modulos = (
         df_reprobacion
         .groupby(["Plantel", "matricula"])
@@ -147,13 +148,19 @@ def mostrar_indicadores_academicos():
         .fillna(0)
         .astype(int)
     )
-    # Estudiantes NO competentes = estudiantes únicos con >= 1 módulo no competente
+
     tabla["Total estudiantes no competentes"] = tabla.sum(axis=1)
     tabla = tabla.merge(df_matricula, on="Plantel", how="left")
-    tabla["% Estudiantes no competentes"] = (tabla["Total estudiantes no competentes"] / tabla["matriculaTotal"]) * 100
-    tabla["% Estudiantes no competentes"] = tabla["% Estudiantes no competentes"].round(2)
 
-    # Orden de columnas para mostrar
+    tabla["matriculaTotal"] = pd.to_numeric(tabla["matriculaTotal"], errors="coerce").fillna(0)
+    tabla["% Estudiantes no competentes"] = (tabla["Total estudiantes no competentes"] / tabla["matriculaTotal"]) * 100
+    tabla["% Estudiantes no competentes"] = (
+        tabla["% Estudiantes no competentes"]
+        .replace([float("inf"), -float("inf")], 0)
+        .fillna(0)
+        .round(2)
+    )
+
     orden_columnas = (
         ["Plantel", "matriculaTotal"] +
         [str(i) for i in range(1, 11) if str(i) in tabla.columns] +
@@ -168,35 +175,69 @@ def mostrar_indicadores_academicos():
     # ADMIN
     # =========================
     if st.session_state["administrador"]:
-        # 1) Porcentaje de estudiantes NO competentes por plantel (GRÁFICA)
-        tabla_ordenada = tabla.sort_values(by="% Estudiantes no competentes", ascending=False)
-        tabla_ordenada["etiqueta"] = (
-            tabla_ordenada["Total estudiantes no competentes"].astype(str)
-            + " - " + tabla_ordenada["% Estudiantes no competentes"].astype(str) + "%"
+
+        vista = st.radio(
+            "Visualización de la gráfica:",
+            ["% NO competencia", "Total NO competentes"],
+            horizontal=True
         )
 
-        fig = px.bar(
-            tabla_ordenada,
-            x="Plantel",
-            y="% Estudiantes no competentes",
-            text="etiqueta",
-            title="Porcentaje de estudiantes NO competentes por plantel",
+        tabla_ordenada = tabla.sort_values(by="% Estudiantes no competentes", ascending=False).copy()
+
+        # Etiqueta: "Total - %"
+        tabla_ordenada["etiqueta"] = tabla_ordenada.apply(
+            lambda r: f"{int(r['Total estudiantes no competentes'])} - {float(r['% Estudiantes no competentes']):.1f}%",
+            axis=1
         )
-        fig.update_traces(marker_color="#FFC107", textangle=0, textposition='auto', textfont=dict(size=14))
+
+        if vista == "% NO competencia":
+            y_col = "% Estudiantes no competentes"
+            titulo = "Porcentaje de estudiantes NO competentes por plantel"
+            y_title = "% de estudiantes NO competentes"
+        else:
+            y_col = "Total estudiantes no competentes"
+            titulo = "Total de estudiantes NO competentes por plantel"
+            y_title = "Total de estudiantes NO competentes"
+
+        ymax = float(tabla_ordenada[y_col].max()) if not tabla_ordenada.empty else 0
+
+        fig = go.Figure(
+            data=[
+                go.Bar(
+                    x=tabla_ordenada["Plantel"],
+                    y=tabla_ordenada[y_col],
+                    text=tabla_ordenada["etiqueta"],
+                    textposition="outside",
+                    textangle=-90,  # si se ve al revés: -90
+                    marker_color="#FFC107",
+                    cliponaxis=False,
+                    outsidetextfont=dict(size=LABEL_FONT_SIZE_ADMIN),
+                    hoverinfo="skip",
+                    hovertemplate="",
+                )
+            ]
+        )
+
         fig.update_layout(
-            xaxis_tickangle=-45,
-            yaxis_title="% de estudiantes NO competentes",
+            title=titulo,
             xaxis_title="Plantel",
-            height=600
+            yaxis_title=y_title,
+            xaxis_tickangle=-45,
+            height=560,
+            showlegend=False,
+            # 👇 CLAVE: ya NO fuerza tamaño grande; lo igualamos a tu tamaño configurado
+            uniformtext=dict(minsize=LABEL_FONT_SIZE_ADMIN, mode="show"),
+            yaxis=dict(range=[0, ymax * Y_AXIS_PADDING_MULT if ymax else 1]),
+            margin=dict(t=90),
         )
+
         st.plotly_chart(fig, use_container_width=True)
 
-        # 2) Estudiantes agrupados por módulos NO competentes (TABLA) + TOTAL
+        # 2) Tabla agrupada + TOTAL
         st.subheader("📋 Estudiantes agrupados por módulos NO competentes")
         tabla_con_total = agregar_fila_total(tabla)
         st.dataframe(tabla_con_total, use_container_width=True)
 
-        # ✅ Botones de impresión/exportación de la tabla agrupada (sin controles de orden)
         col_imp_xlsx, col_imp_html = st.columns(2)
         with col_imp_xlsx:
             archivo_xlsx_agrupada = exportar_excel(tabla_con_total, filename="agrupados_no_competentes.xlsx")
@@ -222,33 +263,29 @@ def mostrar_indicadores_academicos():
                 use_container_width=True
             )
 
-        # 3) Total general de estudiantes NO competentes (Cantidad)
-        # 4) Porcentaje respecto a la matrícula (Porcentaje)
-        total_general = tabla["Total estudiantes no competentes"].sum()
-        porcentaje_promedio = round((total_general / tabla["matriculaTotal"].sum()) * 100, 2)
+        # Totales generales
+        total_general = int(tabla["Total estudiantes no competentes"].sum())
+        total_matricula = float(tabla["matriculaTotal"].sum())
+        porcentaje_promedio = round((total_general / total_matricula) * 100, 2) if total_matricula else 0
         st.markdown(f"### 👥 Total general de estudiantes NO competentes: **{total_general:,}**")
         st.markdown(f"### 📊 Porcentaje respecto a la matrícula: **{porcentaje_promedio}%**")
 
-        # 5) Imprimir / exportar NO competentes por plantel (filtro + tabla)
+        # Imprimir / exportar por plantel
         st.markdown("---")
         st.subheader("🖨️ Imprimir / exportar NO competentes por plantel")
 
         planteles_disponibles = sorted(df_reprobacion["Plantel"].dropna().unique().tolist())
         plantel_sel = st.selectbox("Selecciona un plantel", planteles_disponibles)
 
-        # Columnas base + métricas al final en orden específico
         columnas_base = ["ESTUDIANTE", "matricula", "CARRERA", "MODULO", "DOCENTE", "grado", "cvegrupo"]
         df_print = df_reprobacion[df_reprobacion["Plantel"] == plantel_sel].copy()
 
-        # Asegurar métricas y su orden
         df_print = asegurar_metricas(df_print)
 
-        # Columnas finales (visibles y exportadas)
         cols_presentes_base = [c for c in columnas_base if c in df_print.columns]
         orden_final = (["Plantel"] if "Plantel" in df_print.columns else []) + cols_presentes_base + METRICAS_ORDEN
         df_print = df_print[orden_final]
 
-        # ✅ Contador X para el detalle del plantel seleccionado
         fila_sel = tabla[tabla["Plantel"] == plantel_sel]
         if not fila_sel.empty and "Total estudiantes no competentes" in fila_sel.columns:
             total_nc_admin = int(fila_sel["Total estudiantes no competentes"].iloc[0])
@@ -258,11 +295,9 @@ def mostrar_indicadores_academicos():
         if df_print.empty:
             st.info(f"ℹ️ No hay registros de NO competentes para **{plantel_sel}**.")
         else:
-            # 🔶 Ícono anaranjado en Estudiantes NO competentes (Detalle)
             st.markdown(f"### ⚠️ Estudiantes NO competentes {total_nc_admin} (Detalle) — {plantel_sel}")
             st.dataframe(df_print, use_container_width=True, height=360)
 
-            # 6) Botones: Descargar Excel y Descargar HTML
             col1, col2 = st.columns(2)
             with col1:
                 archivo_xlsx = exportar_excel(df_print, filename=f"no_competentes_{plantel_sel}.xlsx")
@@ -288,24 +323,23 @@ def mostrar_indicadores_academicos():
                     use_container_width=True
                 )
 
-            # =========================
-            # 🚨 Estudiantes sin registro de Calificaciones
-            # =========================
-            df_sin_registro = df_print[df_print["pEspecifico"] == 0].copy() if "pEspecifico" in df_print.columns else pd.DataFrame()
+            # Estudiantes sin registro de Calificaciones
+            df_sin_registro = (
+                df_print[df_print["pEspecifico"] == 0].copy()
+                if "pEspecifico" in df_print.columns
+                else pd.DataFrame()
+            )
 
-            # Contador de ESTUDIANTES (matrículas únicas) sin registro
             if df_sin_registro.empty:
                 total_sin_registro = 0
             else:
-                if "matricula" in df_sin_registro.columns:
-                    total_sin_registro = df_sin_registro["matricula"].nunique()
-                else:
-                    total_sin_registro = len(df_sin_registro)
+                total_sin_registro = (
+                    df_sin_registro["matricula"].nunique()
+                    if "matricula" in df_sin_registro.columns
+                    else len(df_sin_registro)
+                )
 
-            # Ícono de alerta roja con contador, igual que Estudiantes NO competentes
-            st.markdown(
-                f"### 🚨 Estudiantes sin registro de Calificaciones {total_sin_registro} (Detalle) — {plantel_sel}"
-            )
+            st.markdown(f"### 🚨 Estudiantes sin registro de Calificaciones {total_sin_registro} (Detalle) — {plantel_sel}")
 
             if df_sin_registro.empty:
                 st.info(f"ℹ️ No hay registros con pEspecifico = 0 para **{plantel_sel}**.")
@@ -335,7 +369,10 @@ def mostrar_indicadores_academicos():
         df_plantel = df_seguimiento[df_seguimiento["Plantel"] == plantel_usuario]
 
         columnas_cantidad = [col for col in df_plantel.columns if col.startswith("Sem ") and not col.endswith("%")]
-        columnas_porcentaje = [col for col in df_plantel.columns if col.endswith("%") and col.replace(" %", "") in columnas_cantidad]
+        columnas_porcentaje = [
+            col for col in df_plantel.columns
+            if col.endswith("%") and col.replace(" %", "") in columnas_cantidad
+        ]
 
         df_valores = df_plantel[columnas_cantidad].sum().reset_index()
         df_valores.columns = ["Semana", "Cantidad"]
@@ -346,23 +383,44 @@ def mostrar_indicadores_academicos():
         df_porcentajes["Semana"] = df_porcentajes["Semana"].str.replace(" %", "").str.strip()
 
         df_semana = pd.merge(df_valores, df_porcentajes, on="Semana", how="inner")
-        df_semana["Porcentaje"] = df_semana["Porcentaje"].round(2)
-        df_semana["Etiqueta"] = df_semana["Cantidad"].astype(int).astype(str) + " - " + df_semana["Porcentaje"].astype(str) + "%"
+        df_semana["Porcentaje"] = pd.to_numeric(df_semana["Porcentaje"], errors="coerce").fillna(0).round(2)
+
+        df_semana["Etiqueta"] = df_semana.apply(
+            lambda r: f"{int(r['Cantidad'])} - {float(r['Porcentaje']):.1f}%",
+            axis=1
+        )
 
         st.subheader(f"📈 Seguimiento semanal – {plantel_usuario}")
-        fig = px.bar(
-            df_semana,
-            x="Semana",
-            y="Cantidad",
-            text="Etiqueta",
-            labels={"Cantidad": "Estudiantes"}
+
+        ymax = float(df_semana["Cantidad"].max()) if not df_semana.empty else 0
+
+        fig = go.Figure(
+            data=[
+                go.Bar(
+                    x=df_semana["Semana"],
+                    y=df_semana["Cantidad"],
+                    text=df_semana["Etiqueta"],
+                    textposition="outside",
+                    textangle=-90,  # si se ve al revés: -90
+                    marker_color="#FFC107",
+                    cliponaxis=False,
+                    outsidetextfont=dict(size=LABEL_FONT_SIZE_PLANTEL),
+                    hoverinfo="skip",
+                    hovertemplate="",
+                )
+            ]
         )
-        fig.update_traces(marker_color="#FFC107", textposition="outside")
+
         fig.update_layout(
             xaxis_title="Semana",
             yaxis_title="Cantidad de estudiantes",
-            height=500
+            height=520,
+            showlegend=False,
+            uniformtext=dict(minsize=LABEL_FONT_SIZE_PLANTEL, mode="show"),
+            yaxis=dict(range=[0, ymax * Y_AXIS_PADDING_MULT if ymax else 1]),
+            margin=dict(t=70),
         )
+
         st.plotly_chart(fig, use_container_width=True)
 
         # 2) Estudiantes del plantel (TABLA)
@@ -371,37 +429,32 @@ def mostrar_indicadores_academicos():
         st.dataframe(tabla_filtrada, use_container_width=True)
 
         # 3) Matrícula total del plantel
-        matricula_plantel = df_matricula[df_matricula["Plantel"] == plantel_usuario]["matriculaTotal"].values[0]
+        vals = df_matricula[df_matricula["Plantel"] == plantel_usuario]["matriculaTotal"].values
+        matricula_plantel = int(vals[0]) if len(vals) else 0
         st.markdown(f"### 🎓 Matrícula total del plantel {plantel_usuario}: **{matricula_plantel:,}**")
 
-        # 4) Estudiantes NO competentes (Detalle) — TABLA con contador X
+        # 4) Estudiantes NO competentes (Detalle)
         columnas_base = ["ESTUDIANTE", "matricula", "CARRERA", "MODULO", "DOCENTE", "grado", "cvegrupo"]
         df_exportar = df_reprobacion[df_reprobacion["Plantel"] == plantel_usuario].copy()
 
-        # Asegurar métricas y su orden
         df_exportar = asegurar_metricas(df_exportar)
 
-        # Columnas finales
         cols_presentes_base = [c for c in columnas_base if c in df_exportar.columns]
         base_cols = (["Plantel"] if "Plantel" in df_exportar.columns else []) + cols_presentes_base
         orden_final = base_cols + METRICAS_ORDEN
         df_exportar = df_exportar[orden_final]
 
-        # ✅ Contador X para el título (coincide con "Total estudiantes no competentes")
         if not tabla_filtrada.empty and "Total estudiantes no competentes" in tabla_filtrada.columns:
             total_nc = int(tabla_filtrada["Total estudiantes no competentes"].iloc[0])
         else:
-            # Respaldo: contar estudiantes únicos por matricula en Reprobacion para el plantel
             total_nc = df_reprobacion[df_reprobacion["Plantel"] == plantel_usuario]["matricula"].nunique()
 
-        # 🔶 Ícono anaranjado en Estudiantes NO competentes (Detalle)
         st.subheader(f"⚠️ Estudiantes NO competentes {total_nc} (Detalle)")
         if df_exportar.empty:
             st.info("ℹ️ No hay registros de NO competentes para este plantel.")
         else:
             st.dataframe(df_exportar, use_container_width=True, height=360)
 
-            # 5) Botones: Exportar estudiantes a Excel / Descargar HTML para imprimir
             col_a, col_b = st.columns(2)
             with col_a:
                 archivo = exportar_excel(df_exportar, filename=f"estudiantes_{plantel_usuario}.xlsx")
@@ -427,28 +480,23 @@ def mostrar_indicadores_academicos():
                     use_container_width=True
                 )
 
-        # =========================
         # 🚨 Estudiantes sin registro de Calificaciones – Plantel
-        # =========================
         df_sin_registro_plantel = (
             df_exportar[df_exportar["pEspecifico"] == 0].copy()
             if "pEspecifico" in df_exportar.columns
             else pd.DataFrame()
         )
 
-        # Contador de ESTUDIANTES (matrículas únicas) sin registro en el plantel
         if df_sin_registro_plantel.empty:
             total_sin_registro_plantel = 0
         else:
-            if "matricula" in df_sin_registro_plantel.columns:
-                total_sin_registro_plantel = df_sin_registro_plantel["matricula"].nunique()
-            else:
-                total_sin_registro_plantel = len(df_sin_registro_plantel)
+            total_sin_registro_plantel = (
+                df_sin_registro_plantel["matricula"].nunique()
+                if "matricula" in df_sin_registro_plantel.columns
+                else len(df_sin_registro_plantel)
+            )
 
-        # Ícono de alerta roja con contador, igualando el estilo de NO competentes
-        st.subheader(
-            f"🚨 Estudiantes sin registro de Calificaciones {total_sin_registro_plantel} (Detalle)"
-        )
+        st.subheader(f"🚨 Estudiantes sin registro de Calificaciones {total_sin_registro_plantel} (Detalle)")
 
         if df_sin_registro_plantel.empty:
             st.info("ℹ️ No hay registros con pEspecifico = 0 para este plantel.")
