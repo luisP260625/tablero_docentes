@@ -1,6 +1,6 @@
 import streamlit as st
 from data.validator import validar_usuario
-from data.loader import cargar_datos
+from data.loader import cargar_datos, cargar_semcaptura
 from data.logger import registrar_acceso
 
 # Importar vistas
@@ -11,6 +11,7 @@ import views.comportamiento as vista_com
 import views.modulos_criticos as vista_mc
 import views.mostrar_estatal as vista_estatal
 import views.bitacora_conexiones as vista_bc
+import views.captura_docentes as vista_cd
 
 st.set_page_config(page_title="Tablero Docente", layout="wide")
 
@@ -84,6 +85,7 @@ if st.session_state.administrador:
         "Docentes Seguimiento",
         "Módulos Seguimiento",
         "Indicadores Académicos",
+        "Captura Docentes",
         "Bitácora de Conexiones"
     ]
 else:
@@ -92,7 +94,8 @@ else:
         "Docentes y Módulos",
         "Docentes Seguimiento",
         "Módulos Seguimiento",
-        "Indicadores Académicos"
+        "Indicadores Académicos",
+        "Captura Docentes",
     ]
 
 opcion = st.sidebar.selectbox("📂 MENÚ PRINCIPAL", opciones)
@@ -128,6 +131,14 @@ elif opcion == "Módulos Seguimiento":
 
 elif opcion == "Bitácora de Conexiones" and st.session_state.administrador:
     vista_bc.mostrar()
+
+elif opcion == "Captura Docentes":
+    df_sc, error_sc = cargar_semcaptura()
+    if error_sc:
+        st.error(f"❌ Error al cargar SemCaptura: {error_sc}")
+        st.stop()
+
+    vista_cd.mostrar(df_sc, st.session_state.plantel_usuario, st.session_state.administrador)
 
 elif opcion == "Ranking por docentes y módulos":
     mostrar_ranking_por_plantel(df, st.session_state.plantel_usuario)
