@@ -1,139 +1,197 @@
 # data/validator.py
+from __future__ import annotations
+
 from pathlib import Path
+import re
+import unicodedata
 import pandas as pd
-import streamlit as st
-from config import EXCEL_FILE, SHEET_PLANTELES, SHEET_DATOS
 
-__all__ = [
-    "validar_usuario",
-    "guard_plantel_or_stop",
-    "plantel_has_data",
-    "get_missing_planteles",
-]
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DATOS_XLSX = PROJECT_ROOT / "assets" / "Datos1.xlsx"
 
-# --- Admin (ajusta si quieres) ---
-ADMIN_USER = "admin"
-ADMIN_PASS = "administrador*"
+# Nombres “probables” (por si quieres mantener un estándar)
+POSSIBLE_USERS_SHEETS = ["planteles", "plantel", "usuarios", "users"]
+POSSIBLE_PERMS_SHEETS = ["permisos", "permiso", "permissions"]
 
-# Para invalidar cache si cambia el Excel en disco
-def _excel_mtime() -> int:
-    p = Path(EXCEL_FILE)
-    return int(p.stat().st_mtime) if p.exists() else 0
+# Si tu columna en planteles se llama distinto, aquí se detecta por contenido
+USER_COL_CANDIDATES = ["usuario", "user", "username"]
+PASS_COL_CANDIDATES = ["contrasena", "contraseña", "password", "pass"]
+PLANTEL_COL_CANDIDATES = ["plantel", "cct", "campus", "centro"]
+PERMIDS_COL_CANDIDATES = ["permisos", "permiso", "id_permiso", "id_permisos", "permisos_ids"]
 
-# ---------- Carga/normalización ----------
-@st.cache_data(ttl=600)
-def _load_df(sheet: str, _v=_excel_mtime()) -> pd.DataFrame:
-    df = pd.read_excel(EXCEL_FILE, sheet_name=sheet, dtype=str)
-    # normaliza encabezados
-    df.columns = [c.strip() for c in df.columns]
-    return df
 
-def _norm(s: str) -> str:
-    return str(s or "").strip()
+def _norm_text(s) -> str:
+    s = str(s).strip()
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    return s.lower().strip()
 
-def _norm_user(s: str) -> str:
-    return _norm(s).upper()
 
-# ---------- Login ----------
-@st.cache_data(ttl=600)
-def _load_planteles_norm(_v=_excel_mtime()) -> pd.DataFrame:
-    df = _load_df(SHEET_PLANTELES)
-    # renombra columnas tolerando "Contraseña"/"Contrasena"
-    cols = {c.lower(): c for c in df.columns}
-    # nombre canónico:
-    col_plantel = cols.get("plantel")
-    col_usuario = cols.get("usuario")
-    col_contra  = cols.get("contrasena") or cols.get("contraseña")
+def _find_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    cols = list(df.columns)
+    lows = [_norm_text(c) for c in cols]
+    for cand in candidates:
+        cand_n = _norm_text(cand)
+        for c, lc in zip(cols, lows):
+            if lc == cand_n or cand_n in lc:
+                return c
+    return None
 
-    if not (col_plantel and col_usuario and col_contra):
+
+def _pick_sheet_by_name(xls: pd.ExcelFile, possible_names: list[str]) -> str | None:
+    # match “normalizado” para soportar Planteles/PLANTELES/planteles
+    sheet_map = { _norm_text(n): n for n in xls.sheet_names }
+    for p in possible_names:
+        p_n = _norm_text(p)
+        if p_n in sheet_map:
+            return sheet_map[p_n]
+    return None
+
+
+def _pick_sheet_by_columns(xls: pd.ExcelFile, must_have_cols: list[str]) -> str | None:
+    # Escanea hojas buscando columnas mínimas
+    for sh in xls.sheet_names:
+        try:
+            df_head = pd.read_excel(xls, sheet_name=sh, nrows=5, engine="openpyxl")
+            df_head.columns = [str(c).strip() for c in df_head.columns]
+            ok = True
+            for col in must_have_cols:
+                if _find_col(df_head, [col]) is None:
+                    ok = False
+                    break
+            if ok:
+                return sh
+        except Exception:
+            continue
+    return None
+
+
+def _parse_perm_ids(value) -> list[int]:
+    """
+    Soporta:
+      - 1
+      - "1"
+      - "1,2,5"
+      - "1 | 2 | 5"
+      - "1;2;5"
+    """
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return []
+
+    if isinstance(value, (int, float)) and not pd.isna(value):
+        try:
+            return [int(value)]
+        except Exception:
+            return []
+
+    s = str(value).strip()
+    if not s:
+        return []
+
+    parts = re.split(r"[,\|;\s]+", s)
+    out = []
+    for p in parts:
+        p = p.strip()
+        if p.isdigit():
+            out.append(int(p))
+    return out
+
+
+def _load_permissions_map(xls: pd.ExcelFile) -> dict[int, str]:
+    # 1) intentar por nombre
+    perms_sheet = _pick_sheet_by_name(xls, POSSIBLE_PERMS_SHEETS)
+
+    # 2) si no, intentar por columnas
+    if perms_sheet is None:
+        perms_sheet = _pick_sheet_by_columns(xls, must_have_cols=["id", "permiso"])
+
+    # Si no existe, devolvemos vacío (no truena login)
+    if perms_sheet is None:
+        return {}
+
+    dfp = pd.read_excel(xls, sheet_name=perms_sheet, engine="openpyxl")
+    dfp.columns = [str(c).strip() for c in dfp.columns]
+
+    col_id = _find_col(dfp, ["id"])
+    col_perm = _find_col(dfp, ["permiso", "permission"])
+
+    if not col_id or not col_perm:
+        # Si la hoja existe pero no tiene columnas correctas, mejor error claro
+        raise ValueError("La hoja 'Permisos' debe tener columnas: Id y Permiso.")
+
+    perm_map: dict[int, str] = {}
+    for pid, pname in dfp[[col_id, col_perm]].dropna().itertuples(index=False):
+        try:
+            pid_int = int(pid)
+        except Exception:
+            continue
+        perm_map[pid_int] = str(pname).strip().upper()
+
+    return perm_map
+
+
+def validar_usuario(usuario: str, contrasena: str):
+    """
+    Return:
+      ok: bool
+      plantel: str|None
+      permisos_set: set[str]
+      username: str|None
+    """
+    xls = pd.ExcelFile(DATOS_XLSX, engine="openpyxl")
+
+    # 1) detectar hoja de usuarios
+    users_sheet = _pick_sheet_by_name(xls, POSSIBLE_USERS_SHEETS)
+    if users_sheet is None:
+        # buscar hoja por columnas obligatorias: usuario + contraseña
+        users_sheet = _pick_sheet_by_columns(xls, must_have_cols=["usuario", "contrasena"])
+
+    if users_sheet is None:
         raise ValueError(
-            f"La hoja '{SHEET_PLANTELES}' debe tener columnas: "
-            f"'Plantel', 'Usuario' y 'Contrasena'/'Contraseña'. "
-            f"Encontradas: {list(df.columns)}"
+            "No encontré la hoja de usuarios. Debe existir una hoja (ej. 'Planteles') "
+            "que contenga columnas 'Usuario' y 'Contrasena/Contraseña'."
         )
 
-    df = df.rename(columns={
-        col_plantel: "Plantel",
-        col_usuario: "Usuario",
-        col_contra:  "Contrasena",
-    })
+    dfu = pd.read_excel(xls, sheet_name=users_sheet, engine="openpyxl")
+    dfu.columns = [str(c).strip() for c in dfu.columns]
 
-    # normaliza valores
-    df["Plantel"]    = df["Plantel"].astype(str).str.strip()
-    df["Usuario"]    = df["Usuario"].astype(str).str.strip().str.upper()
-    df["Contrasena"] = df["Contrasena"].astype(str).str.strip()
+    col_user = _find_col(dfu, USER_COL_CANDIDATES)
+    col_pass = _find_col(dfu, PASS_COL_CANDIDATES)
+    col_plantel = _find_col(dfu, PLANTEL_COL_CANDIDATES)
+    col_permids = _find_col(dfu, PERMIDS_COL_CANDIDATES)
 
-    # rol (opcional)
-    if "Rol" in df.columns:
-        df["Rol"] = df["Rol"].astype(str).str.strip().str.lower()
-    else:
-        df["Rol"] = "usuario"
-    return df
-
-def validar_usuario(user: str, password: str):
-    # admin hardcoded
-    if _norm(user).lower() == ADMIN_USER and _norm(password) == ADMIN_PASS:
-        return True, "ADMIN", True
-
-    u = _norm_user(user)
-    p = _norm(password)
-
-    try:
-        df = _load_planteles_norm()
-    except Exception as e:
-        st.error(f"No pude leer '{EXCEL_FILE}' / hoja '{SHEET_PLANTELES}': {e}")
-        return False, None, False
-
-    row = df[(df["Usuario"] == u) & (df["Contrasena"] == p)]
-    if row.empty:
-        return False, None, False
-
-    plantel  = row.iloc[0]["Plantel"]
-    es_admin = (row.iloc[0].get("Rol", "usuario") == "admin")
-    return True, plantel, es_admin
-
-# ---------- Guard y utilidades ----------
-@st.cache_data(ttl=600)
-def _planteles_sets(_v=_excel_mtime()):
-    df_datos = _load_df(SHEET_DATOS)
-    df_pl    = _load_planteles_norm()
-
-    # normaliza columna Plantel en Datos
-    if "Plantel" not in df_datos.columns:
-        raise ValueError(f"La hoja '{SHEET_DATOS}' no tiene la columna 'Plantel'.")
-    df_datos["Plantel"] = df_datos["Plantel"].astype(str).str.strip()
-
-    set_listados = set(df_pl["Plantel"].dropna().unique().tolist())
-    set_con_datos = set(df_datos["Plantel"].dropna().unique().tolist())
-    set_sin_datos = set_listados - set_con_datos
-    return set_listados, set_con_datos, set_sin_datos
-
-def plantel_has_data(plantel_nombre: str) -> bool:
-    _, con_datos, _ = _planteles_sets()
-    return _norm(plantel_nombre) in con_datos
-
-def get_missing_planteles() -> list[str]:
-    _, _, faltantes = _planteles_sets()
-    return sorted(faltantes)
-
-def guard_plantel_or_stop(plantel_nombre: str) -> bool:
-    pn = _norm(plantel_nombre)
-    if not pn:
-        st.warning("⚠️ No se pudo identificar el plantel de la sesión.", icon="⚠️")
-        st.stop()
-        return False
-    try:
-        ok = plantel_has_data(pn)
-    except Exception as e:
-        st.error(f"No pude leer '{EXCEL_FILE}' / hoja '{SHEET_DATOS}': {e}")
-        st.stop()
-        return False
-    if not ok:
-        st.warning(
-            f"⚠️ Su plantel **{pn}** NO tiene **EVALUACIONES CAPTURADAS**; "
-            "no se mostrará información.",
-            icon="⚠️",
+    if not col_user or not col_pass:
+        raise ValueError(
+            f"En la hoja '{users_sheet}' no encontré columnas de Usuario/Contraseña. "
+            "Asegúrate que se llamen 'Usuario' y 'Contrasena' (o similar)."
         )
-        st.stop()
-        return False
-    return True
+
+    u = str(usuario).strip()
+    p = str(contrasena).strip()
+
+    dfu["_u"] = dfu[col_user].astype(str).str.strip()
+    dfu["_p"] = dfu[col_pass].astype(str).str.strip()
+
+    match = dfu[(dfu["_u"] == u) & (dfu["_p"] == p)]
+    if match.empty:
+        return False, None, set(), None
+
+    row = match.iloc[0]
+
+    plantel_val = None
+    if col_plantel and not pd.isna(row.get(col_plantel)):
+        plantel_val = str(row.get(col_plantel)).strip()
+        if plantel_val == "":
+            plantel_val = None
+
+    perms_set: set[str] = set()
+    if col_permids:
+        perm_ids = _parse_perm_ids(row.get(col_permids))
+        if perm_ids:
+            perm_map = _load_permissions_map(xls)
+            for pid in perm_ids:
+                pname = perm_map.get(pid)
+                if pname:
+                    perms_set.add(pname)
+
+    return True, plantel_val, perms_set, u
