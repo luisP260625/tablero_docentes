@@ -979,7 +979,9 @@ def mostrar_indicadores_academicos():
             horizontal=True
         )
 
-        tabla_ordenada = tabla.sort_values(by="% Estudiantes no competentes", ascending=False).copy()
+        # ✅ Orden: por % cuando se visualiza "% NO competencia"; por TOTAL cuando se visualiza "Total NO competentes"
+        sort_col = "Total estudiantes no competentes" if vista == "Total NO competentes" else "% Estudiantes no competentes"
+        tabla_ordenada = tabla.sort_values(by=sort_col, ascending=False).copy()
 
         tabla_ordenada["etiqueta"] = tabla_ordenada.apply(
             lambda r: f"{int(r['Total estudiantes no competentes'])} - {float(r['% Estudiantes no competentes']):.1f}%",
