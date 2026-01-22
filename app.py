@@ -19,99 +19,69 @@ from views.estudiantes_por_grupo import mostrar_estudiantes_por_grupo
 
 st.set_page_config(page_title="Tablero Docente", layout="wide")
 
-st.markdown("""
+st.markdown(
+    """
     <style>
     [data-testid="stToolbar"] > div:nth-child(n+2) {
         display: none !important;
     }
     </style>
-""", unsafe_allow_html=True)
+    """,
+    unsafe_allow_html=True,
+)
 
 # ----------------------------
 # Inicializar sesión
 # ----------------------------
 if "logueado" not in st.session_state:
-    st.session_state.update({
-        "logueado": False,
-        "usuario": None,
-        "plantel_usuario": None,
-        "permisos": set(),
-        # compatibilidad con vistas actuales: admin = puede ver todo (scope)
-        "administrador": False,
-    })
+    st.session_state.update(
+        {
+            "logueado": False,
+            "usuario": None,
+            "plantel_usuario": None,
+            # ✅ aquí SIEMPRE guardamos CLAVES (strings) ej. MENU_DOCENTES_MODULOS
+            "permisos": set(),
+            # compatibilidad con vistas actuales: admin = puede ver todo (scope)
+            "administrador": False,
+        }
+    )
 
 
 def _menu_por_permisos(perms: set[str], plantel: str | None) -> list[str]:
     """
-    Permisos especiales tipo "perfil":
-      - MENU_TODOS
-      - MENU_PLANTEL
-      - MENU_SOLO_HISTORICO
-    Permisos específicos por opción (opcionales):
-      - MENU_HISTORICO_INDICADORES
-      - MENU_INDICADORES_ACADEMICOS
-      - MENU_BITACORA_CONEXIONES
-      - MENU_ESTUDIANTES_POR_GRUPO
-      - etc.
+    Reglas:
+    - El Excel asigna permisos por IDs, pero validator.py ya devuelve CLAVES (ej. MENU_DOCENTES_MODULOS)
+    - Plantel: ve todo FILTRADO por su plantel (scope), pero el menú se controla por permisos.
+      * Además, se muestra "Ranking por docentes y módulos" como opción base para plantel.
+      * Plantel NO verá módulos "globales" aunque se les asigne por error (Bitácora / Estatal).
+    - Admin/Otros (sin plantel): menú por permisos, alcance global.
+
+    Permisos esperados (hoja Permisos):
+      MENU_DOCENTES_MODULOS
+      MENU_ESTATAL_DOCENTES_MODULOS
+      MENU_DOCENTES_SEGUIMIENTO
+      MENU_MODULOS_SEGUIMIENTO
+      MENU_INDICADORES_ACADEMICOS
+      MENU_HISTORICO_INDICADORES
+      MENU_CAPTURA_DOCENTES
+      MENU_BITACORA_CONEXIONES
+      MENU_ESTUDIANTES_POR_GRUPO
     """
-    # Menús base (como estaba tu app)
-    menu_plantel = [
-        "Ranking por docentes y módulos",
-        "Docentes y Módulos",
-        "Docentes Seguimiento",
-        "Módulos Seguimiento",
-        "Indicadores Académicos",
-        "Histórico de Indicadores",
-        "Captura Docentes",
-        # ✅ NUEVO
-        "Estudiantes por Grupo",
-    ]
 
-    menu_admin = [
-        "Docentes y Módulos",
-        "Estatal Docentes y Módulos",
-        "Docentes Seguimiento",
-        "Módulos Seguimiento",
-        "Indicadores Académicos",
-        "Histórico de Indicadores",
-        "Captura Docentes",
-        "Bitácora de Conexiones",
-        # ✅ NUEVO
-        "Estudiantes por Grupo",
-    ]
+    # Mapeo: clave -> etiqueta del menú
+    perm_to_label = {
+        "MENU_DOCENTES_MODULOS": "Docentes y Módulos",
+        "MENU_ESTATAL_DOCENTES_MODULOS": "Estatal Docentes y Módulos",
+        "MENU_DOCENTES_SEGUIMIENTO": "Docentes Seguimiento",
+        "MENU_MODULOS_SEGUIMIENTO": "Módulos Seguimiento",
+        "MENU_INDICADORES_ACADEMICOS": "Indicadores Académicos",
+        "MENU_HISTORICO_INDICADORES": "Histórico de Indicadores",
+        "MENU_CAPTURA_DOCENTES": "Captura Docentes",
+        "MENU_BITACORA_CONEXIONES": "Bitácora de Conexiones",
+        "MENU_ESTUDIANTES_POR_GRUPO": "Estudiantes por Grupo",
+    }
 
-    allowed = set()
-
-    # Perfiles
-    if "MENU_TODOS" in perms:
-        allowed.update(menu_admin)
-    if "MENU_PLANTEL" in perms:
-        allowed.update(menu_plantel)
-    if "MENU_SOLO_HISTORICO" in perms:
-        allowed.add("Histórico de Indicadores")
-
-    # Permisos específicos (por si decides usarlos)
-    if "MENU_HISTORICO_INDICADORES" in perms:
-        allowed.add("Histórico de Indicadores")
-    if "MENU_INDICADORES_ACADEMICOS" in perms:
-        allowed.add("Indicadores Académicos")
-    if "MENU_BITACORA_CONEXIONES" in perms:
-        allowed.add("Bitácora de Conexiones")
-    if "MENU_ESTATAL_DOCENTES_MODULOS" in perms:
-        allowed.add("Estatal Docentes y Módulos")
-    if "MENU_CAPTURA_DOCENTES" in perms:
-        allowed.add("Captura Docentes")
-
-    # ✅ NUEVO permiso específico
-    if "MENU_ESTUDIANTES_POR_GRUPO" in perms:
-        allowed.add("Estudiantes por Grupo")
-
-    # Si no le diste permisos de menú, fallback práctico:
-    # - si trae plantel -> menú plantel
-    if not allowed and plantel:
-        allowed.update(menu_plantel)
-
-    # Orden final (para que el selectbox se vea bonito)
+    # Orden final (para que el selectbox se vea siempre igual)
     order = [
         "Ranking por docentes y módulos",
         "Docentes y Módulos",
@@ -122,9 +92,38 @@ def _menu_por_permisos(perms: set[str], plantel: str | None) -> list[str]:
         "Histórico de Indicadores",
         "Captura Docentes",
         "Bitácora de Conexiones",
-        # ✅ NUEVO
         "Estudiantes por Grupo",
     ]
+
+    allowed: set[str] = set()
+
+    # ✅ Plantel: opción base (no depende de permisos)
+    if plantel:
+        allowed.add("Ranking por docentes y módulos")
+
+    # ✅ Permisos por clave
+    for code, label in perm_to_label.items():
+        if code in perms:
+            # módulos globales: ocultarlos a plantel aunque se asignen por error
+            if plantel and label in {"Bitácora de Conexiones", "Estatal Docentes y Módulos"}:
+                continue
+            allowed.add(label)
+
+    # ✅ Fallback práctico: si no hay permisos pero sí plantel, no dejarlo sin menú
+    if plantel and allowed == {"Ranking por docentes y módulos"}:
+        # Menú plantel “default” (como estaba tu app)
+        allowed.update(
+            {
+                "Docentes y Módulos",
+                "Docentes Seguimiento",
+                "Módulos Seguimiento",
+                "Indicadores Académicos",
+                "Histórico de Indicadores",
+                "Captura Docentes",
+                "Estudiantes por Grupo",
+            }
+        )
+
     return [x for x in order if x in allowed]
 
 
@@ -142,14 +141,18 @@ if not st.session_state.logueado:
         if st.button("Iniciar sesión"):
             ok, plantel, perms, username = validar_usuario(usuario, contrasena)
             if ok:
-                st.session_state.update({
-                    "logueado": True,
-                    "usuario": username,
-                    "plantel_usuario": plantel,
-                    "permisos": perms,
-                    # compatibilidad: admin scope
-                    "administrador": ("MENU_TODOS" in perms),
-                })
+                # ✅ Alcance (scope): si no tiene plantel, se considera usuario global (admin/u otro)
+                is_admin_scope = plantel is None
+
+                st.session_state.update(
+                    {
+                        "logueado": True,
+                        "usuario": username,
+                        "plantel_usuario": plantel,
+                        "permisos": perms,  # set[str] de claves
+                        "administrador": is_admin_scope,
+                    }
+                )
                 registrar_acceso(usuario)
                 st.success("✅ ¡Sesión iniciada!")
                 st.rerun()
@@ -171,15 +174,12 @@ st.sidebar.success("✅ Sesión activa")
 
 perms = st.session_state.get("permisos", set())
 plantel = st.session_state.get("plantel_usuario")
+is_admin_scope = bool(st.session_state.get("administrador"))
 
-if "MENU_TODOS" in perms:
-    st.sidebar.info(f"👤 {st.session_state.get('usuario')} (ADMIN)")
-elif "MENU_SOLO_HISTORICO" in perms:
-    st.sidebar.info(f"👤 {st.session_state.get('usuario')} (CAPACITA)")
-elif plantel:
+if plantel:
     st.sidebar.info(f"👤 {st.session_state.get('usuario')} (Plantel: {plantel})")
 else:
-    st.sidebar.info(f"👤 {st.session_state.get('usuario')}")
+    st.sidebar.info(f"👤 {st.session_state.get('usuario')} (GLOBAL)")
 
 opciones = _menu_por_permisos(perms, plantel)
 if not opciones:
@@ -235,6 +235,5 @@ elif opcion == "Captura Docentes":
 elif opcion == "Ranking por docentes y módulos":
     mostrar_ranking_por_plantel(df, st.session_state.plantel_usuario)
 
-# ✅ NUEVO
 elif opcion == "Estudiantes por Grupo":
     mostrar_estudiantes_por_grupo()

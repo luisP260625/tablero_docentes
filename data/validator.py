@@ -40,7 +40,7 @@ def _find_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
 
 def _pick_sheet_by_name(xls: pd.ExcelFile, possible_names: list[str]) -> str | None:
     # match “normalizado” para soportar Planteles/PLANTELES/planteles
-    sheet_map = { _norm_text(n): n for n in xls.sheet_names }
+    sheet_map = {_norm_text(n): n for n in xls.sheet_names}
     for p in possible_names:
         p_n = _norm_text(p)
         if p_n in sheet_map:
@@ -66,35 +66,49 @@ def _pick_sheet_by_columns(xls: pd.ExcelFile, must_have_cols: list[str]) -> str 
     return None
 
 
-def _parse_perm_ids(value) -> list[int]:
+def _parse_perm_tokens(value) -> tuple[list[int], set[str]]:
     """
-    Soporta:
-      - 1
-      - "1"
-      - "1,2,5"
-      - "1 | 2 | 5"
-      - "1;2;5"
+    Soporta permisos en columna Planteles.Permisos en 2 formatos:
+
+    1) Por ID: "1,2,10" / "1 | 2 | 10" / "1;2;10"
+    2) Por clave: "MENU_DOCENTES_MODULOS, SEND_EMAIL_INDICADORES"
+
+    Retorna:
+      - lista de IDs (int)
+      - set de claves (str en UPPER)
     """
     if value is None or (isinstance(value, float) and pd.isna(value)):
-        return []
+        return [], set()
 
+    # Si viene numérico simple
     if isinstance(value, (int, float)) and not pd.isna(value):
         try:
-            return [int(value)]
+            return [int(value)], set()
         except Exception:
-            return []
+            return [], set()
 
     s = str(value).strip()
     if not s:
-        return []
+        return [], set()
 
     parts = re.split(r"[,\|;\s]+", s)
-    out = []
+    ids: list[int] = []
+    codes: set[str] = set()
+
     for p in parts:
-        p = p.strip()
+        p = str(p).strip()
+        if not p:
+            continue
         if p.isdigit():
-            out.append(int(p))
-    return out
+            ids.append(int(p))
+            continue
+        # tokens tipo MENU_xxx o SEND_EMAIL_xxx
+        # aceptamos letras/números/_ (y quitamos espacios)
+        token = re.sub(r"[^A-Za-z0-9_]+", "", p)
+        if token:
+            codes.add(token.upper())
+
+    return ids, codes
 
 
 def _load_permissions_map(xls: pd.ExcelFile) -> dict[int, str]:
@@ -116,7 +130,6 @@ def _load_permissions_map(xls: pd.ExcelFile) -> dict[int, str]:
     col_perm = _find_col(dfp, ["permiso", "permission"])
 
     if not col_id or not col_perm:
-        # Si la hoja existe pero no tiene columnas correctas, mejor error claro
         raise ValueError("La hoja 'Permisos' debe tener columnas: Id y Permiso.")
 
     perm_map: dict[int, str] = {}
@@ -135,7 +148,7 @@ def validar_usuario(usuario: str, contrasena: str):
     Return:
       ok: bool
       plantel: str|None
-      permisos_set: set[str]
+      permisos_set: set[str]   # SIEMPRE claves (ej. MENU_DOCENTES_MODULOS)
       username: str|None
     """
     xls = pd.ExcelFile(DATOS_XLSX, engine="openpyxl")
@@ -143,7 +156,6 @@ def validar_usuario(usuario: str, contrasena: str):
     # 1) detectar hoja de usuarios
     users_sheet = _pick_sheet_by_name(xls, POSSIBLE_USERS_SHEETS)
     if users_sheet is None:
-        # buscar hoja por columnas obligatorias: usuario + contraseña
         users_sheet = _pick_sheet_by_columns(xls, must_have_cols=["usuario", "contrasena"])
 
     if users_sheet is None:
@@ -184,9 +196,15 @@ def validar_usuario(usuario: str, contrasena: str):
         if plantel_val == "":
             plantel_val = None
 
+    # ✅ Permisos: SIEMPRE devolvemos claves (strings)
     perms_set: set[str] = set()
     if col_permids:
-        perm_ids = _parse_perm_ids(row.get(col_permids))
+        perm_ids, perm_codes_direct = _parse_perm_tokens(row.get(col_permids))
+
+        # 1) si ya venían claves directas, se agregan
+        perms_set |= perm_codes_direct
+
+        # 2) si venían IDs, se mapean con hoja Permisos (id -> Permiso)
         if perm_ids:
             perm_map = _load_permissions_map(xls)
             for pid in perm_ids:

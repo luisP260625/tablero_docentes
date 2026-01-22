@@ -19,6 +19,305 @@ LABEL_FONT_SIZE_PLANTEL = 15   # <- tamaño etiquetas gráfica plantel (prueba 9
 # Multiplicador para dar "aire" arriba y que no se corte la etiqueta
 Y_AXIS_PADDING_MULT = 1.35
 
+
+# =========================
+# Permisos (menú / acciones)
+# =========================
+# Recomendación: validar por CÓDIGO (columna "Permiso"), no por ID.
+# Así, aunque cambie el número de ID, mientras el código siga igual,
+# el permiso se mantiene estable.
+PERM_SEND_EMAIL_CODE = "SEND_EMAIL_INDICADORES"
+
+
+def _parse_perm_ids(raw) -> set[int]:
+    """Convierte '1,2,3' o [1,'2'] a {1,2,3}."""
+    if raw is None:
+        return set()
+
+    # lista/tuple/set
+    if isinstance(raw, (list, tuple, set)):
+        out = set()
+        for it in raw:
+            out |= _parse_perm_ids(it)
+        return out
+
+    # dict: intenta llaves típicas
+    if isinstance(raw, dict):
+        out = set()
+        for k in ("ids", "permisos", "permisos_ids", "permissions", "permission_ids"):
+            if k in raw:
+                out |= _parse_perm_ids(raw.get(k))
+        return out
+
+    s = str(raw).strip()
+    if not s or s.lower() in ("nan", "none", "null"):
+        return set()
+
+
+    tokens = re.split(r"[;,|\s]+", s)
+    ids = set()
+    for t in tokens:
+        t = t.strip()
+        if not t:
+            continue
+        m = re.search(r"\d+", t)
+        if m:
+            try:
+                ids.add(int(m.group(0)))
+            except Exception:
+                pass
+    return ids
+
+
+
+@st.cache_data
+def cargar_catalogo_permisos_xlsx() -> dict[int, str]:
+    """Lee hoja 'Permisos' (id, Permiso) y devuelve {id: 'CODIGO_PERMISO'}."""
+    try:
+        df = pd.read_excel("assets/Datos1.xlsx", sheet_name="Permisos")
+    except Exception:
+        return {}
+
+    def _find_col_exact(name: str):
+        for c in df.columns:
+            if str(c).strip().lower() == name.lower():
+                return c
+        return None
+
+    col_id = _find_col_exact("id")
+    col_perm = _find_col_exact("Permiso")
+
+    if col_id is None or col_perm is None:
+        return {}
+
+    cat: dict[int, str] = {}
+    for _, row in df.iterrows():
+        rid = row.get(col_id)
+        rperm = row.get(col_perm)
+        if pd.isna(rid) or pd.isna(rperm):
+            continue
+        # id puede venir como float si Excel lo interpreta así
+        try:
+            pid = int(str(rid).strip())
+        except Exception:
+            continue
+        code = str(rperm).strip()
+        if code:
+            cat[pid] = code
+    return cat
+
+
+def _parse_perm_codes(raw, catalog: dict[int, str]) -> set[str]:
+    """Convierte permisos en cualquier forma a set de CÓDIGOS.
+
+    Acepta:
+      - "1,2,3" (IDs) -> se mapea a códigos vía hoja 'Permisos'
+      - "MENU_X,SEND_EMAIL_INDICADORES" (códigos)
+      - listas/sets/tuplas mixtas
+      - dicts con llaves típicas
+    """
+    if raw is None:
+        return set()
+
+    # lista/tuple/set
+    if isinstance(raw, (list, tuple, set)):
+        out: set[str] = set()
+        for it in raw:
+            out |= _parse_perm_codes(it, catalog)
+        return out
+
+    # dict: intenta llaves típicas
+    if isinstance(raw, dict):
+        out: set[str] = set()
+        for k in (
+            "codes", "permisos_codes", "permissions_codes",
+            "permisos", "permisos_ids", "permissions", "permission_ids",
+            "ids",
+        ):
+            if k in raw:
+                out |= _parse_perm_codes(raw.get(k), catalog)
+        return out
+
+    s = str(raw).strip()
+    if not s or s.lower() in ("nan", "none", "null"):
+        return set()
+
+    # separa por coma, punto y coma, pipe o espacios
+    parts = re.split(r"[\s,;|]+", s)
+    out: set[str] = set()
+    for t in parts:
+        t = t.strip()
+        if not t:
+            continue
+        # token numérico => mapear a código si existe
+        if t.isdigit():
+            pid = int(t)
+            code = catalog.get(pid)
+            if code:
+                out.add(code)
+        else:
+            # token ya es código
+            out.add(t)
+    return out
+
+
+@st.cache_data
+def cargar_permisos_usuarios_codigos_xlsx() -> dict[str, set[str]]:
+    """Lee hoja 'Planteles' (Usuario, Permisos) y regresa {usuario: set(códigos)}.
+
+    Nota: La columna Permisos puede contener IDs ("1,2,3") o códigos
+    ("MENU_X,SEND_EMAIL_INDICADORES"). Si son IDs, se traducen usando hoja 'Permisos'.
+    """
+    try:
+        df = pd.read_excel("assets/Datos1.xlsx", sheet_name="Planteles")
+    except Exception:
+        return {}
+
+    catalog = cargar_catalogo_permisos_xlsx()
+
+    def _find_col_exact(name: str):
+        for c in df.columns:
+            if str(c).strip().lower() == name.lower():
+                return c
+        return None
+
+    col_user = _find_col_exact("Usuario")
+    col_perms = _find_col_exact("Permisos")
+
+    if col_user is None or col_perms is None:
+        return {}
+
+    mapping: dict[str, set[str]] = {}
+    for _, row in df.iterrows():
+        u = str(row.get(col_user, "")).strip()
+        if not u or u.lower() in ("nan", "none"):
+            continue
+        mapping[u] = _parse_perm_codes(row.get(col_perms), catalog)
+
+    return mapping
+
+
+def obtener_permisos_usuario_codigos() -> set[str]:
+    """Devuelve el set de CÓDIGOS de permisos del usuario logueado.
+
+    Prioridad:
+      1) session_state (si ya lo carga validator/app)
+      2) hoja 'Planteles' (Usuario -> Permisos), traducido por hoja 'Permisos'
+    """
+    catalog = cargar_catalogo_permisos_xlsx()
+
+    # 1) desde sesión (varios nombres posibles)
+    posibles = [
+        st.session_state.get("permisos_codes"),
+        st.session_state.get("permissions_codes"),
+        st.session_state.get("permisos"),
+        st.session_state.get("permisos_ids"),
+        st.session_state.get("permissions"),
+        st.session_state.get("permission_ids"),
+        st.session_state.get("permisos_usuario"),
+        st.session_state.get("user_permissions"),
+    ]
+    for raw in posibles:
+        codes = _parse_perm_codes(raw, catalog)
+        if codes:
+            return codes
+
+    # 2) desde Excel (Planteles)
+    username = _get_username_from_session()
+    if username:
+        m = cargar_permisos_usuarios_codigos_xlsx()
+        if username in m:
+            return m[username]
+        for u, codes in m.items():
+            if u.lower() == username.lower():
+                return codes
+
+    return set()
+
+
+
+def _get_username_from_session() -> str | None:
+    """Intenta detectar el usuario logueado desde st.session_state (sin romper compatibilidad)."""
+    for k in (
+        "usuario", "username", "user", "Usuario", "USER", "login_user", "current_user",
+        "user_name", "user_email", "email"
+    ):
+        v = st.session_state.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+
+        # en caso de que sea un dict/obj con username
+        if isinstance(v, dict):
+            for kk in ("usuario", "username", "user", "name", "email"):
+                vv = v.get(kk)
+                if isinstance(vv, str) and vv.strip():
+                    return vv.strip()
+
+    return None
+
+
+@st.cache_data
+def cargar_permisos_usuarios_xlsx() -> dict[str, set[int]]:
+    """Lee hoja 'Planteles' (Usuario, Permisos) y regresa {usuario: set(ids)}."""
+    df = pd.read_excel("assets/Datos1.xlsx", sheet_name="Planteles")
+
+    def _find_col_exact(name: str):
+        for c in df.columns:
+            if str(c).strip().lower() == name.lower():
+                return c
+        return None
+
+    col_user = _find_col_exact("Usuario")
+    col_perms = _find_col_exact("Permisos")
+
+    if col_user is None or col_perms is None:
+        # No romper la app si la hoja cambia: simplemente no hay permisos por XLSX
+        return {}
+
+    mapping: dict[str, set[int]] = {}
+    for _, row in df.iterrows():
+        u = str(row.get(col_user, "")).strip()
+        if not u or u.lower() in ("nan", "none"):
+            continue
+        mapping[u] = _parse_perm_ids(row.get(col_perms))
+
+    return mapping
+
+
+def obtener_permisos_usuario() -> set[int]:
+    """
+    Devuelve el set de IDs de permisos del usuario logueado.
+    Prioridad:
+      1) session_state (si ya lo carga validator/app)
+      2) hoja 'Planteles' (Usuario -> Permisos)
+    """
+    # 1) desde sesión (varios nombres posibles)
+    posibles = [
+        st.session_state.get("permisos_ids"),
+        st.session_state.get("permisos"),
+        st.session_state.get("permissions"),
+        st.session_state.get("permission_ids"),
+        st.session_state.get("permisos_usuario"),
+        st.session_state.get("user_permissions"),
+    ]
+    for raw in posibles:
+        ids = _parse_perm_ids(raw)
+        if ids:
+            return ids
+
+    # 2) desde Excel (Planteles)
+    username = _get_username_from_session()
+    if username:
+        m = cargar_permisos_usuarios_xlsx()
+        # match exact o case-insensitive
+        if username in m:
+            return m[username]
+        for u, ids in m.items():
+            if u.lower() == username.lower():
+                return ids
+
+    return set()
+
 # =========================
 # Carga de datos
 # =========================
@@ -660,9 +959,19 @@ def mostrar_indicadores_academicos():
     tabla = tabla[columnas_presentes]
 
     # =========================
-    # ADMIN
+    # Rol / permisos
     # =========================
-    if st.session_state["administrador"]:
+    is_admin = bool(st.session_state.get("administrador", False))
+    plantel_usuario = st.session_state.get("plantel_usuario") or st.session_state.get("plantel")
+    es_plantel = bool(plantel_usuario) and not is_admin
+
+    permisos_codes = obtener_permisos_usuario_codigos()
+    puede_enviar_email = (not es_plantel) and (PERM_SEND_EMAIL_CODE in permisos_codes)
+
+    # =========================
+    # USUARIO GLOBAL (Admin u otros)
+    # =========================
+    if not es_plantel:
 
         vista = st.radio(
             "Visualización de la gráfica:",
@@ -846,107 +1155,117 @@ def mostrar_indicadores_academicos():
                 )
 
         # =========================
-        # Confirmación tipo ALERTA antes de enviar
+        # Envío de correo (requiere permiso 10: SEND_EMAIL_INDICADORES)
         # =========================
-        if "confirm_send_open" not in st.session_state:
-            st.session_state.confirm_send_open = False
-        if "email_send_result" not in st.session_state:
-            st.session_state.email_send_result = None
+        if puede_enviar_email:
+            # =========================
+            # Confirmación tipo ALERTA antes de enviar
+            # =========================
+            if "confirm_send_open" not in st.session_state:
+                st.session_state.confirm_send_open = False
+            if "email_send_result" not in st.session_state:
+                st.session_state.email_send_result = None
 
-        if st.button("📧 Enviar correo", key="btn_enviar_correo_indicadores"):
-            st.session_state.confirm_send_open = True
+            if st.button("📧 Enviar correo", key="btn_enviar_correo_indicadores"):
+                st.session_state.confirm_send_open = True
 
-        if st.session_state.email_send_result:
-            res = st.session_state.email_send_result
-            if res.get("enviados"):
-                st.success("Correo enviado correctamente a: " + ", ".join(res["enviados"]))
-            if res.get("fallidos"):
-                st.warning("No se pudo enviar correo a: " + "; ".join(res["fallidos"]))
-            if res.get("sin_email"):
-                st.warning("Sin Email en hoja Planteles: " + ", ".join(res["sin_email"]))
+            if st.session_state.email_send_result:
+                res = st.session_state.email_send_result
+                if res.get("enviados"):
+                    st.success("Correo enviado correctamente a: " + ", ".join(res["enviados"]))
+                if res.get("fallidos"):
+                    st.warning("No se pudo enviar correo a: " + "; ".join(res["fallidos"]))
+                if res.get("sin_email"):
+                    st.warning("Sin Email en hoja Planteles: " + ", ".join(res["sin_email"]))
 
-        def _confirm_ui():
-            try:
-                emails_map = cargar_emails_planteles()
-            except Exception as e:
-                st.error(f"No se pudo leer la hoja 'Planteles' (columna Email/Ccp): {e}")
-                return
+            def _confirm_ui():
+                try:
+                    emails_map = cargar_emails_planteles()
+                except Exception as e:
+                    st.error(f"No se pudo leer la hoja 'Planteles' (columna Email/Ccp): {e}")
+                    return
 
-            borradores, sin_email = construir_borradores_envio(
-                plantel_sel=plantel_sel,
-                planteles_disponibles=planteles_disponibles,
-                tabla=tabla,
-                df_reprobacion=df_reprobacion,
-                df_datos=df_datos,
-                emails_map=emails_map
-            )
+                borradores, sin_email = construir_borradores_envio(
+                    plantel_sel=plantel_sel,
+                    planteles_disponibles=planteles_disponibles,
+                    tabla=tabla,
+                    df_reprobacion=df_reprobacion,
+                    df_datos=df_datos,
+                    emails_map=emails_map
+                )
 
-            if plantel_sel == "Todos":
-                aviso = "¿Está seguro de que se desea mandar la siguiente información vía correo electrónico a TODOS los planteles?"
-                st.warning(aviso)
-                if sin_email:
-                    st.info("Nota: estos planteles no tienen Email en la hoja Planteles y NO recibirán correo: " + ", ".join(sin_email))
+                if plantel_sel == "Todos":
+                    aviso = "¿Está seguro de que se desea mandar la siguiente información vía correo electrónico a TODOS los planteles?"
+                    st.warning(aviso)
+                    if sin_email:
+                        st.info("Nota: estos planteles no tienen Email en la hoja Planteles y NO recibirán correo: " + ", ".join(sin_email))
 
-                if borradores:
-                    st.write("Se enviará un correo por plantel. Ejemplo del contenido a enviar:")
-                    st.code(borradores[0]["body"])
-                    st.write("Ejemplo de destinatarios:")
-                    st.code("TO: " + ", ".join(borradores[0]["to"]))
-                    if borradores[0].get("cc"):
-                        st.code("CC: " + ", ".join(borradores[0]["cc"]))
-                else:
-                    st.info("ℹ️ No hay planteles con Email para enviar.")
-            else:
-                aviso = f"¿Está seguro de que se desea mandar la siguiente información vía correo electrónico al Plantel {plantel_sel}?"
-                st.warning(aviso)
-
-                b = next((x for x in borradores if x["plantel"] == plantel_sel), None)
-                if b is None:
-                    if plantel_sel in sin_email:
-                        st.info("Este plantel no tiene Email en la hoja Planteles. No se enviará nada.")
+                    if borradores:
+                        st.write("Se enviará un correo por plantel. Ejemplo del contenido a enviar:")
+                        st.code(borradores[0]["body"])
+                        st.write("Ejemplo de destinatarios:")
+                        st.code("TO: " + ", ".join(borradores[0]["to"]))
+                        if borradores[0].get("cc"):
+                            st.code("CC: " + ", ".join(borradores[0]["cc"]))
                     else:
-                        st.info("No hay información para enviar.")
+                        st.info("ℹ️ No hay planteles con Email para enviar.")
                 else:
-                    st.code(b["body"])
-                    st.code("TO: " + ", ".join(b["to"]))
-                    if b.get("cc"):
-                        st.code("CC: " + ", ".join(b["cc"]))
+                    aviso = f"¿Está seguro de que se desea mandar la siguiente información vía correo electrónico al Plantel {plantel_sel}?"
+                    st.warning(aviso)
 
-            col_ok, col_cancel = st.columns(2)
-            with col_ok:
-                if st.button("✅ De acuerdo", key="btn_confirmar_envio"):
-                    if not borradores:
-                        st.session_state.email_send_result = {"enviados": [], "fallidos": [], "sin_email": sin_email}
+                    b = next((x for x in borradores if x["plantel"] == plantel_sel), None)
+                    if b is None:
+                        if plantel_sel in sin_email:
+                            st.info("Este plantel no tiene Email en la hoja Planteles. No se enviará nada.")
+                        else:
+                            st.info("No hay información para enviar.")
+                    else:
+                        st.code(b["body"])
+                        st.code("TO: " + ", ".join(b["to"]))
+                        if b.get("cc"):
+                            st.code("CC: " + ", ".join(b["cc"]))
+
+                col_ok, col_cancel = st.columns(2)
+                with col_ok:
+                    if st.button("✅ De acuerdo", key="btn_confirmar_envio"):
+                        if not borradores:
+                            st.session_state.email_send_result = {"enviados": [], "fallidos": [], "sin_email": sin_email}
+                            st.session_state.confirm_send_open = False
+                            st.rerun()
+
+                        with st.spinner("Enviando correos..."):
+                            enviados, fallidos = enviar_borradores(borradores)
+
+                        st.session_state.email_send_result = {"enviados": enviados, "fallidos": fallidos, "sin_email": sin_email}
                         st.session_state.confirm_send_open = False
                         st.rerun()
 
-                    with st.spinner("Enviando correos..."):
-                        enviados, fallidos = enviar_borradores(borradores)
+                with col_cancel:
+                    if st.button("❌ Cancelar", key="btn_cancelar_envio"):
+                        st.session_state.confirm_send_open = False
+                        st.rerun()
 
-                    st.session_state.email_send_result = {"enviados": enviados, "fallidos": fallidos, "sin_email": sin_email}
-                    st.session_state.confirm_send_open = False
-                    st.rerun()
+            if st.session_state.confirm_send_open:
+                if hasattr(st, "dialog"):
+                    @st.dialog("Confirmación")
+                    def _dlg():
+                        _confirm_ui()
+                    _dlg()
+                else:
+                    with st.container():
+                        _confirm_ui()
+        else:
+            st.info("ℹ️ Tu usuario no tiene permiso para enviar correos desde este módulo (permiso 10: SEND_EMAIL_INDICADORES).")
 
-            with col_cancel:
-                if st.button("❌ Cancelar", key="btn_cancelar_envio"):
-                    st.session_state.confirm_send_open = False
-                    st.rerun()
-
-        if st.session_state.confirm_send_open:
-            if hasattr(st, "dialog"):
-                @st.dialog("Confirmación")
-                def _dlg():
-                    _confirm_ui()
-                _dlg()
-            else:
-                with st.container():
-                    _confirm_ui()
 
     # =========================
     # PLANTEL (no administrador)
     # =========================
     else:
-        plantel_usuario = st.session_state["plantel_usuario"]
+        if not plantel_usuario:
+            st.error("No se detectó el plantel del usuario en la sesión (plantel_usuario).")
+            return
+
 
         df_seguimiento = pd.read_excel("assets/Datos1.xlsx", sheet_name="Seguimiento")
         df_plantel = df_seguimiento[df_seguimiento["Plantel"] == plantel_usuario]
