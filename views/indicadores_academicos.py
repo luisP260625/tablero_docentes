@@ -845,6 +845,7 @@ def texto_correo_plantel(
         "\nPara consultar información detallada, particular o completa sobre los avances y resultados del plantel, "
         "le invitamos a revisar el tablero institucional en el siguiente enlace:\n"
         "https://tablero-docentes.conalepmexacademica.app/\n"
+        "Nota: Esta información corresponde al corte de fecha 22/01/2026 a las 9:00am \n"
         "\nSin otro particular, reciba un cordial saludo.\n"
 
     )
