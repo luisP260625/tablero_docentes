@@ -1,4 +1,3 @@
-# data/validator.py
 from __future__ import annotations
 
 from pathlib import Path
@@ -13,11 +12,16 @@ DATOS_XLSX = PROJECT_ROOT / "assets" / "Datos1.xlsx"
 POSSIBLE_USERS_SHEETS = ["planteles", "plantel", "usuarios", "users"]
 POSSIBLE_PERMS_SHEETS = ["permisos", "permiso", "permissions"]
 
-# Si tu columna en planteles se llama distinto, aquí se detecta por contenido
+# Si tu columna en usuarios/planteles se llama distinto, aquí se detecta por contenido
 USER_COL_CANDIDATES = ["usuario", "user", "username"]
 PASS_COL_CANDIDATES = ["contrasena", "contraseña", "password", "pass"]
 PLANTEL_COL_CANDIDATES = ["plantel", "cct", "campus", "centro"]
-PERMIDS_COL_CANDIDATES = ["permisos", "permiso", "id_permiso", "id_permisos", "permisos_ids"]
+
+# ✅ ampliado para detectar más variantes de columna de permisos
+PERMIDS_COL_CANDIDATES = [
+    "permisos", "permiso", "id_permiso", "id_permisos", "permisos_ids",
+    "menus", "menu", "opciones", "opciones_menu", "menu_ids", "roles", "rol",
+]
 
 
 def _norm_text(s) -> str:
@@ -68,10 +72,10 @@ def _pick_sheet_by_columns(xls: pd.ExcelFile, must_have_cols: list[str]) -> str 
 
 def _parse_perm_tokens(value) -> tuple[list[int], set[str]]:
     """
-    Soporta permisos en columna Planteles.Permisos en 2 formatos:
+    Soporta permisos en columna de usuarios en 2 formatos:
 
     1) Por ID: "1,2,10" / "1 | 2 | 10" / "1;2;10"
-    2) Por clave: "MENU_DOCENTES_MODULOS, SEND_EMAIL_INDICADORES"
+    2) Por clave: "MENU_DOCENTES_MODULOS, MENU_ACCESO_PLANTELES"
 
     Retorna:
       - lista de IDs (int)
@@ -102,8 +106,6 @@ def _parse_perm_tokens(value) -> tuple[list[int], set[str]]:
         if p.isdigit():
             ids.append(int(p))
             continue
-        # tokens tipo MENU_xxx o SEND_EMAIL_xxx
-        # aceptamos letras/números/_ (y quitamos espacios)
         token = re.sub(r"[^A-Za-z0-9_]+", "", p)
         if token:
             codes.add(token.upper())

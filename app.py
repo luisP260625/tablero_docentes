@@ -4,7 +4,6 @@ from data.loader import cargar_datos, cargar_semcaptura
 from data.logger import registrar_acceso
 
 # Importar vistas
-from views.ranking_docentes_modulos import mostrar_ranking_por_plantel
 from views.indicadores_academicos import mostrar_indicadores_academicos
 import views.no_competentes as vista_nc
 import views.comportamiento as vista_com
@@ -14,17 +13,19 @@ import views.bitacora_conexiones as vista_bc
 import views.captura_docentes as vista_cd
 import views.historico_indicadores as vista_hi
 
-# ✅ NUEVO módulo
+# ✅ módulo
 from views.estudiantes_por_grupo import mostrar_estudiantes_por_grupo
+
+# ✅ Acceso Planteles
+from views.acceso_planteles import mostrar_acceso_planteles
+
 
 st.set_page_config(page_title="Tablero Docente", layout="wide")
 
 st.markdown(
     """
     <style>
-    [data-testid="stToolbar"] > div:nth-child(n+2) {
-        display: none !important;
-    }
+    [data-testid="stToolbar"] > div:nth-child(n+2) { display: none !important; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -39,36 +40,23 @@ if "logueado" not in st.session_state:
             "logueado": False,
             "usuario": None,
             "plantel_usuario": None,
-            # ✅ aquí SIEMPRE guardamos CLAVES (strings) ej. MENU_DOCENTES_MODULOS
-            "permisos": set(),
-            # compatibilidad con vistas actuales: admin = puede ver todo (scope)
-            "administrador": False,
+            "permisos": set(),        # set[str]
+            "administrador": False,   # scope GLOBAL si no tiene plantel
         }
     )
 
 
 def _menu_por_permisos(perms: set[str], plantel: str | None) -> list[str]:
     """
-    Reglas:
-    - El Excel asigna permisos por IDs, pero validator.py ya devuelve CLAVES (ej. MENU_DOCENTES_MODULOS)
-    - Plantel: ve todo FILTRADO por su plantel (scope), pero el menú se controla por permisos.
-      * Además, se muestra "Ranking por docentes y módulos" como opción base para plantel.
-      * Plantel NO verá módulos "globales" aunque se les asigne por error (Bitácora / Estatal).
-    - Admin/Otros (sin plantel): menú por permisos, alcance global.
-
-    Permisos esperados (hoja Permisos):
-      MENU_DOCENTES_MODULOS
-      MENU_ESTATAL_DOCENTES_MODULOS
-      MENU_DOCENTES_SEGUIMIENTO
-      MENU_MODULOS_SEGUIMIENTO
-      MENU_INDICADORES_ACADEMICOS
-      MENU_HISTORICO_INDICADORES
-      MENU_CAPTURA_DOCENTES
-      MENU_BITACORA_CONEXIONES
-      MENU_ESTUDIANTES_POR_GRUPO
+    ✅ REGLA DE NEGOCIO:
+    - Si hay permisos (perms no vacío): el menú se arma SOLO por permisos.
+    - Si NO hay permisos: fallback por rol:
+        * Plantel -> menú plantel (sin módulos globales)
+        * GLOBAL  -> menú admin/global (incluye módulos globales)
+    - Módulos "global_only" nunca aparecen a Plantel.
+    - ✅ Se eliminó por completo la opción "Ranking ..."
     """
 
-    # Mapeo: clave -> etiqueta del menú
     perm_to_label = {
         "MENU_DOCENTES_MODULOS": "Docentes y Módulos",
         "MENU_ESTATAL_DOCENTES_MODULOS": "Estatal Docentes y Módulos",
@@ -79,11 +67,12 @@ def _menu_por_permisos(perms: set[str], plantel: str | None) -> list[str]:
         "MENU_CAPTURA_DOCENTES": "Captura Docentes",
         "MENU_BITACORA_CONEXIONES": "Bitácora de Conexiones",
         "MENU_ESTUDIANTES_POR_GRUPO": "Estudiantes por Grupo",
+
+        # ✅ nuevo (controlado por permiso)
+        "MENU_ACCESO_PLANTELES": "Acceso Planteles",
     }
 
-    # Orden final (para que el selectbox se vea siempre igual)
     order = [
-        "Ranking por docentes y módulos",
         "Docentes y Módulos",
         "Estatal Docentes y Módulos",
         "Docentes Seguimiento",
@@ -92,37 +81,51 @@ def _menu_por_permisos(perms: set[str], plantel: str | None) -> list[str]:
         "Histórico de Indicadores",
         "Captura Docentes",
         "Bitácora de Conexiones",
+        "Acceso Planteles",
         "Estudiantes por Grupo",
     ]
 
+    global_only = {"Bitácora de Conexiones", "Estatal Docentes y Módulos", "Acceso Planteles"}
     allowed: set[str] = set()
 
-    # ✅ Plantel: opción base (no depende de permisos)
+    # ----------------------------
+    # 1) SI HAY PERMISOS -> estricto por permisos
+    # ----------------------------
+    if perms:
+        for code, label in perm_to_label.items():
+            if code in perms:
+                if plantel and label in global_only:
+                    continue
+                allowed.add(label)
+
+        return [x for x in order if x in allowed]
+
+    # ----------------------------
+    # 2) NO HAY PERMISOS -> fallback por rol (controlado)
+    # ----------------------------
     if plantel:
-        allowed.add("Ranking por docentes y módulos")
-
-    # ✅ Permisos por clave
-    for code, label in perm_to_label.items():
-        if code in perms:
-            # módulos globales: ocultarlos a plantel aunque se asignen por error
-            if plantel and label in {"Bitácora de Conexiones", "Estatal Docentes y Módulos"}:
-                continue
-            allowed.add(label)
-
-    # ✅ Fallback práctico: si no hay permisos pero sí plantel, no dejarlo sin menú
-    if plantel and allowed == {"Ranking por docentes y módulos"}:
-        # Menú plantel “default” (como estaba tu app)
-        allowed.update(
-            {
-                "Docentes y Módulos",
-                "Docentes Seguimiento",
-                "Módulos Seguimiento",
-                "Indicadores Académicos",
-                "Histórico de Indicadores",
-                "Captura Docentes",
-                "Estudiantes por Grupo",
-            }
-        )
+        allowed = {
+            "Docentes y Módulos",
+            "Docentes Seguimiento",
+            "Módulos Seguimiento",
+            "Indicadores Académicos",
+            "Histórico de Indicadores",
+            "Captura Docentes",
+            "Estudiantes por Grupo",
+        }
+    else:
+        allowed = {
+            "Docentes y Módulos",
+            "Estatal Docentes y Módulos",
+            "Docentes Seguimiento",
+            "Módulos Seguimiento",
+            "Indicadores Académicos",
+            "Histórico de Indicadores",
+            "Captura Docentes",
+            "Bitácora de Conexiones",
+            "Acceso Planteles",
+            "Estudiantes por Grupo",
+        }
 
     return [x for x in order if x in allowed]
 
@@ -141,7 +144,6 @@ if not st.session_state.logueado:
         if st.button("Iniciar sesión"):
             ok, plantel, perms, username = validar_usuario(usuario, contrasena)
             if ok:
-                # ✅ Alcance (scope): si no tiene plantel, se considera usuario global (admin/u otro)
                 is_admin_scope = plantel is None
 
                 st.session_state.update(
@@ -149,11 +151,11 @@ if not st.session_state.logueado:
                         "logueado": True,
                         "usuario": username,
                         "plantel_usuario": plantel,
-                        "permisos": perms,  # set[str] de claves
+                        "permisos": perms,
                         "administrador": is_admin_scope,
                     }
                 )
-                registrar_acceso(usuario)
+                registrar_acceso(username, plantel)
                 st.success("✅ ¡Sesión iniciada!")
                 st.rerun()
             else:
@@ -174,7 +176,6 @@ st.sidebar.success("✅ Sesión activa")
 
 perms = st.session_state.get("permisos", set())
 plantel = st.session_state.get("plantel_usuario")
-is_admin_scope = bool(st.session_state.get("administrador"))
 
 if plantel:
     st.sidebar.info(f"👤 {st.session_state.get('usuario')} (Plantel: {plantel})")
@@ -183,7 +184,7 @@ else:
 
 opciones = _menu_por_permisos(perms, plantel)
 if not opciones:
-    st.error("❌ Este usuario no tiene permisos de menú configurados en Datos1.xlsx.")
+    st.error("❌ Este usuario no tiene opciones habilitadas. Revisa permisos/reglas en Datos1.xlsx.")
     st.stop()
 
 opcion = st.sidebar.selectbox("📂 MENÚ PRINCIPAL", opciones)
@@ -194,12 +195,17 @@ if st.sidebar.button("🚪 Cerrar sesión"):
     st.rerun()
 
 # ----------------------------
-# Cargar Datos1.xlsx para todas las vistas excepto Histórico (histórico lo carga su view)
+# Cargar Datos1.xlsx para vistas que lo requieren
 # ----------------------------
-df, error = cargar_datos()
-if error:
-    st.error(f"❌ Error al cargar los datos: {error}")
-    st.stop()
+df = None
+error = None
+
+# Acceso Planteles no necesita df de cargar_datos()
+if opcion != "Acceso Planteles":
+    df, error = cargar_datos()
+    if error:
+        st.error(f"❌ Error al cargar los datos: {error}")
+        st.stop()
 
 # ----------------------------
 # Ruteo
@@ -232,8 +238,8 @@ elif opcion == "Captura Docentes":
         st.stop()
     vista_cd.mostrar(df_sc, st.session_state.plantel_usuario, st.session_state.administrador)
 
-elif opcion == "Ranking por docentes y módulos":
-    mostrar_ranking_por_plantel(df, st.session_state.plantel_usuario)
+elif opcion == "Acceso Planteles":
+    mostrar_acceso_planteles()
 
 elif opcion == "Estudiantes por Grupo":
     mostrar_estudiantes_por_grupo()
