@@ -10,14 +10,18 @@ import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
-from filelock import FileLock  # ✅ usar lock
+from filelock import FileLock
 
-
-# Ruta local (compatibilidad): <raiz_proyecto>/data/bitacora.csv
+# ----------------------------
+# Paths / compatibilidad
+# ----------------------------
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 LOG_FILE_PATH = (PROJECT_ROOT / "data" / "bitacora.csv").resolve()
 
-# Lock local (evita escrituras simultáneas en la misma instancia)
+# ✅ Compatibilidad con código viejo que hace: from data.logger import LOG_FILE
+LOG_FILE = str(LOG_FILE_PATH)
+
+# Lock local (evita choques dentro de la misma instancia)
 LOCK_PATH = Path(os.getenv("BITACORA_LOCK_PATH", "/tmp/bitacora.lock"))
 
 
@@ -124,7 +128,7 @@ def _detect_format_from_text(text: str) -> int:
 
 def _migrar_2_a_3_local():
     """
-    Migra CSV viejo: Usuario,FechaHora  ->  Plantel,Usuario,FechaHora (Plantel vacío en históricos).
+    Migra CSV viejo: Usuario,FechaHora -> Plantel,Usuario,FechaHora (Plantel vacío en históricos).
     Trabaja sobre el archivo local.
     """
     if not LOG_FILE_PATH.exists() or LOG_FILE_PATH.stat().st_size == 0:
@@ -156,11 +160,11 @@ def registrar_acceso(usuario: str, plantel: str | None = None) -> None:
     """
     _ensure_folder()
 
-    with FileLock(str(LOCK_PATH)):  # ✅ lock
-        # 1) Trae el archivo remoto (si existe) para no perder historial tras deploy
+    with FileLock(str(LOCK_PATH)):
+        # 1) Bajar remoto (si existe)
         _sync_from_spaces_to_local()
 
-        # 2) Migra formato viejo si lo detecta
+        # 2) Migrar si está en formato viejo
         local_text = _read_local()
         if _detect_format_from_text(local_text) == 2:
             _migrar_2_a_3_local()
@@ -174,7 +178,7 @@ def registrar_acceso(usuario: str, plantel: str | None = None) -> None:
             f.write(f"{plantel_n},{usuario_n},{fecha}\n")
             f.flush()
 
-        # 4) Sube el archivo completo a Spaces
+        # 4) Subir a Spaces
         _upload_spaces_text(_read_local())
 
 
@@ -184,13 +188,12 @@ def obtener_bitacora_df() -> pd.DataFrame:
     """
     _ensure_folder()
 
-    with FileLock(str(LOCK_PATH)):  # ✅ lock al leer también
+    with FileLock(str(LOCK_PATH)):
         _sync_from_spaces_to_local()
 
         if not LOG_FILE_PATH.exists() or LOG_FILE_PATH.stat().st_size == 0:
             return pd.DataFrame(columns=["Plantel", "Usuario", "FechaHora"])
 
-        # Migra si sigue en formato viejo
         local_text = _read_local()
         if _detect_format_from_text(local_text) == 2:
             _migrar_2_a_3_local()
