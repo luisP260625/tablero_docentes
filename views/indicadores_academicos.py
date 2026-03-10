@@ -610,6 +610,94 @@ def top_modulos_porcentaje_no_competencia_por_semestre(
     return top_dict, semana_usada, None
 
 
+
+# =========================
+# ✅ NUEVO: Top N docentes por % de NO competencia para el correo
+# =========================
+def top_docentes_porcentaje_no_competencia(
+    df_datos: pd.DataFrame,
+    plantel: str,
+    top_n: int = 5
+):
+    """
+    Retorna (top_list, semana_usada, err_msg)
+
+    top_list:
+      [(docente, pct_nc), ...]
+
+    pct_nc = (sum(NO COMPETENTES) / sum(TOTAL ALUMNOS)) * 100
+    Usa semana más reciente (si existe columna Semana).
+    """
+    if df_datos is None or getattr(df_datos, "empty", True):
+        return [], None, "No se pudo leer la hoja 'Datos' (o está vacía)."
+
+    df = df_datos.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+
+    col_plantel = _find_col_like(df, ["Plantel"])
+    col_doc = _find_col_like(df, ["DOCENTE", "Docente", "NOMBRE DOCENTE", "PROFESOR", "MAESTRO"])
+    col_nc = _find_col_like(df, ["NO COMPETENTES", "NO_COMPETENTES", "NO COMP", "NO_COMP"])
+    col_total = _find_col_like(df, ["TOTAL ALUMNOS", "TOTAL_ALUMNOS", "TOTAL"])
+    col_semana = _find_col_like(df, ["Semana", "SEMANA"])
+
+    if not col_plantel or not col_doc or not col_nc or not col_total:
+        return [], None, (
+            "La hoja 'Datos' debe contener columnas: Plantel, DOCENTE, NO COMPETENTES, TOTAL ALUMNOS "
+            "(los nombres pueden variar ligeramente)."
+        )
+
+    # Filtrar plantel
+    dfp = df[df[col_plantel].astype(str).str.strip() == str(plantel).strip()].copy()
+    if dfp.empty:
+        return [], None, "No hay registros en hoja 'Datos' para el plantel seleccionado."
+
+    # Si hay Semana, tomar la más reciente
+    semana_usada = None
+    if col_semana and col_semana in dfp.columns:
+        uniq = dfp[col_semana].dropna().unique().tolist()
+        with_nums = [(v, _wk_key(v)) for v in uniq]
+        nums_only = [x for x in with_nums if x[1] is not None]
+
+        if nums_only:
+            semana_usada = max(nums_only, key=lambda t: t[1])[0]
+        else:
+            semana_usada = sorted([str(v).strip() for v in uniq])[-1]
+
+        dfp = dfp[dfp[col_semana].astype(str).str.strip() == str(semana_usada).strip()].copy()
+        if dfp.empty:
+            return [], None, "No hay registros para la semana seleccionada automáticamente en ese plantel."
+
+    # Asegurar numéricos
+    dfp[col_nc] = pd.to_numeric(dfp[col_nc], errors="coerce").fillna(0)
+    dfp[col_total] = pd.to_numeric(dfp[col_total], errors="coerce").fillna(0)
+
+    # Limpiar docente
+    dfp[col_doc] = dfp[col_doc].astype(str).str.strip()
+    dfp = dfp[~dfp[col_doc].str.lower().isin(["", "nan", "none", "null"])].copy()
+
+    # Agrupar
+    g = dfp.groupby(col_doc, dropna=True).agg(
+        NO_COMP=(col_nc, "sum"),
+        TOTAL=(col_total, "sum"),
+    ).reset_index()
+
+    g = g[g["TOTAL"] > 0].copy()
+    if g.empty:
+        return [], semana_usada, "No fue posible calcular % (TOTAL ALUMNOS en 0 o vacío)."
+
+    g["PCT"] = (g["NO_COMP"] / g["TOTAL"]) * 100.0
+
+    # Orden por mayor %, desempate por NO_COMP, TOTAL, y nombre
+    g[col_doc] = g[col_doc].astype(str).str.strip()
+    g = g.sort_values(by=["PCT", "NO_COMP", "TOTAL", col_doc], ascending=[False, False, False, True])
+
+    top_list = []
+    for _, row in g.head(top_n).iterrows():
+        top_list.append((str(row[col_doc]), round(float(row["PCT"]), 2)))
+
+    return top_list, semana_usada, None
+
+
 # =========================
 # Exportadores
 # =========================
@@ -819,35 +907,74 @@ def _formatear_top_por_semestre(top_dict: dict[int, list[tuple[str, float]]], se
     return "\n".join(lines)
 
 
+def _formatear_top_docentes(top_list: list[tuple[str, float]], semana_usada):
+    """
+    Devuelve string con:
+      1) Docente (xx.xx%)
+      ...
+    """
+    lines = []
+    lines.append("Docentes con MAYOR % de NO COMPETENCIA (plantel):")
+
+    if not top_list:
+        lines.append("(Sin datos)")
+    else:
+        for i, (doc, pct) in enumerate(top_list, start=1):
+            lines.append(f"{i}) {doc} ({pct:.2f}%)")
+
+    if semana_usada is not None:
+        lines.append(f"Semana: {semana_usada}")
+
+    return "\n".join(lines)
+
+
+
 def texto_correo_plantel(
     plantel: str,
     total_no_comp: int,
     total_sin_calif: int,
     top_por_semestre: dict[int, list[tuple[str, float]]] | None,
-    semana_usada,
-    mod_err: str | None
+    semana_modulos,
+    mod_err: str | None,
+    top_docentes: list[tuple[str, float]] | None,
+    semana_docentes,
+    doc_err: str | None
 ) -> str:
+    # --- Bloque módulos ---
     if top_por_semestre and any(len(v) > 0 for v in top_por_semestre.values()):
-        extra = "\n" + _formatear_top_por_semestre(top_por_semestre, semana_usada) + "\n"
+        extra_mod = "\n" + _formatear_top_por_semestre(top_por_semestre, semana_modulos) + "\n"
     else:
-        extra = f"\nMódulos con MAYOR % de NO COMPETENCIA por semestre (plantel): No se pudo determinar con certeza. Motivo: {mod_err}\n"
+        extra_mod = (
+            "\nMódulos con MAYOR % de NO COMPETENCIA por semestre (plantel): "
+            f"No se pudo determinar con certeza. Motivo: {mod_err}\n"
+        )
+
+    # --- Bloque docentes ---
+    if top_docentes and len(top_docentes) > 0:
+        extra_doc = "\n" + _formatear_top_docentes(top_docentes, semana_docentes) + "\n"
+    else:
+        extra_doc = (
+            "\nDocentes con MAYOR % de NO COMPETENCIA (plantel): "
+            f"No se pudo determinar con certeza. Motivo: {doc_err}\n"
+        )
 
     return (
         f"Estimado Plantel {plantel}:\n"
-        "\nAnteponiendo un cordial saludo, al cierre del semestre ordinario del periodo 12526, "
+        "\nAnteponiendo un cordial saludo, con base al semestre ordinario del periodo 2.2526, "
         f"el plantel a su digno cargo registra {total_no_comp} estudiantes NO COMPETENTES y "
         f"{total_sin_calif} estudiantes SIN EVALUACIÓN en algún módulo.\n"
-        "Agradecemos las estrategias y acciones implementadas para el seguimiento académico del estudiantado, "
-        "e invitamos a continuar fortaleciendo las actividades necesarias para garantizar el cierre oportuno y "
-        "adecuado del proceso de evaluación.\n"
-        "\nA continuación, se presentan los módulos que registran el mayor porcentaje de NO COMPETENCIA en este cierre de semestre:\n"
-        f"{extra}\n"
+        "Esta situación requiere atención inmediata, ya que impacta directamente en los resultados académicos y "
+        "en la calidad educativa que ofrecemos.\n "
+        "Les exhortamos a implementar de manera urgente estrategias efectivas que permitan revertir estos indicadores y "
+        "asegurar avances significativos.\n"
+        "El compromiso y la acción oportuna de su equipo serán determinantes para mostrar resultados favorables en el próximo corte. \n"
+        f"{extra_mod}\n"
+        "\nA continuación, se presentan los 5 docentes que registran el mayor porcentaje de NO COMPETENCIA en este cierre de semestre:\n"
+        f"{extra_doc}\n"
         "\nPara consultar información detallada, particular o completa sobre los avances y resultados del plantel, "
         "le invitamos a revisar el tablero institucional en el siguiente enlace:\n"
         "https://tablero-docentes.conalepmexacademica.app/\n"
-        "Nota: Esta información corresponde al corte de fecha 22/01/2026 a las 9:00am \n"
         "\nSin otro particular, reciba un cordial saludo.\n"
-
     )
 
 
@@ -880,14 +1007,20 @@ def construir_borradores_envio(
         # ✅ NUEVO: Top 3 por semestre (1,3,5)
         top_por_semestre, semana_usada, mod_err = top_modulos_porcentaje_no_competencia_por_semestre(df_datos, p)
 
+        # ✅ NUEVO: Top 5 docentes con mayor % de NO competencia
+        top_docentes, semana_docentes, doc_err = top_docentes_porcentaje_no_competencia(df_datos, p, top_n=5)
+
         asunto = f"Indicadores académicos - {p}"
         cuerpo = texto_correo_plantel(
             plantel=p,
             total_no_comp=total_no_comp,
             total_sin_calif=total_sin_calif,
             top_por_semestre=top_por_semestre,
-            semana_usada=semana_usada,
-            mod_err=mod_err
+            semana_modulos=semana_usada,
+            mod_err=mod_err,
+            top_docentes=top_docentes,
+            semana_docentes=semana_docentes,
+            doc_err=doc_err
         )
 
         borradores.append({
