@@ -5,6 +5,8 @@ matplotlib
 numpy
 xlsxwriter
 openpyxl
+pyarrow
+python-calamine
 fpdf2
 fastexcel
 plotly

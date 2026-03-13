@@ -1,349 +1,119 @@
-# views/indicadores_academicos.py
-import streamlit as st
-import pandas as pd
-import plotly.graph_objects as go
-from io import BytesIO
-from datetime import datetime
+# views/indicadores_academicos_v2.py
 import os
 import re
 import smtplib
 import unicodedata
+from io import BytesIO
+from datetime import datetime
 from email.message import EmailMessage
 
-# =========================
-# CONFIG (tamaños de texto)
-# =========================
-LABEL_FONT_SIZE_ADMIN = 15     # <- tamaño etiquetas gráfica admin (prueba 9, 10, 11, 12)
-LABEL_FONT_SIZE_PLANTEL = 15   # <- tamaño etiquetas gráfica plantel (prueba 9, 10, 11, 12)
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
 
-# Multiplicador para dar "aire" arriba y que no se corte la etiqueta
+
+# =========================
+# CONFIG
+# =========================
+LABEL_FONT_SIZE_ADMIN = 15
+LABEL_FONT_SIZE_PLANTEL = 15
 Y_AXIS_PADDING_MULT = 1.35
 
-
-# =========================
-# Permisos (menú / acciones)
-# =========================
-# Recomendación: validar por CÓDIGO (columna "Permiso"), no por ID.
-# Así, aunque cambie el número de ID, mientras el código siga igual,
-# el permiso se mantiene estable.
 PERM_SEND_EMAIL_CODE = "SEND_EMAIL_INDICADORES"
 
+EXCEL_PATH = "assets/Datos1.xlsx"
+CACHE_DIR = "assets/cache_indicadores"
+MAX_PREVIEW_ROWS = 500
 
-def _parse_perm_ids(raw) -> set[int]:
-    """Convierte '1,2,3' o [1,'2'] a {1,2,3}."""
-    if raw is None:
-        return set()
+USE_FAST_CACHE = os.getenv("USE_FAST_CACHE", "true").lower() == "true"
 
-    # lista/tuple/set
-    if isinstance(raw, (list, tuple, set)):
-        out = set()
-        for it in raw:
-            out |= _parse_perm_ids(it)
-        return out
+REPROBACION_COLS = [
+    "Plantel", "ESTUDIANTE", "matricula", "CARRERA", "MODULO",
+    "DOCENTE", "grado", "cvegrupo", "pEspecifico", "pAlcanzado", "pRelativo"
+]
 
-    # dict: intenta llaves típicas
-    if isinstance(raw, dict):
-        out = set()
-        for k in ("ids", "permisos", "permisos_ids", "permissions", "permission_ids"):
-            if k in raw:
-                out |= _parse_perm_ids(raw.get(k))
-        return out
-
-    s = str(raw).strip()
-    if not s or s.lower() in ("nan", "none", "null"):
-        return set()
-
-
-    tokens = re.split(r"[;,|\s]+", s)
-    ids = set()
-    for t in tokens:
-        t = t.strip()
-        if not t:
-            continue
-        m = re.search(r"\d+", t)
-        if m:
-            try:
-                ids.add(int(m.group(0)))
-            except Exception:
-                pass
-    return ids
-
-
-
-@st.cache_data
-def cargar_catalogo_permisos_xlsx() -> dict[int, str]:
-    """Lee hoja 'Permisos' (id, Permiso) y devuelve {id: 'CODIGO_PERMISO'}."""
-    try:
-        df = pd.read_excel("assets/Datos1.xlsx", sheet_name="Permisos")
-    except Exception:
-        return {}
-
-    def _find_col_exact(name: str):
-        for c in df.columns:
-            if str(c).strip().lower() == name.lower():
-                return c
-        return None
-
-    col_id = _find_col_exact("id")
-    col_perm = _find_col_exact("Permiso")
-
-    if col_id is None or col_perm is None:
-        return {}
-
-    cat: dict[int, str] = {}
-    for _, row in df.iterrows():
-        rid = row.get(col_id)
-        rperm = row.get(col_perm)
-        if pd.isna(rid) or pd.isna(rperm):
-            continue
-        # id puede venir como float si Excel lo interpreta así
-        try:
-            pid = int(str(rid).strip())
-        except Exception:
-            continue
-        code = str(rperm).strip()
-        if code:
-            cat[pid] = code
-    return cat
-
-
-def _parse_perm_codes(raw, catalog: dict[int, str]) -> set[str]:
-    """Convierte permisos en cualquier forma a set de CÓDIGOS.
-
-    Acepta:
-      - "1,2,3" (IDs) -> se mapea a códigos vía hoja 'Permisos'
-      - "MENU_X,SEND_EMAIL_INDICADORES" (códigos)
-      - listas/sets/tuplas mixtas
-      - dicts con llaves típicas
-    """
-    if raw is None:
-        return set()
-
-    # lista/tuple/set
-    if isinstance(raw, (list, tuple, set)):
-        out: set[str] = set()
-        for it in raw:
-            out |= _parse_perm_codes(it, catalog)
-        return out
-
-    # dict: intenta llaves típicas
-    if isinstance(raw, dict):
-        out: set[str] = set()
-        for k in (
-            "codes", "permisos_codes", "permissions_codes",
-            "permisos", "permisos_ids", "permissions", "permission_ids",
-            "ids",
-        ):
-            if k in raw:
-                out |= _parse_perm_codes(raw.get(k), catalog)
-        return out
-
-    s = str(raw).strip()
-    if not s or s.lower() in ("nan", "none", "null"):
-        return set()
-
-    # separa por coma, punto y coma, pipe o espacios
-    parts = re.split(r"[\s,;|]+", s)
-    out: set[str] = set()
-    for t in parts:
-        t = t.strip()
-        if not t:
-            continue
-        # token numérico => mapear a código si existe
-        if t.isdigit():
-            pid = int(t)
-            code = catalog.get(pid)
-            if code:
-                out.add(code)
-        else:
-            # token ya es código
-            out.add(t)
-    return out
-
-
-@st.cache_data
-def cargar_permisos_usuarios_codigos_xlsx() -> dict[str, set[str]]:
-    """Lee hoja 'Planteles' (Usuario, Permisos) y regresa {usuario: set(códigos)}.
-
-    Nota: La columna Permisos puede contener IDs ("1,2,3") o códigos
-    ("MENU_X,SEND_EMAIL_INDICADORES"). Si son IDs, se traducen usando hoja 'Permisos'.
-    """
-    try:
-        df = pd.read_excel("assets/Datos1.xlsx", sheet_name="Planteles")
-    except Exception:
-        return {}
-
-    catalog = cargar_catalogo_permisos_xlsx()
-
-    def _find_col_exact(name: str):
-        for c in df.columns:
-            if str(c).strip().lower() == name.lower():
-                return c
-        return None
-
-    col_user = _find_col_exact("Usuario")
-    col_perms = _find_col_exact("Permisos")
-
-    if col_user is None or col_perms is None:
-        return {}
-
-    mapping: dict[str, set[str]] = {}
-    for _, row in df.iterrows():
-        u = str(row.get(col_user, "")).strip()
-        if not u or u.lower() in ("nan", "none"):
-            continue
-        mapping[u] = _parse_perm_codes(row.get(col_perms), catalog)
-
-    return mapping
-
-
-def obtener_permisos_usuario_codigos() -> set[str]:
-    """Devuelve el set de CÓDIGOS de permisos del usuario logueado.
-
-    Prioridad:
-      1) session_state (si ya lo carga validator/app)
-      2) hoja 'Planteles' (Usuario -> Permisos), traducido por hoja 'Permisos'
-    """
-    catalog = cargar_catalogo_permisos_xlsx()
-
-    # 1) desde sesión (varios nombres posibles)
-    posibles = [
-        st.session_state.get("permisos_codes"),
-        st.session_state.get("permissions_codes"),
-        st.session_state.get("permisos"),
-        st.session_state.get("permisos_ids"),
-        st.session_state.get("permissions"),
-        st.session_state.get("permission_ids"),
-        st.session_state.get("permisos_usuario"),
-        st.session_state.get("user_permissions"),
-    ]
-    for raw in posibles:
-        codes = _parse_perm_codes(raw, catalog)
-        if codes:
-            return codes
-
-    # 2) desde Excel (Planteles)
-    username = _get_username_from_session()
-    if username:
-        m = cargar_permisos_usuarios_codigos_xlsx()
-        if username in m:
-            return m[username]
-        for u, codes in m.items():
-            if u.lower() == username.lower():
-                return codes
-
-    return set()
-
-
-
-def _get_username_from_session() -> str | None:
-    """Intenta detectar el usuario logueado desde st.session_state (sin romper compatibilidad)."""
-    for k in (
-        "usuario", "username", "user", "Usuario", "USER", "login_user", "current_user",
-        "user_name", "user_email", "email"
-    ):
-        v = st.session_state.get(k)
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-
-        # en caso de que sea un dict/obj con username
-        if isinstance(v, dict):
-            for kk in ("usuario", "username", "user", "name", "email"):
-                vv = v.get(kk)
-                if isinstance(vv, str) and vv.strip():
-                    return vv.strip()
-
-    return None
-
-
-@st.cache_data
-def cargar_permisos_usuarios_xlsx() -> dict[str, set[int]]:
-    """Lee hoja 'Planteles' (Usuario, Permisos) y regresa {usuario: set(ids)}."""
-    df = pd.read_excel("assets/Datos1.xlsx", sheet_name="Planteles")
-
-    def _find_col_exact(name: str):
-        for c in df.columns:
-            if str(c).strip().lower() == name.lower():
-                return c
-        return None
-
-    col_user = _find_col_exact("Usuario")
-    col_perms = _find_col_exact("Permisos")
-
-    if col_user is None or col_perms is None:
-        # No romper la app si la hoja cambia: simplemente no hay permisos por XLSX
-        return {}
-
-    mapping: dict[str, set[int]] = {}
-    for _, row in df.iterrows():
-        u = str(row.get(col_user, "")).strip()
-        if not u or u.lower() in ("nan", "none"):
-            continue
-        mapping[u] = _parse_perm_ids(row.get(col_perms))
-
-    return mapping
-
-
-def obtener_permisos_usuario() -> set[int]:
-    """
-    Devuelve el set de IDs de permisos del usuario logueado.
-    Prioridad:
-      1) session_state (si ya lo carga validator/app)
-      2) hoja 'Planteles' (Usuario -> Permisos)
-    """
-    # 1) desde sesión (varios nombres posibles)
-    posibles = [
-        st.session_state.get("permisos_ids"),
-        st.session_state.get("permisos"),
-        st.session_state.get("permissions"),
-        st.session_state.get("permission_ids"),
-        st.session_state.get("permisos_usuario"),
-        st.session_state.get("user_permissions"),
-    ]
-    for raw in posibles:
-        ids = _parse_perm_ids(raw)
-        if ids:
-            return ids
-
-    # 2) desde Excel (Planteles)
-    username = _get_username_from_session()
-    if username:
-        m = cargar_permisos_usuarios_xlsx()
-        # match exact o case-insensitive
-        if username in m:
-            return m[username]
-        for u, ids in m.items():
-            if u.lower() == username.lower():
-                return ids
-
-    return set()
-
-# =========================
-# Carga de datos
-# =========================
-@st.cache_data
-def cargar_datos():
-    df_reprobacion = pd.read_excel("assets/Datos1.xlsx", sheet_name="Reprobacion")
-    df_matricula = pd.read_excel(
-        "assets/Datos1.xlsx", sheet_name="Matricula", usecols=["Plantel", "matriculaTotal"]
-    )
-
-    # ✅ NUEVO: hoja Datos (para % No competencia por módulo)
-    try:
-        df_datos = pd.read_excel("assets/Datos1.xlsx", sheet_name="Datos")
-    except Exception:
-        df_datos = None  # No romper si no existe
-
-    return df_reprobacion, df_matricula, df_datos
-
-
-# =========================
-# Utilidades
-# =========================
+MATRICULA_COLS = ["Plantel", "matriculaTotal"]
 METRICAS_ORDEN = ["pEspecifico", "pAlcanzado", "pRelativo"]
 
 
-def asegurar_metricas(df: pd.DataFrame) -> pd.DataFrame:
+# =========================
+# Helpers base
+# =========================
+def slug(v):
+    return re.sub(r"[^a-zA-Z0-9_-]+", "_", str(v).strip())
+
+
+def _cache_path(name):
+    return os.path.join(CACHE_DIR, name)
+
+
+def _read_excel(sheet_name, usecols=None):
+    return pd.read_excel(EXCEL_PATH, sheet_name=sheet_name, usecols=usecols)
+
+
+def _read_fast_or_excel(parquet_name, sheet_name, usecols=None):
+    parquet_path = _cache_path(parquet_name)
+
+    if USE_FAST_CACHE and os.path.exists(parquet_path):
+        return pd.read_parquet(parquet_path)
+
+    return _read_excel(sheet_name, usecols=usecols)
+
+
+def _norm_txt(x):
+    s = "" if x is None else str(x)
+    s = s.strip()
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    return s.lower()
+
+
+def _find_col_like(df, candidates):
+    cols = list(df.columns)
+    low = [_norm_txt(c) for c in cols]
+    for cand in candidates:
+        c = _norm_txt(cand)
+        for orig, lo in zip(cols, low):
+            if lo == c or c in lo:
+                return orig
+    return None
+
+
+def _wk_key(v):
+    s = str(v).strip()
+    nums = re.findall(r"\d+", s)
+    return int(nums[0]) if nums else None
+
+
+def _sem_key(v):
+    if v is None:
+        return None
+
+    try:
+        if pd.isna(v):
+            return None
+    except Exception:
+        pass
+
+    if isinstance(v, int):
+        return int(v)
+    if isinstance(v, float) and v.is_integer():
+        return int(v)
+
+    s_norm = _norm_txt(v)
+
+    if "prim" in s_norm:
+        return 1
+    if "terc" in s_norm:
+        return 3
+    if "quint" in s_norm:
+        return 5
+
+    nums = re.findall(r"\d+", str(v))
+    return int(nums[0]) if nums else None
+
+
+def asegurar_metricas(df):
     for col in METRICAS_ORDEN:
         if col not in df.columns:
             df[col] = pd.NA
@@ -352,7 +122,7 @@ def asegurar_metricas(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def agregar_fila_total(tabla: pd.DataFrame) -> pd.DataFrame:
+def agregar_fila_total(tabla):
     df = tabla.copy()
     numeric_cols = df.select_dtypes(include="number").columns.tolist()
 
@@ -374,78 +144,437 @@ def agregar_fila_total(tabla: pd.DataFrame) -> pd.DataFrame:
     return pd.concat([df, pd.DataFrame([total_row])], ignore_index=True)
 
 
-# =========================
-# ✅ NUEVO: Helpers robustos para columnas (acentos, may/min, espacios)
-# =========================
-def _norm_txt(x) -> str:
-    s = "" if x is None else str(x)
-    s = s.strip()
-    s = unicodedata.normalize("NFKD", s)
-    s = "".join(ch for ch in s if not unicodedata.combining(ch))
-    return s.lower()
+def _preparar_columnas_detalle(df):
+    df = asegurar_metricas(df.copy())
+
+    columnas_base = [
+        "Plantel", "ESTUDIANTE", "matricula", "CARRERA",
+        "MODULO", "DOCENTE", "grado", "cvegrupo"
+    ]
+    orden = [c for c in columnas_base if c in df.columns] + [c for c in METRICAS_ORDEN if c in df.columns]
+
+    if orden:
+        return df[orden]
+
+    return df
 
 
-def _find_col_like(df: pd.DataFrame, candidates: list[str]):
-    cols = list(df.columns)
-    low = [_norm_txt(c) for c in cols]
-    for cand in candidates:
-        c = _norm_txt(cand)
-        for orig, lo in zip(cols, low):
-            if lo == c or c in lo:
-                return orig
+def mostrar_dataframe_preview(df, max_rows=MAX_PREVIEW_ROWS, height=360):
+    total = len(df)
+    if total > max_rows:
+        st.caption(f"Mostrando los primeros {max_rows:,} de {total:,} registros. Usa la descarga para obtener el archivo completo.")
+    st.dataframe(df.head(max_rows), use_container_width=True, height=height)
+
+
+# =========================
+# Carga de datos
+# =========================
+@st.cache_data(show_spinner=False)
+def cargar_reprobacion():
+    df = _read_fast_or_excel("reprobacion.parquet", "Reprobacion", usecols=None)
+    return asegurar_metricas(df)
+
+
+@st.cache_data(show_spinner=False)
+def cargar_matricula():
+    try:
+        df = _read_fast_or_excel("matricula.parquet", "Matricula", usecols=MATRICULA_COLS)
+    except Exception:
+        df = _read_fast_or_excel("matricula.parquet", "Matricula", usecols=None)
+
+    if "matriculaTotal" in df.columns:
+        df["matriculaTotal"] = pd.to_numeric(df["matriculaTotal"], errors="coerce").fillna(0)
+
+    return df
+
+
+@st.cache_data(show_spinner=False)
+def cargar_resumen():
+    parquet_name = "resumen.parquet"
+    parquet_path = _cache_path(parquet_name)
+
+    if USE_FAST_CACHE and os.path.exists(parquet_path):
+        return pd.read_parquet(parquet_path)
+
+    df_reprobacion = cargar_reprobacion()
+    df_matricula = cargar_matricula()
+
+    if "Plantel" not in df_reprobacion.columns or "matricula" not in df_reprobacion.columns:
+        raise ValueError("La hoja Reprobacion debe contener al menos las columnas 'Plantel' y 'matricula'.")
+
+    df_modulos = (
+        df_reprobacion
+        .groupby(["Plantel", "matricula"])
+        .size()
+        .reset_index(name="modulos_nc")
+    )
+
+    df_modulos["categoria"] = df_modulos["modulos_nc"].apply(lambda x: str(x) if x <= 10 else "11 o más")
+
+    resumen = (
+        df_modulos
+        .groupby(["Plantel", "categoria"])
+        .size()
+        .reset_index(name="total_estudiantes")
+    )
+
+    tabla = (
+        resumen
+        .pivot(index="Plantel", columns="categoria", values="total_estudiantes")
+        .fillna(0)
+        .astype(int)
+        .reset_index()
+    )
+
+    if "Plantel" in df_matricula.columns:
+        tabla = tabla.merge(df_matricula, on="Plantel", how="left")
+
+    if "matriculaTotal" not in tabla.columns:
+        tabla["matriculaTotal"] = 0
+
+    tabla["matriculaTotal"] = pd.to_numeric(tabla["matriculaTotal"], errors="coerce").fillna(0)
+
+    columnas_excluir = {"Plantel", "matriculaTotal"}
+    columnas_nc = [c for c in tabla.columns if c not in columnas_excluir]
+
+    tabla["Total estudiantes no competentes"] = tabla[columnas_nc].sum(axis=1)
+    tabla["% Estudiantes no competentes"] = (
+        (tabla["Total estudiantes no competentes"] / tabla["matriculaTotal"]) * 100
+    ).replace([float("inf"), -float("inf")], 0).fillna(0).round(2)
+
+    return tabla
+
+
+@st.cache_data(show_spinner=False)
+def cargar_seguimiento():
+    return _read_fast_or_excel("seguimiento.parquet", "Seguimiento", usecols=None)
+
+
+@st.cache_data(show_spinner=False)
+def cargar_datos_sheet():
+    try:
+        return _read_fast_or_excel("datos.parquet", "Datos", usecols=None)
+    except Exception:
+        return None
+
+
+@st.cache_data(show_spinner=False)
+def cargar_planteles_sheet():
+    return _read_fast_or_excel("planteles.parquet", "Planteles", usecols=None)
+
+
+@st.cache_data(show_spinner=False)
+def cargar_permisos_sheet():
+    return _read_fast_or_excel("permisos.parquet", "Permisos", usecols=None)
+
+
+@st.cache_data(show_spinner=False)
+def obtener_detalle_no_competentes(plantel_sel):
+    if USE_FAST_CACHE and plantel_sel != "Todos":
+        path = _cache_path(f"detalle_por_plantel/{slug(plantel_sel)}.parquet")
+        if os.path.exists(path):
+            df = pd.read_parquet(path)
+            return _preparar_columnas_detalle(df)
+
+    df = cargar_reprobacion()
+    if plantel_sel != "Todos":
+        df = df[df["Plantel"] == plantel_sel].copy()
+
+    return _preparar_columnas_detalle(df)
+
+
+@st.cache_data(show_spinner=False)
+def obtener_sin_registro_calificaciones(plantel_sel):
+    df = obtener_detalle_no_competentes(plantel_sel)
+    if "pEspecifico" not in df.columns:
+        return pd.DataFrame(columns=df.columns)
+    return df[df["pEspecifico"] == 0].copy()
+
+
+@st.cache_data(show_spinner=False)
+def obtener_seguimiento_plantel(plantel_usuario):
+    df_seguimiento = cargar_seguimiento()
+    df_plantel = df_seguimiento[df_seguimiento["Plantel"] == plantel_usuario].copy()
+
+    columnas_cantidad = [col for col in df_plantel.columns if str(col).startswith("Sem ") and not str(col).endswith("%")]
+    columnas_porcentaje = [
+        col for col in df_plantel.columns
+        if str(col).endswith("%") and str(col).replace(" %", "") in columnas_cantidad
+    ]
+
+    if not columnas_cantidad or not columnas_porcentaje:
+        return pd.DataFrame(columns=["Semana", "Cantidad", "Porcentaje", "Etiqueta"])
+
+    df_valores = df_plantel[columnas_cantidad].sum().reset_index()
+    df_valores.columns = ["Semana", "Cantidad"]
+    df_valores["Semana"] = df_valores["Semana"].astype(str).str.strip()
+
+    df_porcentajes = df_plantel[columnas_porcentaje].mean().reset_index()
+    df_porcentajes.columns = ["Semana", "Porcentaje"]
+    df_porcentajes["Semana"] = df_porcentajes["Semana"].astype(str).str.replace(" %", "", regex=False).str.strip()
+
+    df_semana = pd.merge(df_valores, df_porcentajes, on="Semana", how="inner")
+    df_semana["Cantidad"] = pd.to_numeric(df_semana["Cantidad"], errors="coerce").fillna(0)
+    df_semana["Porcentaje"] = pd.to_numeric(df_semana["Porcentaje"], errors="coerce").fillna(0).round(2)
+    df_semana["Etiqueta"] = df_semana.apply(
+        lambda r: f"{int(r['Cantidad'])} - {float(r['Porcentaje']):.1f}%",
+        axis=1
+    )
+    return df_semana
+
+
+# =========================
+# Permisos
+# =========================
+def _parse_perm_ids(raw):
+    if raw is None:
+        return set()
+
+    if isinstance(raw, (list, tuple, set)):
+        out = set()
+        for it in raw:
+            out |= _parse_perm_ids(it)
+        return out
+
+    if isinstance(raw, dict):
+        out = set()
+        for k in ("ids", "permisos", "permisos_ids", "permissions", "permission_ids"):
+            if k in raw:
+                out |= _parse_perm_ids(raw.get(k))
+        return out
+
+    s = str(raw).strip()
+    if not s or s.lower() in ("nan", "none", "null"):
+        return set()
+
+    tokens = re.split(r"[;,|\s]+", s)
+    ids = set()
+    for t in tokens:
+        t = t.strip()
+        if not t:
+            continue
+        m = re.search(r"\d+", t)
+        if m:
+            try:
+                ids.add(int(m.group(0)))
+            except Exception:
+                pass
+    return ids
+
+
+@st.cache_data(show_spinner=False)
+def cargar_catalogo_permisos_xlsx():
+    try:
+        df = cargar_permisos_sheet()
+    except Exception:
+        return {}
+
+    def _find_col_exact(name):
+        for c in df.columns:
+            if str(c).strip().lower() == name.lower():
+                return c
+        return None
+
+    col_id = _find_col_exact("id")
+    col_perm = _find_col_exact("Permiso")
+
+    if col_id is None or col_perm is None:
+        return {}
+
+    cat = {}
+    for _, row in df.iterrows():
+        rid = row.get(col_id)
+        rperm = row.get(col_perm)
+        if pd.isna(rid) or pd.isna(rperm):
+            continue
+        try:
+            pid = int(str(rid).strip())
+        except Exception:
+            continue
+        code = str(rperm).strip()
+        if code:
+            cat[pid] = code
+    return cat
+
+
+def _parse_perm_codes(raw, catalog):
+    if raw is None:
+        return set()
+
+    if isinstance(raw, (list, tuple, set)):
+        out = set()
+        for it in raw:
+            out |= _parse_perm_codes(it, catalog)
+        return out
+
+    if isinstance(raw, dict):
+        out = set()
+        for k in (
+            "codes", "permisos_codes", "permissions_codes",
+            "permisos", "permisos_ids", "permissions", "permission_ids",
+            "ids",
+        ):
+            if k in raw:
+                out |= _parse_perm_codes(raw.get(k), catalog)
+        return out
+
+    s = str(raw).strip()
+    if not s or s.lower() in ("nan", "none", "null"):
+        return set()
+
+    parts = re.split(r"[\s,;|]+", s)
+    out = set()
+    for t in parts:
+        t = t.strip()
+        if not t:
+            continue
+        if t.isdigit():
+            pid = int(t)
+            code = catalog.get(pid)
+            if code:
+                out.add(code)
+        else:
+            out.add(t)
+    return out
+
+
+@st.cache_data(show_spinner=False)
+def cargar_permisos_usuarios_codigos_xlsx():
+    try:
+        df = cargar_planteles_sheet()
+    except Exception:
+        return {}
+
+    catalog = cargar_catalogo_permisos_xlsx()
+
+    def _find_col_exact(name):
+        for c in df.columns:
+            if str(c).strip().lower() == name.lower():
+                return c
+        return None
+
+    col_user = _find_col_exact("Usuario")
+    col_perms = _find_col_exact("Permisos")
+
+    if col_user is None or col_perms is None:
+        return {}
+
+    mapping = {}
+    for _, row in df.iterrows():
+        u = str(row.get(col_user, "")).strip()
+        if not u or u.lower() in ("nan", "none"):
+            continue
+        mapping[u] = _parse_perm_codes(row.get(col_perms), catalog)
+
+    return mapping
+
+
+def _get_username_from_session():
+    for k in (
+        "usuario", "username", "user", "Usuario", "USER", "login_user", "current_user",
+        "user_name", "user_email", "email"
+    ):
+        v = st.session_state.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+
+        if isinstance(v, dict):
+            for kk in ("usuario", "username", "user", "name", "email"):
+                vv = v.get(kk)
+                if isinstance(vv, str) and vv.strip():
+                    return vv.strip()
     return None
 
 
-def _wk_key(v):
-    s = str(v).strip()
-    nums = re.findall(r"\d+", s)
-    return int(nums[0]) if nums else None
+def obtener_permisos_usuario_codigos():
+    catalog = cargar_catalogo_permisos_xlsx()
+
+    posibles = [
+        st.session_state.get("permisos_codes"),
+        st.session_state.get("permissions_codes"),
+        st.session_state.get("permisos"),
+        st.session_state.get("permisos_ids"),
+        st.session_state.get("permissions"),
+        st.session_state.get("permission_ids"),
+        st.session_state.get("permisos_usuario"),
+        st.session_state.get("user_permissions"),
+    ]
+    for raw in posibles:
+        codes = _parse_perm_codes(raw, catalog)
+        if codes:
+            return codes
+
+    username = _get_username_from_session()
+    if username:
+        m = cargar_permisos_usuarios_codigos_xlsx()
+        if username in m:
+            return m[username]
+        for u, codes in m.items():
+            if u.lower() == username.lower():
+                return codes
+
+    return set()
 
 
-def _sem_key(v):
-    """
-    Convierte valores de SEMESTRE a entero (1,3,5,...).
-    Soporta: 1, "1", "1er", "primero", "tercero", "quinto", etc.
-    """
-    if v is None:
+@st.cache_data(show_spinner=False)
+def cargar_permisos_usuarios_xlsx():
+    try:
+        df = cargar_planteles_sheet()
+    except Exception:
+        return {}
+
+    def _find_col_exact(name):
+        for c in df.columns:
+            if str(c).strip().lower() == name.lower():
+                return c
         return None
 
-    # numérico puro
-    try:
-        if pd.isna(v):
-            return None
-    except Exception:
-        pass
+    col_user = _find_col_exact("Usuario")
+    col_perms = _find_col_exact("Permisos")
 
-    if isinstance(v, int):
-        return int(v)
-    if isinstance(v, float) and v.is_integer():
-        return int(v)
+    if col_user is None or col_perms is None:
+        return {}
 
-    s_norm = _norm_txt(v)
+    mapping = {}
+    for _, row in df.iterrows():
+        u = str(row.get(col_user, "")).strip()
+        if not u or u.lower() in ("nan", "none"):
+            continue
+        mapping[u] = _parse_perm_ids(row.get(col_perms))
 
-    # palabras comunes
-    if "prim" in s_norm:
-        return 1
-    if "terc" in s_norm:
-        return 3
-    if "quint" in s_norm:
-        return 5
-
-    # números dentro del texto
-    nums = re.findall(r"\d+", str(v))
-    return int(nums[0]) if nums else None
+    return mapping
 
 
-def modulo_mayor_porcentaje_no_competencia(df_datos: pd.DataFrame, plantel: str):
-    """
-    Retorna (modulo, pct_nc, semana_usada, err_msg)
+def obtener_permisos_usuario():
+    posibles = [
+        st.session_state.get("permisos_ids"),
+        st.session_state.get("permisos"),
+        st.session_state.get("permissions"),
+        st.session_state.get("permission_ids"),
+        st.session_state.get("permisos_usuario"),
+        st.session_state.get("user_permissions"),
+    ]
+    for raw in posibles:
+        ids = _parse_perm_ids(raw)
+        if ids:
+            return ids
 
-    Cálculo idéntico al módulo views/no_competentes.py:
-      pct_nc = (sum(NO COMPETENTES) / sum(TOTAL ALUMNOS)) * 100
+    username = _get_username_from_session()
+    if username:
+        m = cargar_permisos_usuarios_xlsx()
+        if username in m:
+            return m[username]
+        for u, ids in m.items():
+            if u.lower() == username.lower():
+                return ids
 
-    Si existe columna 'Semana', usa por defecto la semana más reciente (máximo).
-    """
+    return set()
+
+
+# =========================
+# Cálculos para correo
+# =========================
+def modulo_mayor_porcentaje_no_competencia(df_datos, plantel):
     if df_datos is None or getattr(df_datos, "empty", True):
         return None, None, None, "No se pudo leer la hoja 'Datos' (o está vacía)."
 
@@ -464,12 +593,10 @@ def modulo_mayor_porcentaje_no_competencia(df_datos: pd.DataFrame, plantel: str)
             "(los nombres pueden variar ligeramente)."
         )
 
-    # Filtrar plantel
     dfp = df[df[col_plantel].astype(str).str.strip() == str(plantel).strip()].copy()
     if dfp.empty:
         return None, None, None, "No hay registros en hoja 'Datos' para el plantel seleccionado."
 
-    # Si hay Semana, tomar la más reciente
     semana_usada = None
     if col_semana and col_semana in dfp.columns:
         uniq = dfp[col_semana].dropna().unique().tolist()
@@ -485,11 +612,9 @@ def modulo_mayor_porcentaje_no_competencia(df_datos: pd.DataFrame, plantel: str)
         if dfp.empty:
             return None, None, None, "No hay registros para la semana seleccionada automáticamente en ese plantel."
 
-    # Asegurar numéricos
     dfp[col_nc] = pd.to_numeric(dfp[col_nc], errors="coerce").fillna(0)
     dfp[col_total] = pd.to_numeric(dfp[col_total], errors="coerce").fillna(0)
 
-    # Agrupar
     g = dfp.groupby(col_mod, dropna=True).agg(
         NO_COMP=(col_nc, "sum"),
         TOTAL=(col_total, "sum"),
@@ -500,8 +625,6 @@ def modulo_mayor_porcentaje_no_competencia(df_datos: pd.DataFrame, plantel: str)
         return None, None, semana_usada, "No fue posible calcular % (TOTAL ALUMNOS en 0 o vacío)."
 
     g["PCT"] = (g["NO_COMP"] / g["TOTAL"]) * 100.0
-
-    # Orden por mayor %, desempate por NO_COMP, TOTAL, y nombre
     g[col_mod] = g[col_mod].astype(str).str.strip()
     g = g.sort_values(by=["PCT", "NO_COMP", "TOTAL", col_mod], ascending=[False, False, False, True])
 
@@ -511,28 +634,7 @@ def modulo_mayor_porcentaje_no_competencia(df_datos: pd.DataFrame, plantel: str)
     return modulo, round(pct, 2), semana_usada, None
 
 
-# =========================
-# ✅ NUEVO: Top 3 módulos por semestre (1,3,5) para el correo
-# =========================
-def top_modulos_porcentaje_no_competencia_por_semestre(
-    df_datos: pd.DataFrame,
-    plantel: str,
-    semestres: tuple[int, ...] = (1, 3, 5),
-    top_n: int = 3
-):
-    """
-    Retorna (top_dict, semana_usada, err_msg)
-
-    top_dict:
-      {
-        1: [(modulo, pct), (modulo, pct), (modulo, pct)],
-        3: [...],
-        5: [...]
-      }
-
-    pct = (sum(NO COMPETENTES) / sum(TOTAL ALUMNOS)) * 100
-    Usa semana más reciente (si existe columna Semana).
-    """
+def top_modulos_porcentaje_no_competencia_por_semestre(df_datos, plantel, semestres=(1, 3, 5), top_n=3):
     if df_datos is None or getattr(df_datos, "empty", True):
         return {}, None, "No se pudo leer la hoja 'Datos' (o está vacía)."
 
@@ -552,12 +654,10 @@ def top_modulos_porcentaje_no_competencia_por_semestre(
             "(los nombres pueden variar ligeramente)."
         )
 
-    # Filtrar plantel
     dfp = df[df[col_plantel].astype(str).str.strip() == str(plantel).strip()].copy()
     if dfp.empty:
         return {}, None, "No hay registros en hoja 'Datos' para el plantel seleccionado."
 
-    # Si hay Semana, tomar la más reciente
     semana_usada = None
     if col_semana and col_semana in dfp.columns:
         uniq = dfp[col_semana].dropna().unique().tolist()
@@ -573,14 +673,11 @@ def top_modulos_porcentaje_no_competencia_por_semestre(
         if dfp.empty:
             return {}, None, "No hay registros para la semana seleccionada automáticamente en ese plantel."
 
-    # Asegurar numéricos
     dfp[col_nc] = pd.to_numeric(dfp[col_nc], errors="coerce").fillna(0)
     dfp[col_total] = pd.to_numeric(dfp[col_total], errors="coerce").fillna(0)
-
-    # Mapear semestre a número (1,3,5...)
     dfp["_SEM_KEY_"] = dfp[col_semestre].apply(_sem_key)
 
-    top_dict: dict[int, list[tuple[str, float]]] = {}
+    top_dict = {}
     for sem in semestres:
         dfs = dfp[dfp["_SEM_KEY_"] == int(sem)].copy()
         if dfs.empty:
@@ -610,24 +707,7 @@ def top_modulos_porcentaje_no_competencia_por_semestre(
     return top_dict, semana_usada, None
 
 
-
-# =========================
-# ✅ NUEVO: Top N docentes por % de NO competencia para el correo
-# =========================
-def top_docentes_porcentaje_no_competencia(
-    df_datos: pd.DataFrame,
-    plantel: str,
-    top_n: int = 5
-):
-    """
-    Retorna (top_list, semana_usada, err_msg)
-
-    top_list:
-      [(docente, pct_nc), ...]
-
-    pct_nc = (sum(NO COMPETENTES) / sum(TOTAL ALUMNOS)) * 100
-    Usa semana más reciente (si existe columna Semana).
-    """
+def top_docentes_porcentaje_no_competencia(df_datos, plantel, top_n=5):
     if df_datos is None or getattr(df_datos, "empty", True):
         return [], None, "No se pudo leer la hoja 'Datos' (o está vacía)."
 
@@ -646,12 +726,10 @@ def top_docentes_porcentaje_no_competencia(
             "(los nombres pueden variar ligeramente)."
         )
 
-    # Filtrar plantel
     dfp = df[df[col_plantel].astype(str).str.strip() == str(plantel).strip()].copy()
     if dfp.empty:
         return [], None, "No hay registros en hoja 'Datos' para el plantel seleccionado."
 
-    # Si hay Semana, tomar la más reciente
     semana_usada = None
     if col_semana and col_semana in dfp.columns:
         uniq = dfp[col_semana].dropna().unique().tolist()
@@ -667,15 +745,11 @@ def top_docentes_porcentaje_no_competencia(
         if dfp.empty:
             return [], None, "No hay registros para la semana seleccionada automáticamente en ese plantel."
 
-    # Asegurar numéricos
     dfp[col_nc] = pd.to_numeric(dfp[col_nc], errors="coerce").fillna(0)
     dfp[col_total] = pd.to_numeric(dfp[col_total], errors="coerce").fillna(0)
-
-    # Limpiar docente
     dfp[col_doc] = dfp[col_doc].astype(str).str.strip()
     dfp = dfp[~dfp[col_doc].str.lower().isin(["", "nan", "none", "null"])].copy()
 
-    # Agrupar
     g = dfp.groupby(col_doc, dropna=True).agg(
         NO_COMP=(col_nc, "sum"),
         TOTAL=(col_total, "sum"),
@@ -686,8 +760,6 @@ def top_docentes_porcentaje_no_competencia(
         return [], semana_usada, "No fue posible calcular % (TOTAL ALUMNOS en 0 o vacío)."
 
     g["PCT"] = (g["NO_COMP"] / g["TOTAL"]) * 100.0
-
-    # Orden por mayor %, desempate por NO_COMP, TOTAL, y nombre
     g[col_doc] = g[col_doc].astype(str).str.strip()
     g = g.sort_values(by=["PCT", "NO_COMP", "TOTAL", col_doc], ascending=[False, False, False, True])
 
@@ -716,7 +788,7 @@ def exportar_excel(df, filename="seguimiento_filtrado.xlsx"):
     return output
 
 
-def exportar_html_imprimible(df: pd.DataFrame, titulo: str, subtitulo: str = "", filename: str = "no_competentes.html") -> BytesIO:
+def exportar_html_imprimible(df, titulo, subtitulo="", filename="no_competentes.html"):
     ahora = datetime.now().strftime("%Y-%m-%d %H:%M")
     css = """
     <style>
@@ -763,18 +835,9 @@ def exportar_html_imprimible(df: pd.DataFrame, titulo: str, subtitulo: str = "",
 # =========================
 # Email (SMTP)
 # =========================
-@st.cache_data
+@st.cache_data(show_spinner=False)
 def cargar_emails_planteles():
-    """
-    Lee 'assets/Datos1.xlsx' hoja 'Planteles' y regresa un dict:
-    {
-      'Nombre Plantel': {
-          'to': ['correo@..', ...],     # columna Email
-          'cc': ['copia@..', ...],      # columna Ccp (opcional)
-      }
-    }
-    """
-    df = pd.read_excel("assets/Datos1.xlsx", sheet_name="Planteles")
+    df = cargar_planteles_sheet()
 
     def _find_col(obj):
         for c in df.columns:
@@ -784,7 +847,7 @@ def cargar_emails_planteles():
 
     col_plantel = _find_col("Plantel")
     col_email = _find_col("Email")
-    col_ccp = _find_col("Ccp")  # <- NUEVO: CC
+    col_ccp = _find_col("Ccp")
 
     if col_plantel is None or col_email is None:
         raise KeyError("La hoja 'Planteles' debe contener las columnas 'Plantel' y 'Email'.")
@@ -797,12 +860,10 @@ def cargar_emails_planteles():
         if not plantel or plantel.lower() in ("nan", "none"):
             continue
 
-        # TO
         to_list = []
         if email_raw and email_raw.lower() not in ("nan", "none"):
             to_list = [e.strip() for e in re.split(r"[;,]+", email_raw) if e.strip()]
 
-        # CC (Ccp)
         cc_list = []
         if col_ccp is not None:
             ccp_raw = str(row.get(col_ccp, "")).strip()
@@ -841,10 +902,6 @@ def _smtp_config():
 
 
 def enviar_correo(destinatarios, asunto, cuerpo, cc=None):
-    """
-    destinatarios: lista TO
-    cc: lista CC (Ccp)
-    """
     host, port, user, password, from_email, use_tls = _smtp_config()
     cc = cc or []
 
@@ -868,7 +925,7 @@ def enviar_correo(destinatarios, asunto, cuerpo, cc=None):
         server.send_message(msg)
 
 
-def contar_sin_calificaciones(df_reprobacion: pd.DataFrame, plantel: str) -> int:
+def contar_sin_calificaciones(df_reprobacion, plantel):
     df_p = df_reprobacion[df_reprobacion["Plantel"] == plantel].copy()
     df_p = asegurar_metricas(df_p)
     if "pEspecifico" not in df_p.columns:
@@ -881,13 +938,7 @@ def contar_sin_calificaciones(df_reprobacion: pd.DataFrame, plantel: str) -> int
     return int(len(df_sin))
 
 
-def _formatear_top_por_semestre(top_dict: dict[int, list[tuple[str, float]]], semana_usada):
-    """
-    Devuelve string con:
-      Semestre 1: 1) ... 2) ... 3) ...
-      Semestre 3: ...
-      Semestre 5: ...
-    """
+def _formatear_top_por_semestre(top_dict, semana_usada):
     orden = [1, 3, 5]
     lines = []
     lines.append("Módulos con MAYOR % de NO COMPETENCIA por semestre (plantel):")
@@ -907,12 +958,7 @@ def _formatear_top_por_semestre(top_dict: dict[int, list[tuple[str, float]]], se
     return "\n".join(lines)
 
 
-def _formatear_top_docentes(top_list: list[tuple[str, float]], semana_usada):
-    """
-    Devuelve string con:
-      1) Docente (xx.xx%)
-      ...
-    """
+def _formatear_top_docentes(top_list, semana_usada):
     lines = []
     lines.append("Docentes con MAYOR % de NO COMPETENCIA (plantel):")
 
@@ -928,19 +974,17 @@ def _formatear_top_docentes(top_list: list[tuple[str, float]], semana_usada):
     return "\n".join(lines)
 
 
-
 def texto_correo_plantel(
-    plantel: str,
-    total_no_comp: int,
-    total_sin_calif: int,
-    top_por_semestre: dict[int, list[tuple[str, float]]] | None,
+    plantel,
+    total_no_comp,
+    total_sin_calif,
+    top_por_semestre,
     semana_modulos,
-    mod_err: str | None,
-    top_docentes: list[tuple[str, float]] | None,
+    mod_err,
+    top_docentes,
     semana_docentes,
-    doc_err: str | None
-) -> str:
-    # --- Bloque módulos ---
+    doc_err
+):
     if top_por_semestre and any(len(v) > 0 for v in top_por_semestre.values()):
         extra_mod = "\n" + _formatear_top_por_semestre(top_por_semestre, semana_modulos) + "\n"
     else:
@@ -949,7 +993,6 @@ def texto_correo_plantel(
             f"No se pudo determinar con certeza. Motivo: {mod_err}\n"
         )
 
-    # --- Bloque docentes ---
     if top_docentes and len(top_docentes) > 0:
         extra_doc = "\n" + _formatear_top_docentes(top_docentes, semana_docentes) + "\n"
     else:
@@ -978,14 +1021,7 @@ def texto_correo_plantel(
     )
 
 
-def construir_borradores_envio(
-    plantel_sel: str,
-    planteles_disponibles: list,
-    tabla: pd.DataFrame,
-    df_reprobacion: pd.DataFrame,
-    df_datos: pd.DataFrame,
-    emails_map: dict
-):
+def construir_borradores_envio(plantel_sel, planteles_disponibles, tabla, df_reprobacion, df_datos, emails_map):
     objetivos = planteles_disponibles if plantel_sel == "Todos" else [plantel_sel]
 
     borradores = []
@@ -1004,10 +1040,7 @@ def construir_borradores_envio(
         total_no_comp = int(fila_p["Total estudiantes no competentes"].iloc[0]) if (not fila_p.empty and "Total estudiantes no competentes" in fila_p.columns) else 0
         total_sin_calif = contar_sin_calificaciones(df_reprobacion, p)
 
-        # ✅ NUEVO: Top 3 por semestre (1,3,5)
         top_por_semestre, semana_usada, mod_err = top_modulos_porcentaje_no_competencia_por_semestre(df_datos, p)
-
-        # ✅ NUEVO: Top 5 docentes con mayor % de NO competencia
         top_docentes, semana_docentes, doc_err = top_docentes_porcentaje_no_competencia(df_datos, p, top_n=5)
 
         asunto = f"Indicadores académicos - {p}"
@@ -1034,7 +1067,7 @@ def construir_borradores_envio(
     return borradores, sin_email
 
 
-def enviar_borradores(borradores: list):
+def enviar_borradores(borradores):
     enviados = []
     fallidos = []
     for b in borradores:
@@ -1047,54 +1080,56 @@ def enviar_borradores(borradores: list):
 
 
 # =========================
-# Vista principal
+# Exportaciones cacheadas
+# =========================
+@st.cache_data(show_spinner=False)
+def generar_excel_no_competentes(plantel_sel):
+    df = obtener_detalle_no_competentes(plantel_sel)
+    return exportar_excel(df).getvalue()
+
+
+@st.cache_data(show_spinner=False)
+def generar_html_no_competentes(plantel_sel):
+    df = obtener_detalle_no_competentes(plantel_sel)
+    return exportar_html_imprimible(
+        df,
+        titulo="Estudiantes NO competentes",
+        subtitulo=f"Plantel: {plantel_sel}",
+    ).getvalue()
+
+
+@st.cache_data(show_spinner=False)
+def generar_excel_sin_registro(plantel_sel):
+    df = obtener_sin_registro_calificaciones(plantel_sel)
+    return exportar_excel(df).getvalue()
+
+
+@st.cache_data(show_spinner=False)
+def generar_excel_tabla_agrupada():
+    tabla_con_total = agregar_fila_total(cargar_resumen())
+    return exportar_excel(tabla_con_total, filename="agrupados_no_competentes.xlsx").getvalue()
+
+
+@st.cache_data(show_spinner=False)
+def generar_html_tabla_agrupada():
+    tabla_con_total = agregar_fila_total(cargar_resumen())
+    return exportar_html_imprimible(
+        tabla_con_total,
+        titulo="Estudiantes agrupados por módulos NO competentes",
+        subtitulo="(Vista agrupada con TOTAL)",
+        filename="agrupados_no_competentes.html",
+    ).getvalue()
+
+
+# =========================
+# Función principal
 # =========================
 def mostrar_indicadores_academicos():
     st.title("📊 Indicadores Académicos")
 
-    df_reprobacion, df_matricula, df_datos = cargar_datos()
+    tabla = cargar_resumen()
+    df_matricula = cargar_matricula()
 
-    # --- Agregación para tabla/gráfica ---
-    df_modulos = (
-        df_reprobacion
-        .groupby(["Plantel", "matricula"])
-        .size()
-        .reset_index(name="modulos_nc")
-    )
-    df_modulos["categoria"] = df_modulos["modulos_nc"].apply(lambda x: str(x) if x <= 10 else "11 o más")
-
-    resumen = df_modulos.groupby(["Plantel", "categoria"]).size().reset_index(name="total_estudiantes")
-    tabla = (
-        resumen.pivot(index="Plantel", columns="categoria", values="total_estudiantes")
-        .fillna(0)
-        .astype(int)
-    )
-
-    tabla["Total estudiantes no competentes"] = tabla.sum(axis=1)
-    tabla = tabla.merge(df_matricula, on="Plantel", how="left")
-
-    tabla["matriculaTotal"] = pd.to_numeric(tabla["matriculaTotal"], errors="coerce").fillna(0)
-    tabla["% Estudiantes no competentes"] = (tabla["Total estudiantes no competentes"] / tabla["matriculaTotal"]) * 100
-    tabla["% Estudiantes no competentes"] = (
-        tabla["% Estudiantes no competentes"]
-        .replace([float("inf"), -float("inf")], 0)
-        .fillna(0)
-        .round(2)
-    )
-
-    orden_columnas = (
-        ["Plantel", "matriculaTotal"] +
-        [str(i) for i in range(1, 11) if str(i) in tabla.columns] +
-        (["11 o más"] if "11 o más" in tabla.columns else []) +
-        ["Total estudiantes no competentes", "% Estudiantes no competentes"]
-    )
-    tabla = tabla.reset_index()
-    columnas_presentes = [col for col in orden_columnas if col in tabla.columns]
-    tabla = tabla[columnas_presentes]
-
-    # =========================
-    # Rol / permisos
-    # =========================
     is_admin = bool(st.session_state.get("administrador", False))
     plantel_usuario = st.session_state.get("plantel_usuario") or st.session_state.get("plantel")
     es_plantel = bool(plantel_usuario) and not is_admin
@@ -1102,166 +1137,153 @@ def mostrar_indicadores_academicos():
     permisos_codes = obtener_permisos_usuario_codigos()
     puede_enviar_email = (not es_plantel) and (PERM_SEND_EMAIL_CODE in permisos_codes)
 
-    # =========================
-    # USUARIO GLOBAL (Admin u otros)
-    # =========================
     if not es_plantel:
-
-        vista = st.radio(
-            "Visualización de la gráfica:",
-            ["% NO competencia", "Total NO competentes"],
-            horizontal=True
-        )
-
-        # ✅ Orden: por % cuando se visualiza "% NO competencia"; por TOTAL cuando se visualiza "Total NO competentes"
-        sort_col = "Total estudiantes no competentes" if vista == "Total NO competentes" else "% Estudiantes no competentes"
-        tabla_ordenada = tabla.sort_values(by=sort_col, ascending=False).copy()
-
-        tabla_ordenada["etiqueta"] = tabla_ordenada.apply(
-            lambda r: f"{int(r['Total estudiantes no competentes'])} - {float(r['% Estudiantes no competentes']):.1f}%",
-            axis=1
-        )
-
-        if vista == "% NO competencia":
-            y_col = "% Estudiantes no competentes"
-            titulo = "Porcentaje de estudiantes NO competentes por plantel"
-            y_title = "% de estudiantes NO competentes"
-        else:
-            y_col = "Total estudiantes no competentes"
-            titulo = "Total de estudiantes NO competentes por plantel"
-            y_title = "Total de estudiantes NO competentes"
-
-        ymax = float(tabla_ordenada[y_col].max()) if not tabla_ordenada.empty else 0
-
-        fig = go.Figure(
-            data=[
-                go.Bar(
-                    x=tabla_ordenada["Plantel"],
-                    y=tabla_ordenada[y_col],
-                    text=tabla_ordenada["etiqueta"],
-                    textposition="outside",
-                    textangle=-90,
-                    marker_color="#FFC107",
-                    cliponaxis=False,
-                    outsidetextfont=dict(size=LABEL_FONT_SIZE_ADMIN),
-                    hoverinfo="skip",
-                    hovertemplate="",
-                )
-            ]
-        )
-
-        fig.update_layout(
-            title=titulo,
-            xaxis_title="Plantel",
-            yaxis_title=y_title,
-            xaxis_tickangle=-45,
-            height=560,
-            showlegend=False,
-            uniformtext=dict(minsize=LABEL_FONT_SIZE_ADMIN, mode="show"),
-            yaxis=dict(range=[0, ymax * Y_AXIS_PADDING_MULT if ymax else 1]),
-            margin=dict(t=90),
-        )
-
-        st.plotly_chart(fig, use_container_width=True)
-
-        st.subheader("📋 Estudiantes agrupados por módulos NO competentes")
-        tabla_con_total = agregar_fila_total(tabla)
-        st.dataframe(tabla_con_total, use_container_width=True)
-
-        col_imp_xlsx, col_imp_html = st.columns(2)
-        with col_imp_xlsx:
-            archivo_xlsx_agrupada = exportar_excel(tabla_con_total, filename="agrupados_no_competentes.xlsx")
-            st.download_button(
-                label="📤 Descargar Excel (tabla agrupada)",
-                data=archivo_xlsx_agrupada,
-                file_name="agrupados_no_competentes.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True
-            )
-        with col_imp_html:
-            archivo_html_agrupada = exportar_html_imprimible(
-                tabla_con_total,
-                titulo="Estudiantes agrupados por módulos NO competentes",
-                subtitulo="(Vista agrupada con TOTAL)",
-                filename="agrupados_no_competentes.html"
-            )
-            st.download_button(
-                label="🖨️ Descargar HTML (tabla agrupada)",
-                data=archivo_html_agrupada,
-                file_name="agrupados_no_competentes.html",
-                mime="text/html",
-                use_container_width=True
-            )
-
-        total_general = int(tabla["Total estudiantes no competentes"].sum())
-        total_matricula = float(tabla["matriculaTotal"].sum())
-        porcentaje_promedio = round((total_general / total_matricula) * 100, 2) if total_matricula else 0
-        st.markdown(f"### 👥 Total general de estudiantes NO competentes: **{total_general:,}**")
-        st.markdown(f"### 📊 Porcentaje respecto a la matrícula: **{porcentaje_promedio}%**")
-
-        st.markdown("---")
-        st.subheader("🖨️ Imprimir / exportar NO competentes por plantel")
-
-        planteles_disponibles = sorted(df_reprobacion["Plantel"].dropna().unique().tolist())
+        df_reprobacion = None
+        planteles_disponibles = sorted(tabla["Plantel"].dropna().astype(str).unique().tolist())
         opciones_plantel = ["Todos"] + planteles_disponibles
-        plantel_sel = st.selectbox("Selecciona un plantel", opciones_plantel)
 
-        columnas_base = ["ESTUDIANTE", "matricula", "CARRERA", "MODULO", "DOCENTE", "grado", "cvegrupo"]
+        if "indicadores_admin_filtros_aplicados" not in st.session_state:
+            st.session_state.indicadores_admin_filtros_aplicados = False
+
+        with st.form("filtros_indicadores_admin"):
+            vista = st.radio(
+                "Visualización de la gráfica:",
+                ["% NO competencia", "Total NO competentes"],
+                horizontal=True
+            )
+            plantel_sel = st.selectbox("Selecciona un plantel", opciones_plantel)
+            filtros_aplicados = st.form_submit_button("Aplicar filtros")
+
+        if filtros_aplicados:
+            st.session_state.indicadores_admin_filtros_aplicados = True
 
         if plantel_sel == "Todos":
-            df_print = df_reprobacion.copy()
+            tabla_vista = tabla.copy()
         else:
-            df_print = df_reprobacion[df_reprobacion["Plantel"] == plantel_sel].copy()
+            tabla_vista = tabla[tabla["Plantel"] == plantel_sel].copy()
 
-        df_print = asegurar_metricas(df_print)
-
-        cols_presentes_base = [c for c in columnas_base if c in df_print.columns]
-        orden_final = (["Plantel"] if "Plantel" in df_print.columns else []) + cols_presentes_base + METRICAS_ORDEN
-        df_print = df_print[orden_final]
-
-        fila_sel = tabla[tabla["Plantel"] == plantel_sel]
-        if not fila_sel.empty and "Total estudiantes no competentes" in fila_sel.columns:
-            total_nc_admin = int(fila_sel["Total estudiantes no competentes"].iloc[0])
+        if tabla_vista.empty:
+            st.warning("No hay información disponible para los filtros seleccionados.")
         else:
-            total_nc_admin = df_print["matricula"].nunique() if "matricula" in df_print.columns else len(df_print)
-
-        if df_print.empty:
-            st.info(f"ℹ️ No hay registros de NO competentes para **{plantel_sel}**.")
-        else:
-            st.markdown(f"### ⚠️ Estudiantes NO competentes {total_nc_admin} (Detalle) — {plantel_sel}")
-            st.dataframe(df_print, use_container_width=True, height=360)
-
-            col1, col2 = st.columns(2)
-            with col1:
-                archivo_xlsx = exportar_excel(df_print, filename=f"no_competentes_{plantel_sel}.xlsx")
-                st.download_button(
-                    label="📤 Descargar Excel",
-                    data=archivo_xlsx,
-                    file_name=f"no_competentes_{plantel_sel}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True
-                )
-            with col2:
-                archivo_html = exportar_html_imprimible(
-                    df_print,
-                    titulo="Estudiantes NO competentes",
-                    subtitulo=f"Plantel: {plantel_sel}",
-                    filename=f"no_competentes_{plantel_sel}.html"
-                )
-                st.download_button(
-                    label="🖨️ Descargar HTML",
-                    data=archivo_html,
-                    file_name=f"no_competentes_{plantel_sel}.html",
-                    mime="text/html",
-                    use_container_width=True
-                )
-
-            df_sin_registro = (
-                df_print[df_print["pEspecifico"] == 0].copy()
-                if "pEspecifico" in df_print.columns
-                else pd.DataFrame()
+            sort_col = (
+                "Total estudiantes no competentes"
+                if vista == "Total NO competentes"
+                else "% Estudiantes no competentes"
+            )
+            tabla_ordenada = tabla_vista.sort_values(by=sort_col, ascending=False).copy()
+            tabla_ordenada["etiqueta"] = tabla_ordenada.apply(
+                lambda r: f"{int(r['Total estudiantes no competentes'])} - {float(r['% Estudiantes no competentes']):.1f}%",
+                axis=1
             )
 
+            if vista == "% NO competencia":
+                y_col = "% Estudiantes no competentes"
+                titulo = "Porcentaje de estudiantes NO competentes por plantel"
+                y_title = "% de estudiantes NO competentes"
+            else:
+                y_col = "Total estudiantes no competentes"
+                titulo = "Total de estudiantes NO competentes por plantel"
+                y_title = "Total de estudiantes NO competentes"
+
+            ymax = float(tabla_ordenada[y_col].max()) if not tabla_ordenada.empty else 0
+
+            fig = go.Figure(
+                data=[
+                    go.Bar(
+                        x=tabla_ordenada["Plantel"],
+                        y=tabla_ordenada[y_col],
+                        text=tabla_ordenada["etiqueta"],
+                        textposition="outside",
+                        textangle=-90,
+                        marker_color="#FFC107",
+                        cliponaxis=False,
+                        outsidetextfont=dict(size=LABEL_FONT_SIZE_ADMIN),
+                        hoverinfo="skip",
+                        hovertemplate="",
+                    )
+                ]
+            )
+
+            fig.update_layout(
+                title=titulo,
+                xaxis_title="Plantel",
+                yaxis_title=y_title,
+                xaxis_tickangle=-45,
+                height=560,
+                showlegend=False,
+                uniformtext=dict(minsize=LABEL_FONT_SIZE_ADMIN, mode="show"),
+                yaxis=dict(range=[0, ymax * Y_AXIS_PADDING_MULT if ymax else 1]),
+                margin=dict(t=90),
+            )
+
+            st.plotly_chart(fig, use_container_width=True)
+
+            st.subheader("📋 Estudiantes agrupados por módulos NO competentes")
+            tabla_con_total = agregar_fila_total(tabla_vista)
+            st.dataframe(tabla_con_total, use_container_width=True)
+
+            total_general = int(tabla_vista["Total estudiantes no competentes"].sum())
+            total_matricula = float(tabla_vista["matriculaTotal"].sum())
+            porcentaje_promedio = round((total_general / total_matricula) * 100, 2) if total_matricula else 0
+            st.markdown(f"### 👥 Total general de estudiantes NO competentes: **{total_general:,}**")
+            st.markdown(f"### 📊 Porcentaje respecto a la matrícula: **{porcentaje_promedio}%**")
+
+        st.markdown("---")
+
+        if plantel_sel == "Todos":
+            if not st.session_state.get("indicadores_admin_filtros_aplicados", False):
+                st.markdown("### ⚠️ Estudiantes NO competentes (Detalle) — Todos")
+                st.info("Presiona **Aplicar filtros** para cargar el detalle general de todos los planteles.")
+            else:
+                with st.spinner("Cargando detalle general de estudiantes NO competentes..."):
+                    df_print = obtener_detalle_no_competentes("Todos")
+
+                total_nc_admin = (
+                    df_print["matricula"].nunique()
+                    if not df_print.empty and "matricula" in df_print.columns
+                    else len(df_print)
+                )
+
+                st.markdown(f"### ⚠️ Estudiantes NO competentes {total_nc_admin} (Detalle) — Todos")
+                if df_print.empty:
+                    st.info("ℹ️ No hay registros de NO competentes para **Todos**.")
+                else:
+                    mostrar_dataframe_preview(df_print)
+
+            if not st.session_state.get("indicadores_admin_filtros_aplicados", False):
+                st.markdown("### 🚨 Estudiantes sin registro de Calificaciones (Detalle) — Todos")
+                st.info("Presiona **Aplicar filtros** para cargar el detalle general de estudiantes sin registro.")
+            else:
+                with st.spinner("Cargando estudiantes sin registro de calificaciones..."):
+                    df_sin_registro = obtener_sin_registro_calificaciones("Todos")
+
+                total_sin_registro = (
+                    df_sin_registro["matricula"].nunique()
+                    if not df_sin_registro.empty and "matricula" in df_sin_registro.columns
+                    else len(df_sin_registro)
+                )
+
+                st.markdown(f"### 🚨 Estudiantes sin registro de Calificaciones {total_sin_registro} (Detalle) — Todos")
+                if df_sin_registro.empty:
+                    st.info("ℹ️ No hay registros con pEspecifico = 0 para **Todos**.")
+                else:
+                    mostrar_dataframe_preview(df_sin_registro)
+        else:
+            df_print = obtener_detalle_no_competentes(plantel_sel)
+
+            fila_sel = tabla[tabla["Plantel"] == plantel_sel]
+            if not fila_sel.empty and "Total estudiantes no competentes" in fila_sel.columns:
+                total_nc_admin = int(fila_sel["Total estudiantes no competentes"].iloc[0])
+            else:
+                total_nc_admin = df_print["matricula"].nunique() if "matricula" in df_print.columns else len(df_print)
+
+            st.markdown(f"### ⚠️ Estudiantes NO competentes {total_nc_admin} (Detalle) — {plantel_sel}")
+            if df_print.empty:
+                st.info(f"ℹ️ No hay registros de NO competentes para **{plantel_sel}**.")
+            else:
+                mostrar_dataframe_preview(df_print)
+
+            df_sin_registro = obtener_sin_registro_calificaciones(plantel_sel)
             if df_sin_registro.empty:
                 total_sin_registro = 0
             else:
@@ -1272,37 +1294,18 @@ def mostrar_indicadores_academicos():
                 )
 
             st.markdown(f"### 🚨 Estudiantes sin registro de Calificaciones {total_sin_registro} (Detalle) — {plantel_sel}")
-
             if df_sin_registro.empty:
                 st.info(f"ℹ️ No hay registros con pEspecifico = 0 para **{plantel_sel}**.")
             else:
-                st.dataframe(df_sin_registro, use_container_width=True, height=360)
+                mostrar_dataframe_preview(df_sin_registro)
 
-                archivo_sin_registro = exportar_excel(
-                    df_sin_registro,
-                    filename=f"sin_registro_calificaciones_{plantel_sel}.xlsx"
-                )
-                st.download_button(
-                    label="📤 Sin registro de Calificaciones",
-                    data=archivo_sin_registro,
-                    file_name=f"sin_registro_calificaciones_{plantel_sel}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True
-                )
-
-        # =========================
-        # Envío de correo (requiere permiso 10: SEND_EMAIL_INDICADORES)
-        # =========================
         if puede_enviar_email:
-            # =========================
-            # Confirmación tipo ALERTA antes de enviar
-            # =========================
             if "confirm_send_open" not in st.session_state:
                 st.session_state.confirm_send_open = False
             if "email_send_result" not in st.session_state:
                 st.session_state.email_send_result = None
 
-            if st.button("📧 Enviar correo", key="btn_enviar_correo_indicadores"):
+            if st.button("📧 Enviar correo", key="btn_enviar_correo_indicadores_v2"):
                 st.session_state.confirm_send_open = True
 
             if st.session_state.email_send_result:
@@ -1321,11 +1324,18 @@ def mostrar_indicadores_academicos():
                     st.error(f"No se pudo leer la hoja 'Planteles' (columna Email/Ccp): {e}")
                     return
 
+                if df_reprobacion is None:
+                    df_reprobacion_local = cargar_reprobacion()
+                else:
+                    df_reprobacion_local = df_reprobacion
+
+                df_datos = cargar_datos_sheet()
+
                 borradores, sin_email = construir_borradores_envio(
                     plantel_sel=plantel_sel,
                     planteles_disponibles=planteles_disponibles,
                     tabla=tabla,
-                    df_reprobacion=df_reprobacion,
+                    df_reprobacion=df_reprobacion_local,
                     df_datos=df_datos,
                     emails_map=emails_map
                 )
@@ -1363,7 +1373,7 @@ def mostrar_indicadores_academicos():
 
                 col_ok, col_cancel = st.columns(2)
                 with col_ok:
-                    if st.button("✅ De acuerdo", key="btn_confirmar_envio"):
+                    if st.button("✅ De acuerdo", key="btn_confirmar_envio_v2"):
                         if not borradores:
                             st.session_state.email_send_result = {"enviados": [], "fallidos": [], "sin_email": sin_email}
                             st.session_state.confirm_send_open = False
@@ -1377,7 +1387,7 @@ def mostrar_indicadores_academicos():
                         st.rerun()
 
                 with col_cancel:
-                    if st.button("❌ Cancelar", key="btn_cancelar_envio"):
+                    if st.button("❌ Cancelar", key="btn_cancelar_envio_v2"):
                         st.session_state.confirm_send_open = False
                         st.rerun()
 
@@ -1391,42 +1401,14 @@ def mostrar_indicadores_academicos():
                     with st.container():
                         _confirm_ui()
         else:
-            st.info("ℹ️ Tu usuario no tiene permiso para enviar correos desde este módulo (permiso 10: SEND_EMAIL_INDICADORES).")
+            st.info("ℹ️ Tu usuario no tiene permiso para enviar correos desde este módulo.")
 
-
-    # =========================
-    # PLANTEL (no administrador)
-    # =========================
     else:
         if not plantel_usuario:
             st.error("No se detectó el plantel del usuario en la sesión (plantel_usuario).")
             return
 
-
-        df_seguimiento = pd.read_excel("assets/Datos1.xlsx", sheet_name="Seguimiento")
-        df_plantel = df_seguimiento[df_seguimiento["Plantel"] == plantel_usuario]
-
-        columnas_cantidad = [col for col in df_plantel.columns if col.startswith("Sem ") and not col.endswith("%")]
-        columnas_porcentaje = [
-            col for col in df_plantel.columns
-            if col.endswith("%") and col.replace(" %", "") in columnas_cantidad
-        ]
-
-        df_valores = df_plantel[columnas_cantidad].sum().reset_index()
-        df_valores.columns = ["Semana", "Cantidad"]
-        df_valores["Semana"] = df_valores["Semana"].str.strip()
-
-        df_porcentajes = df_plantel[columnas_porcentaje].mean().reset_index()
-        df_porcentajes.columns = ["Semana", "Porcentaje"]
-        df_porcentajes["Semana"] = df_porcentajes["Semana"].str.replace(" %", "").str.strip()
-
-        df_semana = pd.merge(df_valores, df_porcentajes, on="Semana", how="inner")
-        df_semana["Porcentaje"] = pd.to_numeric(df_semana["Porcentaje"], errors="coerce").fillna(0).round(2)
-
-        df_semana["Etiqueta"] = df_semana.apply(
-            lambda r: f"{int(r['Cantidad'])} - {float(r['Porcentaje']):.1f}%",
-            axis=1
-        )
+        df_semana = obtener_seguimiento_plantel(plantel_usuario)
 
         st.subheader(f"📈 Seguimiento semanal – {plantel_usuario}")
 
@@ -1469,56 +1451,38 @@ def mostrar_indicadores_academicos():
         matricula_plantel = int(vals[0]) if len(vals) else 0
         st.markdown(f"### 🎓 Matrícula total del plantel {plantel_usuario}: **{matricula_plantel:,}**")
 
-        columnas_base = ["ESTUDIANTE", "matricula", "CARRERA", "MODULO", "DOCENTE", "grado", "cvegrupo"]
-        df_exportar = df_reprobacion[df_reprobacion["Plantel"] == plantel_usuario].copy()
-        df_exportar = asegurar_metricas(df_exportar)
-
-        cols_presentes_base = [c for c in columnas_base if c in df_exportar.columns]
-        base_cols = (["Plantel"] if "Plantel" in df_exportar.columns else []) + cols_presentes_base
-        orden_final = base_cols + METRICAS_ORDEN
-        df_exportar = df_exportar[orden_final]
+        df_exportar = obtener_detalle_no_competentes(plantel_usuario)
 
         if not tabla_filtrada.empty and "Total estudiantes no competentes" in tabla_filtrada.columns:
             total_nc = int(tabla_filtrada["Total estudiantes no competentes"].iloc[0])
         else:
-            total_nc = df_reprobacion[df_reprobacion["Plantel"] == plantel_usuario]["matricula"].nunique()
+            total_nc = df_exportar["matricula"].nunique() if "matricula" in df_exportar.columns else len(df_exportar)
 
         st.subheader(f"⚠️ Estudiantes NO competentes {total_nc} (Detalle)")
         if df_exportar.empty:
             st.info("ℹ️ No hay registros de NO competentes para este plantel.")
         else:
-            st.dataframe(df_exportar, use_container_width=True, height=360)
+            mostrar_dataframe_preview(df_exportar)
 
             col_a, col_b = st.columns(2)
             with col_a:
-                archivo = exportar_excel(df_exportar, filename=f"estudiantes_{plantel_usuario}.xlsx")
                 st.download_button(
                     label="📤 Exportar estudiantes a Excel",
-                    data=archivo,
-                    file_name=f"estudiantes_{plantel_usuario}.xlsx",
+                    data=generar_excel_no_competentes(plantel_usuario),
+                    file_name=f"estudiantes_{slug(plantel_usuario)}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True
                 )
             with col_b:
-                archivo_html = exportar_html_imprimible(
-                    df_exportar,
-                    titulo="Estudiantes NO competentes",
-                    subtitulo=f"Plantel: {plantel_usuario}",
-                    filename=f"no_competentes_{plantel_usuario}.html"
-                )
                 st.download_button(
                     label="🖨️ Descargar HTML para imprimir",
-                    data=archivo_html,
-                    file_name=f"no_competentes_{plantel_usuario}.html",
+                    data=generar_html_no_competentes(plantel_usuario),
+                    file_name=f"no_competentes_{slug(plantel_usuario)}.html",
                     mime="text/html",
                     use_container_width=True
                 )
 
-        df_sin_registro_plantel = (
-            df_exportar[df_exportar["pEspecifico"] == 0].copy()
-            if "pEspecifico" in df_exportar.columns
-            else pd.DataFrame()
-        )
+        df_sin_registro_plantel = obtener_sin_registro_calificaciones(plantel_usuario)
 
         if df_sin_registro_plantel.empty:
             total_sin_registro_plantel = 0
@@ -1534,16 +1498,12 @@ def mostrar_indicadores_academicos():
         if df_sin_registro_plantel.empty:
             st.info("ℹ️ No hay registros con pEspecifico = 0 para este plantel.")
         else:
-            st.dataframe(df_sin_registro_plantel, use_container_width=True, height=360)
+            mostrar_dataframe_preview(df_sin_registro_plantel)
 
-            archivo_sin_registro_plantel = exportar_excel(
-                df_sin_registro_plantel,
-                filename=f"sin_registro_calificaciones_{plantel_usuario}.xlsx"
-            )
             st.download_button(
                 label="📤 Sin registro de Calificaciones",
-                data=archivo_sin_registro_plantel,
-                file_name=f"sin_registro_calificaciones_{plantel_usuario}.xlsx",
+                data=generar_excel_sin_registro(plantel_usuario),
+                file_name=f"sin_registro_calificaciones_{slug(plantel_usuario)}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True
             )
