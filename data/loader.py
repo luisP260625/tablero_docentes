@@ -15,7 +15,7 @@ def cargar_datos():
         df = pl.from_pandas(df_pandas).sort(["Semana", "Plantel", "DOCENTE"])
         return df, None
     except Exception as e:
-        return None, str(e)
+        return None, str(e) 
 
 
 @st.cache_data(ttl=600)  # cache por 10 minutos
@@ -36,6 +36,7 @@ def cargar_semcaptura():
             "GRUPO",
             "UAPRENDIZAJE",
             "RAPRENDIZAJE",
+            "IEVALUAR",
             "IEVALUADOS",
             "PCAPTURA",
             "TOTALE",
