@@ -103,11 +103,11 @@ def _sem_key(v):
     s_norm = _norm_txt(v)
 
     if "prim" in s_norm:
-        return 1
+        return 2
     if "terc" in s_norm:
-        return 3
+        return 4
     if "quint" in s_norm:
-        return 5
+        return 6
 
     nums = re.findall(r"\d+", str(v))
     return int(nums[0]) if nums else None
@@ -634,7 +634,7 @@ def modulo_mayor_porcentaje_no_competencia(df_datos, plantel):
     return modulo, round(pct, 2), semana_usada, None
 
 
-def top_modulos_porcentaje_no_competencia_por_semestre(df_datos, plantel, semestres=(1, 3, 5), top_n=3):
+def top_modulos_porcentaje_no_competencia_por_semestre(df_datos, plantel, semestres=(2, 4, 6), top_n=3):
     if df_datos is None or getattr(df_datos, "empty", True):
         return {}, None, "No se pudo leer la hoja 'Datos' (o está vacía)."
 
@@ -939,7 +939,7 @@ def contar_sin_calificaciones(df_reprobacion, plantel):
 
 
 def _formatear_top_por_semestre(top_dict, semana_usada):
-    orden = [1, 3, 5]
+    orden = [2, 4, 6]
     lines = []
     lines.append("Módulos con MAYOR % de NO COMPETENCIA por semestre (plantel):")
 
@@ -1408,18 +1408,26 @@ def mostrar_indicadores_academicos():
             st.error("No se detectó el plantel del usuario en la sesión (plantel_usuario).")
             return
 
-        df_semana = obtener_seguimiento_plantel(plantel_usuario)
+        tabla_filtrada = tabla[tabla["Plantel"] == plantel_usuario].copy()
 
-        st.subheader(f"📈 Seguimiento semanal – {plantel_usuario}")
+        if tabla_filtrada.empty:
+            st.warning(f"No hay información disponible para el plantel {plantel_usuario}.")
+            return
 
-        ymax = float(df_semana["Cantidad"].max()) if not df_semana.empty else 0
+        tabla_filtrada["etiqueta"] = tabla_filtrada.apply(
+            lambda r: f"{int(r['Total estudiantes no competentes'])} - {float(r['% Estudiantes no competentes']):.1f}%",
+            axis=1
+        )
+
+        y_col = "% Estudiantes no competentes"
+        ymax = float(tabla_filtrada[y_col].max()) if not tabla_filtrada.empty else 0
 
         fig = go.Figure(
             data=[
                 go.Bar(
-                    x=df_semana["Semana"],
-                    y=df_semana["Cantidad"],
-                    text=df_semana["Etiqueta"],
+                    x=tabla_filtrada["Plantel"],
+                    y=tabla_filtrada[y_col],
+                    text=tabla_filtrada["etiqueta"],
                     textposition="outside",
                     textangle=-90,
                     marker_color="#FFC107",
@@ -1432,8 +1440,9 @@ def mostrar_indicadores_academicos():
         )
 
         fig.update_layout(
-            xaxis_title="Semana",
-            yaxis_title="Cantidad de estudiantes",
+            title=f"Porcentaje de estudiantes NO competentes — {plantel_usuario}",
+            xaxis_title="Plantel",
+            yaxis_title="% de estudiantes NO competentes",
             height=520,
             showlegend=False,
             uniformtext=dict(minsize=LABEL_FONT_SIZE_PLANTEL, mode="show"),
@@ -1443,7 +1452,6 @@ def mostrar_indicadores_academicos():
 
         st.plotly_chart(fig, use_container_width=True)
 
-        tabla_filtrada = tabla[tabla["Plantel"] == plantel_usuario]
         st.subheader(f"📋 Estudiantes del plantel: {plantel_usuario}")
         st.dataframe(tabla_filtrada, use_container_width=True)
 
@@ -1451,12 +1459,17 @@ def mostrar_indicadores_academicos():
         matricula_plantel = int(vals[0]) if len(vals) else 0
         st.markdown(f"### 🎓 Matrícula total del plantel {plantel_usuario}: **{matricula_plantel:,}**")
 
-        df_exportar = obtener_detalle_no_competentes(plantel_usuario)
-
         if not tabla_filtrada.empty and "Total estudiantes no competentes" in tabla_filtrada.columns:
             total_nc = int(tabla_filtrada["Total estudiantes no competentes"].iloc[0])
         else:
-            total_nc = df_exportar["matricula"].nunique() if "matricula" in df_exportar.columns else len(df_exportar)
+            df_exportar_tmp = obtener_detalle_no_competentes(plantel_usuario)
+            total_nc = df_exportar_tmp["matricula"].nunique() if "matricula" in df_exportar_tmp.columns else len(df_exportar_tmp)
+
+        porcentaje_nc = float(tabla_filtrada["% Estudiantes no competentes"].iloc[0]) if "% Estudiantes no competentes" in tabla_filtrada.columns else 0.0
+        st.markdown(f"### 👥 Total de estudiantes NO competentes: **{total_nc:,}**")
+        st.markdown(f"### 📊 Porcentaje respecto a la matrícula: **{porcentaje_nc:.2f}%**")
+
+        df_exportar = obtener_detalle_no_competentes(plantel_usuario)
 
         st.subheader(f"⚠️ Estudiantes NO competentes {total_nc} (Detalle)")
         if df_exportar.empty:
