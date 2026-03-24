@@ -9,6 +9,7 @@ from email.message import EmailMessage
 
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
 
 
@@ -247,7 +248,22 @@ def cargar_resumen():
 
 @st.cache_data(show_spinner=False)
 def cargar_seguimiento():
-    return _read_fast_or_excel("seguimiento.parquet", "Seguimiento", usecols=None)
+    parquet_path = _cache_path("seguimiento.parquet")
+
+    if USE_FAST_CACHE and os.path.exists(parquet_path):
+        return pd.read_parquet(parquet_path)
+
+    last_error = None
+    for sheet_name in ("Seguimiento", "SEGUIMIENTO", "seguimiento"):
+        try:
+            return _read_excel(sheet_name, usecols=None)
+        except Exception as e:
+            last_error = e
+
+    if last_error:
+        raise last_error
+
+    return pd.DataFrame()
 
 
 @st.cache_data(show_spinner=False)
@@ -291,36 +307,306 @@ def obtener_sin_registro_calificaciones(plantel_sel):
     return df[df["pEspecifico"] == 0].copy()
 
 
+def _mapear_columnas_seguimiento(df):
+    mapping = {}
+    for col in df.columns:
+        col_str = str(col).strip()
+        col_norm = _norm_txt(col_str)
+
+        if "sem" not in col_norm:
+            continue
+
+        wk = _wk_key(col_str)
+        if wk is None:
+            continue
+
+        base = f"Sem {wk}"
+        is_pct = ("%" in col_str) or ("porcentaje" in col_norm) or ("pct" in col_norm)
+
+        if base not in mapping:
+            mapping[base] = {"cantidad": None, "porcentaje": None, "week_num": wk}
+
+        if is_pct:
+            mapping[base]["porcentaje"] = col
+        else:
+            mapping[base]["cantidad"] = col
+
+    return mapping
+
+
+def _detectar_columna_semana(df):
+    return _find_col_like(df, ["Semana", "Sem", "Semana Corte", "Week"])
+
+
+def filtrar_semana_mas_reciente_si_existe(df):
+    if df is None or getattr(df, "empty", True):
+        return df
+
+    col_semana = _detectar_columna_semana(df)
+    if not col_semana:
+        return df
+
+    tmp = df.copy()
+    tmp["__week_key__"] = tmp[col_semana].apply(_wk_key)
+
+    if tmp["__week_key__"].notna().any():
+        week_max = int(tmp["__week_key__"].dropna().max())
+        tmp = tmp[tmp["__week_key__"] == week_max].copy()
+
+    tmp.drop(columns=["__week_key__"], inplace=True, errors="ignore")
+    return tmp
+
+
+def obtener_etiqueta_semana_mas_reciente(df):
+    if df is None or getattr(df, "empty", True):
+        return None
+
+    col_semana = _detectar_columna_semana(df)
+    if not col_semana:
+        return None
+
+    tmp = df[[col_semana]].copy()
+    tmp["__week_key__"] = tmp[col_semana].apply(_wk_key)
+
+    if tmp["__week_key__"].notna().any():
+        week_max = int(tmp["__week_key__"].dropna().max())
+        match = tmp[tmp["__week_key__"] == week_max]
+        if not match.empty:
+            return str(match[col_semana].iloc[0]).strip()
+
+    return None
+
+
 @st.cache_data(show_spinner=False)
 def obtener_seguimiento_plantel(plantel_usuario):
     df_seguimiento = cargar_seguimiento()
-    df_plantel = df_seguimiento[df_seguimiento["Plantel"] == plantel_usuario].copy()
-
-    columnas_cantidad = [col for col in df_plantel.columns if str(col).startswith("Sem ") and not str(col).endswith("%")]
-    columnas_porcentaje = [
-        col for col in df_plantel.columns
-        if str(col).endswith("%") and str(col).replace(" %", "") in columnas_cantidad
-    ]
-
-    if not columnas_cantidad or not columnas_porcentaje:
+    if df_seguimiento is None or getattr(df_seguimiento, "empty", True):
         return pd.DataFrame(columns=["Semana", "Cantidad", "Porcentaje", "Etiqueta"])
 
-    df_valores = df_plantel[columnas_cantidad].sum().reset_index()
-    df_valores.columns = ["Semana", "Cantidad"]
-    df_valores["Semana"] = df_valores["Semana"].astype(str).str.strip()
+    col_plantel = _find_col_like(df_seguimiento, ["Plantel"])
+    if not col_plantel:
+        return pd.DataFrame(columns=["Semana", "Cantidad", "Porcentaje", "Etiqueta"])
 
-    df_porcentajes = df_plantel[columnas_porcentaje].mean().reset_index()
-    df_porcentajes.columns = ["Semana", "Porcentaje"]
-    df_porcentajes["Semana"] = df_porcentajes["Semana"].astype(str).str.replace(" %", "", regex=False).str.strip()
+    objetivo = str(plantel_usuario).strip().lower()
+    df_plantel = df_seguimiento[
+        df_seguimiento[col_plantel].astype(str).str.strip().str.lower() == objetivo
+    ].copy()
 
-    df_semana = pd.merge(df_valores, df_porcentajes, on="Semana", how="inner")
-    df_semana["Cantidad"] = pd.to_numeric(df_semana["Cantidad"], errors="coerce").fillna(0)
-    df_semana["Porcentaje"] = pd.to_numeric(df_semana["Porcentaje"], errors="coerce").fillna(0).round(2)
+    if df_plantel.empty:
+        return pd.DataFrame(columns=["Semana", "Cantidad", "Porcentaje", "Etiqueta"])
+
+    mapping = _mapear_columnas_seguimiento(df_plantel)
+    if not mapping:
+        return pd.DataFrame(columns=["Semana", "Cantidad", "Porcentaje", "Etiqueta"])
+
+    rows = []
+    for semana, meta in mapping.items():
+        col_cantidad = meta.get("cantidad")
+        col_porcentaje = meta.get("porcentaje")
+
+        cantidad = 0
+        porcentaje = 0.0
+
+        if col_cantidad is not None and col_cantidad in df_plantel.columns:
+            cantidad = pd.to_numeric(df_plantel[col_cantidad], errors="coerce").fillna(0).sum()
+
+        if col_porcentaje is not None and col_porcentaje in df_plantel.columns:
+            porcentaje = pd.to_numeric(df_plantel[col_porcentaje], errors="coerce").fillna(0).mean()
+
+        rows.append({
+            "Semana": semana,
+            "Cantidad": int(round(float(cantidad))) if pd.notna(cantidad) else 0,
+            "Porcentaje": round(float(porcentaje), 2) if pd.notna(porcentaje) else 0.0,
+            "Semana_num": meta.get("week_num") or 0,
+        })
+
+    df_semana = pd.DataFrame(rows)
+    if df_semana.empty:
+        return pd.DataFrame(columns=["Semana", "Cantidad", "Porcentaje", "Etiqueta"])
+
+    df_semana = df_semana.sort_values("Semana_num").reset_index(drop=True)
     df_semana["Etiqueta"] = df_semana.apply(
-        lambda r: f"{int(r['Cantidad'])} - {float(r['Porcentaje']):.1f}%",
+        lambda r: f"{int(r['Cantidad'])} - {float(r['Porcentaje']):.2f}%",
         axis=1
     )
     return df_semana
+
+
+def _datos_tendencia_seguimiento(df):
+    if df is None or getattr(df, "empty", True):
+        return {
+            "texto": "Tendencia vs semana previa: sin información.",
+            "valor_card": "Sin información",
+            "detalle_card": "No hay datos de seguimiento semanal.",
+        }
+
+    if len(df) < 2:
+        return {
+            "texto": "Tendencia vs semana previa: sin comparación.",
+            "valor_card": "Sin comparación",
+            "detalle_card": "No hay semana previa disponible para comparar.",
+        }
+
+    ultimo = df.iloc[-1]
+    previo = df.iloc[-2]
+
+    delta_cantidad = int(ultimo["Cantidad"] - previo["Cantidad"])
+    delta_porcentaje = round(float(ultimo["Porcentaje"] - previo["Porcentaje"]), 2)
+
+    if delta_porcentaje > 0:
+        estado = "subió"
+        flecha = "↑"
+    elif delta_porcentaje < 0:
+        estado = "bajó"
+        flecha = "↓"
+    else:
+        estado = "se mantuvo"
+        flecha = "→"
+
+    return {
+        "texto": (
+            f"Tendencia vs semana previa: {flecha} {estado} "
+            f"({delta_cantidad:+d} estudiantes; {delta_porcentaje:+.2f} pp)."
+        ),
+        "valor_card": f"{flecha} {estado.capitalize()}",
+        "detalle_card": f"{delta_cantidad:+d} estudiantes; {delta_porcentaje:+.2f} pp",
+    }
+
+
+def _resumen_tendencia_seguimiento(df):
+    return _datos_tendencia_seguimiento(df)["texto"]
+
+
+def _pie_semanas_seguimiento(df):
+    if df is None or getattr(df, "empty", True) or "Semana" not in df.columns:
+        return None
+
+    semanas = []
+    for valor in df["Semana"].dropna().tolist():
+        s = str(valor).strip()
+        wk = _wk_key(s)
+        if wk is not None:
+            semanas.append(f"Semana {wk}")
+        elif s:
+            semanas.append(s)
+
+    semanas = list(dict.fromkeys(semanas))
+    if not semanas:
+        return None
+
+    if len(semanas) == 1:
+        return f"Comportamiento correspondiente a: {semanas[0]}."
+
+    return "Comportamiento correspondiente a: " + ", ".join(semanas) + "."
+
+
+
+
+def _render_cards_resumen(items):
+    if not items:
+        return
+
+    cols = st.columns(len(items))
+    for col, item in zip(cols, items):
+        titulo = str(item.get("titulo", "")).strip()
+        valor = str(item.get("valor", "")).strip()
+        detalle = str(item.get("detalle", "")).strip()
+
+        with col:
+            st.markdown(
+                f"""
+                <div style="border:1px solid #D0D5DD;border-radius:14px;padding:16px 14px;background:#FFFFFF;min-height:120px;box-shadow:0 1px 2px rgba(16,24,40,0.05);">
+                    <div style="font-size:13px;color:#667085;margin-bottom:8px;font-weight:600;">{titulo}</div>
+                    <div style="font-size:24px;color:#101828;font-weight:800;line-height:1.15;">{valor}</div>
+                    <div style="font-size:12px;color:#667085;margin-top:10px;line-height:1.35;">{detalle}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+
+def mostrar_grafica_seguimiento_plantel(plantel_objetivo, show_title=True, show_footer=True):
+    seguimiento_plantel = obtener_seguimiento_plantel(plantel_objetivo)
+
+    if seguimiento_plantel is None or seguimiento_plantel.empty:
+        return False
+
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    fig.add_trace(
+        go.Bar(
+            x=seguimiento_plantel["Semana"],
+            y=seguimiento_plantel["Cantidad"],
+            name="Cantidad",
+            text=seguimiento_plantel["Etiqueta"],
+            textposition="outside",
+            textangle=-90,
+            marker_color="#FFC107",
+            cliponaxis=False,
+            outsidetextfont=dict(size=LABEL_FONT_SIZE_ADMIN + 2, color="#2b2b2b"),
+            hovertemplate="Semana %{x}<br>Estudiantes: %{y}<br>% NO competencia: %{customdata:.2f}%<extra></extra>",
+            customdata=seguimiento_plantel["Porcentaje"],
+        ),
+        secondary_y=False,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=seguimiento_plantel["Semana"],
+            y=seguimiento_plantel["Porcentaje"],
+            name="% NO competencia",
+            mode="lines+markers",
+            line=dict(color="#1f77b4", width=3),
+            marker=dict(size=9),
+            hovertemplate="Semana %{x}<br>% NO competencia: %{y:.2f}%<extra></extra>",
+        ),
+        secondary_y=True,
+    )
+
+    max_cantidad = float(seguimiento_plantel["Cantidad"].max()) if not seguimiento_plantel.empty else 0
+    max_porcentaje = float(seguimiento_plantel["Porcentaje"].max()) if not seguimiento_plantel.empty else 0
+
+    fig.update_layout(
+        title=f"Comportamiento semanal — {plantel_objetivo}" if show_title else None,
+        height=560,
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        uniformtext=dict(minsize=LABEL_FONT_SIZE_ADMIN + 2, mode="show"),
+        margin=dict(t=90 if show_title else 40, b=40),
+    )
+    fig.update_xaxes(
+        title_text="",
+        showticklabels=True,
+        ticks="",
+        showgrid=False,
+        tickangle=0,
+        tickfont=dict(size=12),
+    )
+    fig.update_yaxes(
+        title_text="",
+        showticklabels=False,
+        ticks="",
+        showgrid=False,
+        zeroline=False,
+        range=[0, max_cantidad * Y_AXIS_PADDING_MULT if max_cantidad else 1],
+        secondary_y=False,
+    )
+    fig.update_yaxes(
+        title_text="",
+        showticklabels=False,
+        ticks="",
+        showgrid=False,
+        zeroline=False,
+        range=[0, max_porcentaje * Y_AXIS_PADDING_MULT if max_porcentaje else 1],
+        secondary_y=True,
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+
+    resumen = _resumen_tendencia_seguimiento(seguimiento_plantel)
+    if show_footer and resumen:
+        st.caption(resumen)
+
+    return True
+
 
 
 # =========================
@@ -1185,38 +1471,43 @@ def mostrar_indicadores_academicos():
                 titulo = "Total de estudiantes NO competentes por plantel"
                 y_title = "Total de estudiantes NO competentes"
 
-            ymax = float(tabla_ordenada[y_col].max()) if not tabla_ordenada.empty else 0
+            if plantel_sel == "Todos":
+                ymax = float(tabla_ordenada[y_col].max()) if not tabla_ordenada.empty else 0
 
-            fig = go.Figure(
-                data=[
-                    go.Bar(
-                        x=tabla_ordenada["Plantel"],
-                        y=tabla_ordenada[y_col],
-                        text=tabla_ordenada["etiqueta"],
-                        textposition="outside",
-                        textangle=-90,
-                        marker_color="#FFC107",
-                        cliponaxis=False,
-                        outsidetextfont=dict(size=LABEL_FONT_SIZE_ADMIN),
-                        hoverinfo="skip",
-                        hovertemplate="",
-                    )
-                ]
-            )
+                fig = go.Figure(
+                    data=[
+                        go.Bar(
+                            x=tabla_ordenada["Plantel"],
+                            y=tabla_ordenada[y_col],
+                            text=tabla_ordenada["etiqueta"],
+                            textposition="outside",
+                            textangle=-90,
+                            marker_color="#FFC107",
+                            cliponaxis=False,
+                            outsidetextfont=dict(size=LABEL_FONT_SIZE_ADMIN),
+                            hoverinfo="skip",
+                            hovertemplate="",
+                        )
+                    ]
+                )
 
-            fig.update_layout(
-                title=titulo,
-                xaxis_title="Plantel",
-                yaxis_title=y_title,
-                xaxis_tickangle=-45,
-                height=560,
-                showlegend=False,
-                uniformtext=dict(minsize=LABEL_FONT_SIZE_ADMIN, mode="show"),
-                yaxis=dict(range=[0, ymax * Y_AXIS_PADDING_MULT if ymax else 1]),
-                margin=dict(t=90),
-            )
+                fig.update_layout(
+                    title=titulo,
+                    xaxis_title="Plantel",
+                    yaxis_title=y_title,
+                    xaxis_tickangle=-45,
+                    height=560,
+                    showlegend=False,
+                    uniformtext=dict(minsize=LABEL_FONT_SIZE_ADMIN, mode="show"),
+                    yaxis=dict(range=[0, ymax * Y_AXIS_PADDING_MULT if ymax else 1]),
+                    margin=dict(t=90),
+                )
 
-            st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.markdown(f"### 📈 Comportamiento semanal — {plantel_sel}")
+                if not mostrar_grafica_seguimiento_plantel(plantel_sel, show_title=False, show_footer=True):
+                    st.info(f"ℹ️ No hay datos de seguimiento semanal para **{plantel_sel}** en la hoja SEGUIMIENTO.")
 
             st.subheader("📋 Estudiantes agrupados por módulos NO competentes")
             tabla_con_total = agregar_fila_total(tabla_vista)
@@ -1414,50 +1705,13 @@ def mostrar_indicadores_academicos():
             st.warning(f"No hay información disponible para el plantel {plantel_usuario}.")
             return
 
-        tabla_filtrada["etiqueta"] = tabla_filtrada.apply(
-            lambda r: f"{int(r['Total estudiantes no competentes'])} - {float(r['% Estudiantes no competentes']):.1f}%",
-            axis=1
-        )
-
-        y_col = "% Estudiantes no competentes"
-        ymax = float(tabla_filtrada[y_col].max()) if not tabla_filtrada.empty else 0
-
-        fig = go.Figure(
-            data=[
-                go.Bar(
-                    x=tabla_filtrada["Plantel"],
-                    y=tabla_filtrada[y_col],
-                    text=tabla_filtrada["etiqueta"],
-                    textposition="outside",
-                    textangle=-90,
-                    marker_color="#FFC107",
-                    cliponaxis=False,
-                    outsidetextfont=dict(size=LABEL_FONT_SIZE_PLANTEL),
-                    hoverinfo="skip",
-                    hovertemplate="",
-                )
-            ]
-        )
-
-        fig.update_layout(
-            title=f"Porcentaje de estudiantes NO competentes — {plantel_usuario}",
-            xaxis_title="Plantel",
-            yaxis_title="% de estudiantes NO competentes",
-            height=520,
-            showlegend=False,
-            uniformtext=dict(minsize=LABEL_FONT_SIZE_PLANTEL, mode="show"),
-            yaxis=dict(range=[0, ymax * Y_AXIS_PADDING_MULT if ymax else 1]),
-            margin=dict(t=70),
-        )
-
-        st.plotly_chart(fig, use_container_width=True)
-
-        st.subheader(f"📋 Estudiantes del plantel: {plantel_usuario}")
-        st.dataframe(tabla_filtrada, use_container_width=True)
+        st.markdown(f"### 📈 Comportamiento semanal — {plantel_usuario}")
+        seguimiento_plantel = obtener_seguimiento_plantel(plantel_usuario)
+        if not mostrar_grafica_seguimiento_plantel(plantel_usuario, show_title=False, show_footer=False):
+            st.info(f"ℹ️ No hay datos de seguimiento semanal para **{plantel_usuario}** en la hoja SEGUIMIENTO.")
 
         vals = df_matricula[df_matricula["Plantel"] == plantel_usuario]["matriculaTotal"].values
         matricula_plantel = int(vals[0]) if len(vals) else 0
-        st.markdown(f"### 🎓 Matrícula total del plantel {plantel_usuario}: **{matricula_plantel:,}**")
 
         if not tabla_filtrada.empty and "Total estudiantes no competentes" in tabla_filtrada.columns:
             total_nc = int(tabla_filtrada["Total estudiantes no competentes"].iloc[0])
@@ -1466,36 +1720,50 @@ def mostrar_indicadores_academicos():
             total_nc = df_exportar_tmp["matricula"].nunique() if "matricula" in df_exportar_tmp.columns else len(df_exportar_tmp)
 
         porcentaje_nc = float(tabla_filtrada["% Estudiantes no competentes"].iloc[0]) if "% Estudiantes no competentes" in tabla_filtrada.columns else 0.0
-        st.markdown(f"### 👥 Total de estudiantes NO competentes: **{total_nc:,}**")
-        st.markdown(f"### 📊 Porcentaje respecto a la matrícula: **{porcentaje_nc:.2f}%**")
+        tendencia = _datos_tendencia_seguimiento(seguimiento_plantel)
+
+        _render_cards_resumen([
+            {
+                "titulo": "Tendencia vs semana previa",
+                "valor": tendencia["valor_card"],
+                "detalle": tendencia["detalle_card"],
+            },
+            {
+                "titulo": "Matrícula",
+                "valor": f"{matricula_plantel:,}",
+                "detalle": f"Matrícula total del plantel {plantel_usuario}",
+            },
+            {
+                "titulo": "Total de estudiantes NO competentes",
+                "valor": f"{total_nc:,}",
+                "detalle": "Total actual mostrado para el plantel.",
+            },
+            {
+                "titulo": "Porcentaje respecto a la matrícula",
+                "valor": f"{porcentaje_nc:.2f}%",
+                "detalle": "Porcentaje actual de estudiantes NO competentes.",
+            },
+        ])
+
+        st.subheader(f"📋 Estudiantes del plantel: {plantel_usuario}")
+        st.dataframe(tabla_filtrada, use_container_width=True)
 
         df_exportar = obtener_detalle_no_competentes(plantel_usuario)
+        semana_detalle_nc = obtener_etiqueta_semana_mas_reciente(df_exportar)
+        df_exportar = filtrar_semana_mas_reciente_si_existe(df_exportar)
 
         st.subheader(f"⚠️ Estudiantes NO competentes {total_nc} (Detalle)")
         if df_exportar.empty:
             st.info("ℹ️ No hay registros de NO competentes para este plantel.")
         else:
+            if semana_detalle_nc:
+                st.caption(f"Mostrando el detalle más reciente detectado: **{semana_detalle_nc}**.")
             mostrar_dataframe_preview(df_exportar)
 
-            col_a, col_b = st.columns(2)
-            with col_a:
-                st.download_button(
-                    label="📤 Exportar estudiantes a Excel",
-                    data=generar_excel_no_competentes(plantel_usuario),
-                    file_name=f"estudiantes_{slug(plantel_usuario)}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True
-                )
-            with col_b:
-                st.download_button(
-                    label="🖨️ Descargar HTML para imprimir",
-                    data=generar_html_no_competentes(plantel_usuario),
-                    file_name=f"no_competentes_{slug(plantel_usuario)}.html",
-                    mime="text/html",
-                    use_container_width=True
-                )
 
         df_sin_registro_plantel = obtener_sin_registro_calificaciones(plantel_usuario)
+        semana_detalle_sr = obtener_etiqueta_semana_mas_reciente(df_sin_registro_plantel)
+        df_sin_registro_plantel = filtrar_semana_mas_reciente_si_existe(df_sin_registro_plantel)
 
         if df_sin_registro_plantel.empty:
             total_sin_registro_plantel = 0
@@ -1511,12 +1779,7 @@ def mostrar_indicadores_academicos():
         if df_sin_registro_plantel.empty:
             st.info("ℹ️ No hay registros con pEspecifico = 0 para este plantel.")
         else:
+            if semana_detalle_sr:
+                st.caption(f"Mostrando el detalle más reciente detectado: **{semana_detalle_sr}**.")
             mostrar_dataframe_preview(df_sin_registro_plantel)
 
-            st.download_button(
-                label="📤 Sin registro de Calificaciones",
-                data=generar_excel_sin_registro(plantel_usuario),
-                file_name=f"sin_registro_calificaciones_{slug(plantel_usuario)}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True
-            )
