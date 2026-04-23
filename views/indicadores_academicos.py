@@ -24,7 +24,9 @@ PERM_SEND_EMAIL_CODE = "SEND_EMAIL_INDICADORES"
 
 EXCEL_PATH = "assets/Datos1.xlsx"
 CACHE_DIR = "assets/cache_indicadores"
-MAX_PREVIEW_ROWS = 500
+MAX_PREVIEW_ROWS = 500  # Compatibilidad: ya no se usa para recortar la tabla.
+DEFAULT_TABLE_HEIGHT = 520
+USE_PLANTEL_DETAIL_CACHE = os.getenv("USE_PLANTEL_DETAIL_CACHE", "false").lower() == "true"
 
 USE_FAST_CACHE = os.getenv("USE_FAST_CACHE", "true").lower() == "true"
 
@@ -160,11 +162,17 @@ def _preparar_columnas_detalle(df):
     return df
 
 
-def mostrar_dataframe_preview(df, max_rows=MAX_PREVIEW_ROWS, height=360):
-    total = len(df)
-    if total > max_rows:
-        st.caption(f"Mostrando los primeros {max_rows:,} de {total:,} registros. Usa la descarga para obtener el archivo completo.")
-    st.dataframe(df.head(max_rows), use_container_width=True, height=height)
+def mostrar_dataframe_preview(df, max_rows=None, height=DEFAULT_TABLE_HEIGHT):
+    """
+    Muestra el DataFrame completo.
+
+    Antes se usaba df.head(MAX_PREVIEW_ROWS), lo que provocaba que si un plantel
+    tenía más de 500 registros solo se vieran los primeros 500. Se mantiene el
+    nombre de la función para no romper llamadas existentes, pero ya no recorta.
+    """
+    total = len(df) if df is not None else 0
+    st.caption(f"Mostrando {total:,} registro(s). La tabla no está recortada; usa el scroll para revisar todos los registros.")
+    st.dataframe(df, use_container_width=True, height=height)
 
 
 # =========================
@@ -286,7 +294,18 @@ def cargar_permisos_sheet():
 
 @st.cache_data(show_spinner=False)
 def obtener_detalle_no_competentes(plantel_sel):
-    if USE_FAST_CACHE and plantel_sel != "Todos":
+    """
+    Devuelve el detalle completo de NO competentes para el plantel seleccionado.
+
+    Importante:
+    - No se recorta a 500 filas.
+    - Por defecto NO se usa el parquet parcial detalle_por_plantel, porque si ese
+      cache está viejo o fue generado incompleto puede provocar que la tabla y el
+      Excel bajen menos registros que el total real.
+    - Si necesitas volver a activar ese cache por rendimiento, define:
+      USE_PLANTEL_DETAIL_CACHE=true
+    """
+    if USE_FAST_CACHE and USE_PLANTEL_DETAIL_CACHE and plantel_sel != "Todos":
         path = _cache_path(f"detalle_por_plantel/{slug(plantel_sel)}.parquet")
         if os.path.exists(path):
             df = pd.read_parquet(path)
@@ -543,7 +562,8 @@ def mostrar_grafica_seguimiento_plantel(plantel_objetivo, show_title=True, show_
             marker_color="#FFC107",
             cliponaxis=False,
             outsidetextfont=dict(size=LABEL_FONT_SIZE_ADMIN + 2, color="#2b2b2b"),
-            hovertemplate="Semana %{x}<br>Estudiantes: %{y}<br>% NO competencia: %{customdata:.2f}%<extra></extra>",
+            hoverinfo="skip",
+            hovertemplate="",
             customdata=seguimiento_plantel["Porcentaje"],
         ),
         secondary_y=False,
@@ -556,7 +576,8 @@ def mostrar_grafica_seguimiento_plantel(plantel_objetivo, show_title=True, show_
             mode="lines+markers",
             line=dict(color="#1f77b4", width=3),
             marker=dict(size=9),
-            hovertemplate="Semana %{x}<br>% NO competencia: %{y:.2f}%<extra></extra>",
+            hoverinfo="skip",
+            hovertemplate="",
         ),
         secondary_y=True,
     )
@@ -567,7 +588,7 @@ def mostrar_grafica_seguimiento_plantel(plantel_objetivo, show_title=True, show_
     fig.update_layout(
         title=f"Comportamiento semanal — {plantel_objetivo}" if show_title else None,
         height=560,
-        hovermode="x unified",
+        hovermode=False,
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         uniformtext=dict(minsize=LABEL_FONT_SIZE_ADMIN + 2, mode="show"),
         margin=dict(t=90 if show_title else 40, b=40),
@@ -1118,6 +1139,67 @@ def exportar_html_imprimible(df, titulo, subtitulo="", filename="no_competentes.
     return b
 
 
+
+def _safe_download_name(value):
+    text = str(value or "todos").strip()
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    text = re.sub(r"[^a-zA-Z0-9_-]+", "_", text)
+    text = re.sub(r"_+", "_", text).strip("_")
+    return text.lower() or "todos"
+
+
+def render_botones_descarga_detalle(df, plantel_sel, tipo="no_competentes", key_prefix="detalle"):
+    """
+    Renderiza botones de descarga usando exactamente el mismo DataFrame que se muestra.
+    Así la tabla en pantalla y el Excel contienen los mismos registros completos.
+    """
+    if df is None or getattr(df, "empty", True):
+        return
+
+    plantel_file = _safe_download_name(plantel_sel)
+    tipo_file = _safe_download_name(tipo)
+    fecha_file = datetime.now().strftime("%Y%m%d_%H%M")
+
+    if tipo == "sin_registro_calificaciones":
+        titulo = "Estudiantes sin registro de Calificaciones"
+        excel_name = f"sin_registro_calificaciones_{plantel_file}_{fecha_file}.xlsx"
+        html_name = f"sin_registro_calificaciones_{plantel_file}_{fecha_file}.html"
+    elif tipo == "agrupados_no_competentes":
+        titulo = "Estudiantes agrupados por módulos NO competentes"
+        excel_name = f"agrupados_no_competentes_{plantel_file}_{fecha_file}.xlsx"
+        html_name = f"agrupados_no_competentes_{plantel_file}_{fecha_file}.html"
+    else:
+        titulo = "Estudiantes NO competentes"
+        excel_name = f"estudiantes_no_competentes_{plantel_file}_{fecha_file}.xlsx"
+        html_name = f"estudiantes_no_competentes_{plantel_file}_{fecha_file}.html"
+
+    excel_bytes = exportar_excel(df).getvalue()
+    html_bytes = exportar_html_imprimible(
+        df,
+        titulo=titulo,
+        subtitulo=f"Plantel: {plantel_sel} | Registros exportados: {len(df):,}",
+    ).getvalue()
+
+    col_excel, col_html = st.columns(2)
+    with col_excel:
+        st.download_button(
+            label=f"⬇️ Descargar Excel completo ({len(df):,} registros)",
+            data=excel_bytes,
+            file_name=excel_name,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key=f"{key_prefix}_{tipo_file}_{plantel_file}_excel",
+        )
+    with col_html:
+        st.download_button(
+            label="🖨️ Descargar HTML imprimible",
+            data=html_bytes,
+            file_name=html_name,
+            mime="text/html",
+            key=f"{key_prefix}_{tipo_file}_{plantel_file}_html",
+        )
+
+
 # =========================
 # Email (SMTP)
 # =========================
@@ -1512,6 +1594,12 @@ def mostrar_indicadores_academicos():
             st.subheader("📋 Estudiantes agrupados por módulos NO competentes")
             tabla_con_total = agregar_fila_total(tabla_vista)
             st.dataframe(tabla_con_total, use_container_width=True)
+            render_botones_descarga_detalle(
+                tabla_con_total,
+                plantel_sel,
+                tipo="agrupados_no_competentes",
+                key_prefix="admin_agrupado"
+            )
 
             total_general = int(tabla_vista["Total estudiantes no competentes"].sum())
             total_matricula = float(tabla_vista["matriculaTotal"].sum())
@@ -1540,6 +1628,12 @@ def mostrar_indicadores_academicos():
                     st.info("ℹ️ No hay registros de NO competentes para **Todos**.")
                 else:
                     mostrar_dataframe_preview(df_print)
+                    render_botones_descarga_detalle(
+                        df_print,
+                        "Todos",
+                        tipo="no_competentes",
+                        key_prefix="admin_todos_nc"
+                    )
 
             if not st.session_state.get("indicadores_admin_filtros_aplicados", False):
                 st.markdown("### 🚨 Estudiantes sin registro de Calificaciones (Detalle) — Todos")
@@ -1559,6 +1653,12 @@ def mostrar_indicadores_academicos():
                     st.info("ℹ️ No hay registros con pEspecifico = 0 para **Todos**.")
                 else:
                     mostrar_dataframe_preview(df_sin_registro)
+                    render_botones_descarga_detalle(
+                        df_sin_registro,
+                        "Todos",
+                        tipo="sin_registro_calificaciones",
+                        key_prefix="admin_todos_sr"
+                    )
         else:
             df_print = obtener_detalle_no_competentes(plantel_sel)
 
@@ -1573,6 +1673,12 @@ def mostrar_indicadores_academicos():
                 st.info(f"ℹ️ No hay registros de NO competentes para **{plantel_sel}**.")
             else:
                 mostrar_dataframe_preview(df_print)
+                render_botones_descarga_detalle(
+                    df_print,
+                    plantel_sel,
+                    tipo="no_competentes",
+                    key_prefix="admin_plantel_nc"
+                )
 
             df_sin_registro = obtener_sin_registro_calificaciones(plantel_sel)
             if df_sin_registro.empty:
@@ -1589,6 +1695,12 @@ def mostrar_indicadores_academicos():
                 st.info(f"ℹ️ No hay registros con pEspecifico = 0 para **{plantel_sel}**.")
             else:
                 mostrar_dataframe_preview(df_sin_registro)
+                render_botones_descarga_detalle(
+                    df_sin_registro,
+                    plantel_sel,
+                    tipo="sin_registro_calificaciones",
+                    key_prefix="admin_plantel_sr"
+                )
 
         if puede_enviar_email:
             if "confirm_send_open" not in st.session_state:
@@ -1749,21 +1861,31 @@ def mostrar_indicadores_academicos():
         st.dataframe(tabla_filtrada, use_container_width=True)
 
         df_exportar = obtener_detalle_no_competentes(plantel_usuario)
-        semana_detalle_nc = obtener_etiqueta_semana_mas_reciente(df_exportar)
-        df_exportar = filtrar_semana_mas_reciente_si_existe(df_exportar)
 
         st.subheader(f"⚠️ Estudiantes NO competentes {total_nc} (Detalle)")
         if df_exportar.empty:
             st.info("ℹ️ No hay registros de NO competentes para este plantel.")
         else:
-            if semana_detalle_nc:
-                st.caption(f"Mostrando el detalle más reciente detectado: **{semana_detalle_nc}**.")
+            estudiantes_unicos_nc = (
+                df_exportar["matricula"].nunique()
+                if "matricula" in df_exportar.columns
+                else len(df_exportar)
+            )
+            st.caption(
+                f"Mostrando el detalle completo del plantel: "
+                f"{estudiantes_unicos_nc:,} estudiante(s) único(s), "
+                f"{len(df_exportar):,} registro(s) académico(s)."
+            )
             mostrar_dataframe_preview(df_exportar)
+            render_botones_descarga_detalle(
+                df_exportar,
+                plantel_usuario,
+                tipo="no_competentes",
+                key_prefix="plantel_nc"
+            )
 
 
         df_sin_registro_plantel = obtener_sin_registro_calificaciones(plantel_usuario)
-        semana_detalle_sr = obtener_etiqueta_semana_mas_reciente(df_sin_registro_plantel)
-        df_sin_registro_plantel = filtrar_semana_mas_reciente_si_existe(df_sin_registro_plantel)
 
         if df_sin_registro_plantel.empty:
             total_sin_registro_plantel = 0
@@ -1779,7 +1901,21 @@ def mostrar_indicadores_academicos():
         if df_sin_registro_plantel.empty:
             st.info("ℹ️ No hay registros con pEspecifico = 0 para este plantel.")
         else:
-            if semana_detalle_sr:
-                st.caption(f"Mostrando el detalle más reciente detectado: **{semana_detalle_sr}**.")
+            estudiantes_unicos_sr = (
+                df_sin_registro_plantel["matricula"].nunique()
+                if "matricula" in df_sin_registro_plantel.columns
+                else len(df_sin_registro_plantel)
+            )
+            st.caption(
+                f"Mostrando el detalle completo del plantel: "
+                f"{estudiantes_unicos_sr:,} estudiante(s) único(s), "
+                f"{len(df_sin_registro_plantel):,} registro(s) académico(s)."
+            )
             mostrar_dataframe_preview(df_sin_registro_plantel)
+            render_botones_descarga_detalle(
+                df_sin_registro_plantel,
+                plantel_usuario,
+                tipo="sin_registro_calificaciones",
+                key_prefix="plantel_sr"
+            )
 
