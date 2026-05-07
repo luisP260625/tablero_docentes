@@ -9,6 +9,7 @@ COLUMNAS_SEMCAPTURA = [
     "DOCENTE",
     "MODULO",
     "SEMESTRE",
+    "FECHA_CAPTURA",
     "GRUPO",
     "UAPRENDIZAJE",
     "RAPRENDIZAJE",
@@ -71,16 +72,21 @@ def mostrar(df_semcaptura: pl.DataFrame, plantel_usuario: str, administrador: bo
 
         if filtro == "≤30":
             df_view = df_view.filter(pl.col("_PCAPTURA_NUM") <= 30)
+
         elif filtro == "31 a 60":
             df_view = df_view.filter(
-                (pl.col("_PCAPTURA_NUM") >= 31) & (pl.col("_PCAPTURA_NUM") <= 60)
+                (pl.col("_PCAPTURA_NUM") >= 31)
+                & (pl.col("_PCAPTURA_NUM") <= 60)
             )
+
         elif filtro == "61 a 90":
             df_view = df_view.filter(
-                (pl.col("_PCAPTURA_NUM") >= 61) & (pl.col("_PCAPTURA_NUM") <= 90)
+                (pl.col("_PCAPTURA_NUM") >= 61)
+                & (pl.col("_PCAPTURA_NUM") <= 90)
             )
 
         df_view = df_view.drop("_PCAPTURA_NUM")
+
     else:
         st.warning("No se encontró la columna PCAPTURA; no se puede aplicar el filtro.")
 
@@ -100,6 +106,7 @@ def mostrar(df_semcaptura: pl.DataFrame, plantel_usuario: str, administrador: bo
             "DOCENTE": st.column_config.TextColumn("DOCENTE", width="medium"),
             "MODULO": st.column_config.TextColumn("MODULO", width="medium"),
             "SEMESTRE": st.column_config.NumberColumn("SEMESTRE", width="small"),
+            "FECHA_CAPTURA": st.column_config.TextColumn("FECHA CAPTURA", width="medium"),
             "GRUPO": st.column_config.TextColumn("GRUPO", width="small"),
             "UAPRENDIZAJE": st.column_config.NumberColumn("UAPRENDIZAJE", width="small"),
             "RAPRENDIZAJE": st.column_config.NumberColumn("RAPRENDIZAJE", width="small"),
