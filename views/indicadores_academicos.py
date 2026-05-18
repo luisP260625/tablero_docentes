@@ -38,6 +38,10 @@ REPROBACION_COLS = [
 MATRICULA_COLS = ["Plantel", "matriculaTotal"]
 METRICAS_ORDEN = ["pEspecifico", "pAlcanzado", "pRelativo"]
 
+# Categorías usadas para identificar estudiantes por cantidad de módulos NO competentes.
+# Se mantiene el mismo criterio del resumen: 1, 2, 3... 10 y 11 o más.
+CATEGORIAS_MODULOS_NC = [str(i) for i in range(1, 11)] + ["11 o más"]
+
 
 # =========================
 # Helpers base
@@ -324,6 +328,289 @@ def obtener_sin_registro_calificaciones(plantel_sel):
     if "pEspecifico" not in df.columns:
         return pd.DataFrame(columns=df.columns)
     return df[df["pEspecifico"] == 0].copy()
+
+
+# =========================
+# Identificación/impresión por cantidad de módulos NO competentes
+# =========================
+def _categoria_modulos_nc(total_modulos):
+    try:
+        n = int(total_modulos)
+    except Exception:
+        n = 0
+
+    if n <= 0:
+        return "0"
+    return str(n) if n <= 10 else "11 o más"
+
+
+def _orden_categoria_modulos_nc(categoria):
+    texto = _norm_txt(categoria)
+    nums = re.findall(r"\d+", texto)
+    if nums:
+        n = int(nums[0])
+        return n if n <= 10 else 11
+    if "mas" in texto or "+" in texto:
+        return 11
+    return 999
+
+
+def _join_unique_values(series):
+    values = []
+    for value in series.dropna().tolist():
+        text = str(value).strip()
+        if not text or text.lower() in ("nan", "none", "null"):
+            continue
+        values.append(text)
+    values = list(dict.fromkeys(values))
+    return " | ".join(values)
+
+
+def agregar_conteo_modulos_no_competentes(df):
+    """
+    Agrega a cada registro académico dos columnas:
+    - modulos_nc: cantidad de módulos/registros NO competentes del estudiante.
+    - categoria_modulos_nc: 1, 2, 3... 10, 11 o más.
+
+    Se agrupa por Plantel + matrícula cuando ambas columnas existen. Esto permite
+    que el usuario identifique todos los datos completos de los estudiantes que
+    tienen 1, 2, 7, 11 o más módulos NO competentes, sin perder el detalle original.
+    """
+    if df is None or getattr(df, "empty", True):
+        base_cols = list(df.columns) if df is not None else []
+        return pd.DataFrame(columns=base_cols + ["modulos_nc", "categoria_modulos_nc"])
+
+    d = df.copy()
+    # Si el DataFrame ya venía filtrado/con conteo previo, se recalcula para evitar
+    # columnas duplicadas con sufijos _x/_y al hacer merge.
+    d = d.drop(columns=["modulos_nc", "categoria_modulos_nc"], errors="ignore")
+
+    if "matricula" not in d.columns:
+        d["modulos_nc"] = 1
+        d["categoria_modulos_nc"] = "1"
+        return d
+
+    group_cols = ["matricula"]
+    if "Plantel" in d.columns:
+        group_cols = ["Plantel", "matricula"]
+
+    conteo = (
+        d.groupby(group_cols, dropna=False)
+        .size()
+        .reset_index(name="modulos_nc")
+    )
+    conteo["modulos_nc"] = pd.to_numeric(conteo["modulos_nc"], errors="coerce").fillna(0).astype(int)
+    conteo["categoria_modulos_nc"] = conteo["modulos_nc"].apply(_categoria_modulos_nc)
+
+    d = d.merge(conteo, on=group_cols, how="left")
+    d["modulos_nc"] = pd.to_numeric(d["modulos_nc"], errors="coerce").fillna(0).astype(int)
+    d["categoria_modulos_nc"] = d["categoria_modulos_nc"].fillna(d["modulos_nc"].apply(_categoria_modulos_nc))
+
+    sort_cols = [c for c in ["Plantel", "modulos_nc", "ESTUDIANTE", "matricula", "MODULO"] if c in d.columns]
+    if sort_cols:
+        ascending = [True] * len(sort_cols)
+        if "modulos_nc" in sort_cols:
+            ascending[sort_cols.index("modulos_nc")] = False
+        d = d.sort_values(sort_cols, ascending=ascending).reset_index(drop=True)
+
+    return d
+
+
+def filtrar_detalle_por_categorias_modulos(df, categorias):
+    d = agregar_conteo_modulos_no_competentes(df)
+    if d.empty or not categorias:
+        return d.iloc[0:0].copy()
+
+    categorias_norm = {str(c).strip() for c in categorias}
+    return d[d["categoria_modulos_nc"].astype(str).isin(categorias_norm)].copy()
+
+
+def construir_resumen_estudiantes_por_modulos(df_detalle):
+    """
+    Convierte el detalle académico a una vista de 1 fila por estudiante para impresión.
+    Incluye módulos y docentes concatenados para que el usuario pueda identificar
+    claramente a quién debe dar atención según la cantidad de módulos NO competentes.
+    """
+    if df_detalle is None or getattr(df_detalle, "empty", True):
+        return pd.DataFrame()
+
+    d = agregar_conteo_modulos_no_competentes(df_detalle)
+    if d.empty:
+        return pd.DataFrame()
+
+    if "matricula" not in d.columns:
+        return d.copy()
+
+    group_cols = ["matricula"]
+    if "Plantel" in d.columns:
+        group_cols = ["Plantel", "matricula"]
+
+    agg = {}
+    for col in ["ESTUDIANTE", "CARRERA", "grado", "cvegrupo", "modulos_nc", "categoria_modulos_nc"]:
+        if col in d.columns:
+            agg[col] = "first"
+
+    if "MODULO" in d.columns:
+        agg["MODULO"] = _join_unique_values
+    if "DOCENTE" in d.columns:
+        agg["DOCENTE"] = _join_unique_values
+
+    for col in METRICAS_ORDEN:
+        if col in d.columns:
+            agg[col] = "min"
+
+    resumen = d.groupby(group_cols, dropna=False).agg(agg).reset_index()
+
+    rename_map = {
+        "MODULO": "MODULOS_NO_COMPETENTES",
+        "DOCENTE": "DOCENTES_RELACIONADOS",
+        "pEspecifico": "pEspecifico_min",
+        "pAlcanzado": "pAlcanzado_min",
+        "pRelativo": "pRelativo_min",
+    }
+    resumen = resumen.rename(columns=rename_map)
+
+    orden = [
+        "Plantel", "ESTUDIANTE", "matricula", "CARRERA", "grado", "cvegrupo",
+        "modulos_nc", "categoria_modulos_nc", "MODULOS_NO_COMPETENTES", "DOCENTES_RELACIONADOS",
+        "pEspecifico_min", "pAlcanzado_min", "pRelativo_min"
+    ]
+    orden = [c for c in orden if c in resumen.columns]
+    resto = [c for c in resumen.columns if c not in orden]
+    resumen = resumen[orden + resto]
+
+    sort_cols = [c for c in ["Plantel", "modulos_nc", "ESTUDIANTE", "matricula"] if c in resumen.columns]
+    if sort_cols:
+        ascending = [True] * len(sort_cols)
+        if "modulos_nc" in sort_cols:
+            ascending[sort_cols.index("modulos_nc")] = False
+        resumen = resumen.sort_values(sort_cols, ascending=ascending).reset_index(drop=True)
+
+    return resumen
+
+
+def construir_resumen_categorias_modulos(df_detalle):
+    if df_detalle is None or getattr(df_detalle, "empty", True):
+        return pd.DataFrame(columns=["Módulos NO competentes", "Estudiantes", "Registros académicos"])
+
+    d = agregar_conteo_modulos_no_competentes(df_detalle)
+    if d.empty or "categoria_modulos_nc" not in d.columns:
+        return pd.DataFrame(columns=["Módulos NO competentes", "Estudiantes", "Registros académicos"])
+
+    if "matricula" in d.columns:
+        resumen = (
+            d.groupby("categoria_modulos_nc", dropna=False)
+            .agg(
+                Estudiantes=("matricula", "nunique"),
+                **{"Registros académicos": ("matricula", "size")}
+            )
+            .reset_index()
+        )
+    else:
+        resumen = (
+            d.groupby("categoria_modulos_nc", dropna=False)
+            .size()
+            .reset_index(name="Registros académicos")
+        )
+        resumen["Estudiantes"] = resumen["Registros académicos"]
+
+    resumen = resumen.rename(columns={"categoria_modulos_nc": "Módulos NO competentes"})
+    resumen["__orden__"] = resumen["Módulos NO competentes"].apply(_orden_categoria_modulos_nc)
+    resumen = resumen.sort_values("__orden__").drop(columns=["__orden__"]).reset_index(drop=True)
+    return resumen
+
+
+def _label_categorias_modulos(categorias):
+    if not categorias:
+        return "Sin selección"
+    cats = sorted([str(c) for c in categorias], key=_orden_categoria_modulos_nc)
+    return ", ".join(cats)
+
+
+def render_seccion_impresion_por_modulos(plantel_sel, key_prefix="modulos_nc"):
+    """
+    Sección reutilizable para administradores y planteles.
+    Permite filtrar e imprimir estudiantes por cantidad de módulos NO competentes:
+    1, 2, 3... 10 y 11 o más.
+    """
+    df_base = obtener_detalle_no_competentes(plantel_sel)
+
+    st.markdown("---")
+    st.subheader("Selecciona e imprime la relación de estudiantes clasificados según el número de módulos en los que no resultaron competentes.")
+    st.caption(
+        "Selecciona una o varias categorías. Ejemplo: si quieres atender a los estudiantes "
+        "con 7 módulos no competentes, selecciona únicamente **7**. La tabla mostrará exactamente el filtro seleccionado."
+    )
+
+    if df_base is None or df_base.empty:
+        st.info(f"ℹ️ No hay registros de NO competentes para **{plantel_sel}**.")
+        return
+
+    df_con_conteo = agregar_conteo_modulos_no_competentes(df_base)
+    resumen_categorias = construir_resumen_categorias_modulos(df_con_conteo)
+
+    categorias_disponibles = sorted(
+        df_con_conteo["categoria_modulos_nc"].dropna().astype(str).unique().tolist(),
+        key=_orden_categoria_modulos_nc
+    )
+
+    seleccion = st.multiselect(
+        "Cantidad de módulos NO competentes a identificar/imprimir",
+        options=categorias_disponibles,
+        default=categorias_disponibles,
+        key=f"{key_prefix}_{_safe_download_name(plantel_sel)}_categorias",
+        help="Puedes seleccionar 1, 2, 3... 10 o 11 o más. También puedes combinar varias categorías."
+    )
+
+    if not seleccion:
+        st.info("Selecciona al menos una categoría para mostrar e imprimir estudiantes.")
+        return
+
+    df_detalle_filtrado = filtrar_detalle_por_categorias_modulos(df_base, seleccion)
+    df_resumen_estudiantes = construir_resumen_estudiantes_por_modulos(df_detalle_filtrado)
+
+    estudiantes_unicos = (
+        df_resumen_estudiantes["matricula"].nunique()
+        if not df_resumen_estudiantes.empty and "matricula" in df_resumen_estudiantes.columns
+        else len(df_resumen_estudiantes)
+    )
+    registros = len(df_detalle_filtrado)
+    categorias_label = _label_categorias_modulos(seleccion)
+
+    st.markdown(
+        f"#### Resultado filtrado: **{estudiantes_unicos:,} estudiante(s)** | "
+        f"**{registros:,} registro(s) académico(s)** | Categoría(s): **{categorias_label}**"
+    )
+
+    if df_detalle_filtrado.empty:
+        st.info("No hay estudiantes para la categoría seleccionada.")
+        return
+
+    tab_resumen, tab_detalle = st.tabs(["👤 Resumen por estudiante", "📚 Detalle por módulo"])
+
+    with tab_resumen:
+        st.caption(
+            "Vista recomendada para impresión de atención: una fila por estudiante con sus módulos y docentes relacionados."
+        )
+        mostrar_dataframe_preview(df_resumen_estudiantes, height=430)
+        render_botones_descarga_detalle(
+            df_resumen_estudiantes,
+            plantel_sel,
+            tipo="resumen_por_modulos_no_competentes",
+            key_prefix=f"{key_prefix}_resumen_{_safe_download_name(categorias_label)}"
+        )
+
+    with tab_detalle:
+        st.caption(
+            "Vista completa: conserva cada registro/módulo académico original y agrega la cantidad total de módulos NO competentes del estudiante."
+        )
+        mostrar_dataframe_preview(df_detalle_filtrado, height=520)
+        render_botones_descarga_detalle(
+            df_detalle_filtrado,
+            plantel_sel,
+            tipo="detalle_por_modulos_no_competentes",
+            key_prefix=f"{key_prefix}_detalle_{_safe_download_name(categorias_label)}"
+        )
 
 
 def _mapear_columnas_seguimiento(df):
@@ -1151,53 +1438,17 @@ def _safe_download_name(value):
 
 def render_botones_descarga_detalle(df, plantel_sel, tipo="no_competentes", key_prefix="detalle"):
     """
-    Renderiza botones de descarga usando exactamente el mismo DataFrame que se muestra.
-    Así la tabla en pantalla y el Excel contienen los mismos registros completos.
+    Descargas manuales deshabilitadas por requerimiento.
+
+    Antes esta función mostraba botones como:
+    - Descargar Excel completo
+    - Descargar HTML imprimible
+
+    Se conserva la función para NO romper las llamadas existentes en el dashboard.
+    Las tablas siguen mostrándose completas mediante st.dataframe(), por lo que el
+    usuario puede usar las herramientas propias de la tabla para bajar la información.
     """
-    if df is None or getattr(df, "empty", True):
-        return
-
-    plantel_file = _safe_download_name(plantel_sel)
-    tipo_file = _safe_download_name(tipo)
-    fecha_file = datetime.now().strftime("%Y%m%d_%H%M")
-
-    if tipo == "sin_registro_calificaciones":
-        titulo = "Estudiantes sin registro de Calificaciones"
-        excel_name = f"sin_registro_calificaciones_{plantel_file}_{fecha_file}.xlsx"
-        html_name = f"sin_registro_calificaciones_{plantel_file}_{fecha_file}.html"
-    elif tipo == "agrupados_no_competentes":
-        titulo = "Estudiantes agrupados por módulos NO competentes"
-        excel_name = f"agrupados_no_competentes_{plantel_file}_{fecha_file}.xlsx"
-        html_name = f"agrupados_no_competentes_{plantel_file}_{fecha_file}.html"
-    else:
-        titulo = "Estudiantes NO competentes"
-        excel_name = f"estudiantes_no_competentes_{plantel_file}_{fecha_file}.xlsx"
-        html_name = f"estudiantes_no_competentes_{plantel_file}_{fecha_file}.html"
-
-    excel_bytes = exportar_excel(df).getvalue()
-    html_bytes = exportar_html_imprimible(
-        df,
-        titulo=titulo,
-        subtitulo=f"Plantel: {plantel_sel} | Registros exportados: {len(df):,}",
-    ).getvalue()
-
-    col_excel, col_html = st.columns(2)
-    with col_excel:
-        st.download_button(
-            label=f"⬇️ Descargar Excel completo ({len(df):,} registros)",
-            data=excel_bytes,
-            file_name=excel_name,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key=f"{key_prefix}_{tipo_file}_{plantel_file}_excel",
-        )
-    with col_html:
-        st.download_button(
-            label="🖨️ Descargar HTML imprimible",
-            data=html_bytes,
-            file_name=html_name,
-            mime="text/html",
-            key=f"{key_prefix}_{tipo_file}_{plantel_file}_html",
-        )
+    return
 
 
 # =========================
@@ -1659,6 +1910,11 @@ def mostrar_indicadores_academicos():
                         tipo="sin_registro_calificaciones",
                         key_prefix="admin_todos_sr"
                     )
+
+                render_seccion_impresion_por_modulos(
+                    "Todos",
+                    key_prefix="admin_todos_modulos"
+                )
         else:
             df_print = obtener_detalle_no_competentes(plantel_sel)
 
@@ -1701,6 +1957,11 @@ def mostrar_indicadores_academicos():
                     tipo="sin_registro_calificaciones",
                     key_prefix="admin_plantel_sr"
                 )
+
+            render_seccion_impresion_por_modulos(
+                plantel_sel,
+                key_prefix="admin_plantel_modulos"
+            )
 
         if puede_enviar_email:
             if "confirm_send_open" not in st.session_state:
@@ -1918,4 +2179,9 @@ def mostrar_indicadores_academicos():
                 tipo="sin_registro_calificaciones",
                 key_prefix="plantel_sr"
             )
+
+        render_seccion_impresion_por_modulos(
+            plantel_usuario,
+            key_prefix="plantel_modulos"
+        )
 
