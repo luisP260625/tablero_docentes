@@ -2,7 +2,7 @@
 import streamlit as st
 import pandas as pd
 import matplotlib.pyplot as plt
-from typing import Optional, Any, List
+from typing import Optional, Any, List, Tuple
 import io
 import unicodedata
 from datetime import datetime
@@ -10,6 +10,7 @@ from datetime import datetime
 # ====== Config Excel ======
 EXCEL_PATH_DEFAULT = "assets/Datos1.xlsx"
 SHEET_SEMCAPTURA = "SemCaptura"
+SHEET_REPROBACION = "Reprobacion"
 
 # ====== Nombres EXACTOS en tu Excel (hoja "Datos") ======
 COL_PLANTEL   = "Plantel"
@@ -35,30 +36,61 @@ def _to_pandas(df: Any) -> Optional[pd.DataFrame]:
     """Convierte df (polars/pandas/lista de dicts) a pandas.DataFrame."""
     if df is None:
         return None
+
     if isinstance(df, pd.DataFrame):
         return df.copy()
+
     try:
         import polars as pl  # type: ignore
         if isinstance(df, pl.DataFrame):
             return df.to_pandas()
     except Exception:
         pass
+
     try:
         return pd.DataFrame(df)
     except Exception:
         return None
 
+
 def _validar_columnas(base: pd.DataFrame, requeridas: List[str]) -> List[str]:
     return [c for c in requeridas if c not in base.columns]
+
 
 def _norm_colname(s: str) -> str:
     """Normaliza nombres de columna para matching robusto (sin acentos, sin espacios, upper)."""
     if s is None:
         return ""
+
     s = str(s)
     s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
-    s = s.strip().replace(" ", "").replace("_", "").upper()
+    s = s.strip().replace(" ", "").replace("_", "").replace(".", "").replace("-", "").upper()
     return s
+
+
+def _norm_value(s: Any) -> str:
+    """Normaliza valores para comparar textos de Excel de forma más segura."""
+    if pd.isna(s):
+        return ""
+
+    s = str(s)
+    s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
+    return " ".join(s.strip().upper().split())
+
+
+def _find_col(df: pd.DataFrame, nombres_posibles: List[str]) -> Optional[str]:
+    """Busca una columna en df comparando con normalización."""
+    if df is None or df.empty:
+        return None
+
+    mapa = {_norm_colname(c): c for c in df.columns}
+    for nombre in nombres_posibles:
+        key = _norm_colname(nombre)
+        if key in mapa:
+            return mapa[key]
+
+    return None
+
 
 def _seleccionar_columnas_case_insensitive(df: pd.DataFrame, cols_deseadas: List[str]) -> pd.DataFrame:
     """
@@ -70,6 +102,7 @@ def _seleccionar_columnas_case_insensitive(df: pd.DataFrame, cols_deseadas: List
 
     mapa = {_norm_colname(c): c for c in df.columns}
     seleccion = {}
+
     for c in cols_deseadas:
         key = _norm_colname(c)
         if key in mapa:
@@ -82,7 +115,67 @@ def _seleccionar_columnas_case_insensitive(df: pd.DataFrame, cols_deseadas: List
     for c in cols_deseadas:
         if c not in out.columns:
             out[c] = pd.NA
+
     return out[cols_deseadas]
+
+
+def _drop_columns_by_norm(df: pd.DataFrame, cols_a_eliminar: List[str]) -> pd.DataFrame:
+    """Elimina columnas por nombre normalizado, por ejemplo status/estatus aunque vengan en mayúsculas."""
+    if df is None or df.empty:
+        return df
+
+    keys_eliminar = {_norm_colname(c) for c in cols_a_eliminar}
+    columnas_finales = [c for c in df.columns if _norm_colname(c) not in keys_eliminar]
+    return df[columnas_finales].copy()
+
+
+def _rename_column_by_norm(df: pd.DataFrame, nombre_actual: str, nombre_nuevo: str) -> pd.DataFrame:
+    """Renombra una columna usando matching robusto."""
+    if df is None or df.empty:
+        return df
+
+    actual_key = _norm_colname(nombre_actual)
+    renames = {}
+
+    for c in df.columns:
+        if _norm_colname(c) == actual_key:
+            renames[c] = nombre_nuevo
+
+    if renames:
+        df = df.rename(columns=renames)
+
+    return df
+
+
+def _as_numeric_series(s: pd.Series) -> pd.Series:
+    return pd.to_numeric(s, errors="coerce")
+
+
+def _current_week_from_docente(df_docente: pd.DataFrame) -> Optional[int]:
+    """Obtiene la última semana disponible del docente en la hoja Datos."""
+    if df_docente is None or df_docente.empty or COL_SEMANA not in df_docente.columns:
+        return None
+
+    semanas = pd.to_numeric(df_docente[COL_SEMANA], errors="coerce").dropna()
+    if semanas.empty:
+        return None
+
+    return int(semanas.max())
+
+
+def _set_index_consecutivo(df: pd.DataFrame, inicio: int = 1) -> pd.DataFrame:
+    """
+    Hace que el número que Streamlit muestra antes de la primera columna
+    sea consecutivo: 1, 2, 3 ... n.
+    """
+    if df is None:
+        return pd.DataFrame()
+
+    out = df.copy().reset_index(drop=True)
+    out.index = range(inicio, inicio + len(out))
+    out.index.name = ""
+    return out
+
 
 def _grafica_semanal(sem_df: pd.DataFrame, titulo: str, color_hex: str = "#c3b08f") -> None:
     """
@@ -130,12 +223,16 @@ def _grafica_semanal(sem_df: pd.DataFrame, titulo: str, color_hex: str = "#c3b08
     fig.tight_layout()
     st.pyplot(fig)
 
+
 def _tabla_modulos_ultima_semana(df_docente: pd.DataFrame) -> pd.DataFrame:
     """Devuelve tabla con columnas solicitadas para la última semana disponible."""
     if df_docente is None or df_docente.shape[0] == 0:
         return pd.DataFrame(columns=["Modulo", "semestre", "no_com", "competentes", "total", "porcentaje_no_comp"])
 
-    ult_sem = int(pd.to_numeric(df_docente[COL_SEMANA], errors="coerce").dropna().astype(int).max())
+    ult_sem = _current_week_from_docente(df_docente)
+    if ult_sem is None:
+        return pd.DataFrame(columns=["Modulo", "semestre", "no_com", "competentes", "total", "porcentaje_no_comp"])
+
     df_u = df_docente[pd.to_numeric(df_docente[COL_SEMANA], errors="coerce").astype("Int64") == ult_sem].copy()
 
     agg = (
@@ -143,8 +240,10 @@ def _tabla_modulos_ultima_semana(df_docente: pd.DataFrame) -> pd.DataFrame:
         .sum(numeric_only=True)
         .reset_index()
     )
+
     agg["porcentaje_no_comp"] = agg.apply(
-        lambda r: (r[COL_NO_COMP] / r[COL_TOTAL] * 100) if r[COL_TOTAL] > 0 else 0.0, axis=1
+        lambda r: (r[COL_NO_COMP] / r[COL_TOTAL] * 100) if r[COL_TOTAL] > 0 else 0.0,
+        axis=1
     )
 
     agg = agg.rename(columns={
@@ -154,17 +253,22 @@ def _tabla_modulos_ultima_semana(df_docente: pd.DataFrame) -> pd.DataFrame:
         COL_COMPET: "competentes",
         COL_TOTAL:  "total",
     })
+
     agg = agg[["Modulo", "semestre", "no_com", "competentes", "total", "porcentaje_no_comp"]]
     agg["porcentaje_no_comp"] = agg["porcentaje_no_comp"].round(1)
+
     return agg
+
 
 # ====== helpers Excel ======
 def _slugify_filename(text: str) -> str:
     """Convierte 'José Pérez / 3A' -> 'Jose_Perez__3A' y limpia caracteres inválidos."""
     if not isinstance(text, str):
         text = str(text or "")
+
     text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
     return "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in text).strip("_")
+
 
 def _auto_width_xlsx(ws, df: pd.DataFrame, start_col=0):
     """Ajusta el ancho de columnas en xlsxwriter según contenido."""
@@ -173,12 +277,15 @@ def _auto_width_xlsx(ws, df: pd.DataFrame, start_col=0):
             max_len_vals = df[col].astype(str).map(len).max() if not df.empty else 0
         except Exception:
             max_len_vals = 0
+
         header_len = len(str(col))
         width = min(max(max_len_vals, header_len) + 2, 60)
+
         try:
             ws.set_column(idx, idx, width)
         except Exception:
             pass
+
 
 def _excel_comportamiento_bytes(
     *,
@@ -187,8 +294,12 @@ def _excel_comportamiento_bytes(
     semanas_df: pd.DataFrame,
     tabla_modulos_df: pd.DataFrame
 ) -> bytes:
-    """Crea un Excel con dos hojas: 'Comportamiento semanal' y 'Módulos última semana', más metadatos."""
+    """
+    Se conserva por compatibilidad, aunque ya no se muestra el botón
+    Crear/Descargar Excel del docente.
+    """
     buffer = io.BytesIO()
+
     try:
         writer = pd.ExcelWriter(buffer, engine="xlsxwriter")
     except Exception:
@@ -196,6 +307,7 @@ def _excel_comportamiento_bytes(
 
     with writer:
         hoja1 = "Comportamiento semanal"
+
         if semanas_df is not None and not semanas_df.empty:
             semanas_ord = semanas_df["semana"].dropna().astype(int).sort_values().tolist()
             sem_min = min(semanas_ord)
@@ -209,23 +321,33 @@ def _excel_comportamiento_bytes(
         meta1 = pd.DataFrame(
             {
                 "Campo": ["Plantel", "Docente", "Semana mínima", "Semana máxima", "Semanas con datos", "Nota"],
-                "Valor": [plantel, docente, sem_min, sem_max, sem_list_str,
-                          "El porcentaje corresponde a NO_COMP/TOTAL por semana."]
+                "Valor": [
+                    plantel,
+                    docente,
+                    sem_min,
+                    sem_max,
+                    sem_list_str,
+                    "El porcentaje corresponde a NO_COMP/TOTAL por semana."
+                ],
             }
         )
+
         meta1.to_excel(writer, sheet_name=hoja1, index=False, startrow=0)
 
         if semanas_df is not None and not semanas_df.empty:
             semanas_out = semanas_df.copy()
             semanas_out["porcentaje_no_comp"] = semanas_out.apply(
-                lambda r: (r["no_comp"] / r["total"] * 100) if r["total"] else 0.0, axis=1
+                lambda r: (r["no_comp"] / r["total"] * 100) if r["total"] else 0.0,
+                axis=1
             ).round(1)
+
             semanas_out = semanas_out[["semana", "no_comp", "total", "porcentaje_no_comp"]]
             startrow = len(meta1) + 2
             semanas_out.to_excel(writer, sheet_name=hoja1, index=False, startrow=startrow)
 
         wb = writer.book
         ws1 = writer.sheets[hoja1]
+
         try:
             fmt_bold = wb.add_format({"bold": True, "font_size": 12})
             ws1.write(0, 0, "Campo", fmt_bold)
@@ -239,81 +361,179 @@ def _excel_comportamiento_bytes(
         hoja2 = "Módulos última semana"
         meta2 = pd.DataFrame({"Campo": ["Plantel", "Docente"], "Valor": [plantel, docente]})
         meta2.to_excel(writer, sheet_name=hoja2, index=False, startrow=0)
+
         startrow2 = len(meta2) + 2
         tabla_out = tabla_modulos_df.copy() if tabla_modulos_df is not None else pd.DataFrame()
         tabla_out.to_excel(writer, sheet_name=hoja2, index=False, startrow=startrow2)
 
         ws2 = writer.sheets[hoja2]
+
         try:
             if fmt_bold is not None:
                 ws2.write(0, 0, "Campo", fmt_bold)
                 ws2.write(0, 1, "Valor", fmt_bold)
         except Exception:
             pass
+
         _auto_width_xlsx(ws2, tabla_out, start_col=0)
 
     buffer.seek(0)
     return buffer.getvalue()
 
+
 # =========================
-# NUEVO: Cargar SemCaptura
+# Cargar hojas auxiliares
 # =========================
 @st.cache_data
+def _cargar_hoja_excel(excel_path: str, sheet_name: str) -> pd.DataFrame:
+    """
+    Carga una hoja de Excel de forma robusta:
+    - intenta el nombre exacto;
+    - si falla, busca por nombre normalizado, por ejemplo Reprobación/Reprobacion.
+    """
+    try:
+        return pd.read_excel(excel_path, sheet_name=sheet_name)
+    except Exception:
+        pass
+
+    try:
+        xls = pd.ExcelFile(excel_path)
+        objetivo = _norm_colname(sheet_name)
+
+        for hoja in xls.sheet_names:
+            if _norm_colname(hoja) == objetivo:
+                return pd.read_excel(excel_path, sheet_name=hoja)
+    except Exception:
+        pass
+
+    return pd.DataFrame()
+
+
+@st.cache_data
 def _cargar_semcaptura(excel_path: str) -> pd.DataFrame:
-    try:
-        return pd.read_excel(excel_path, sheet_name=SHEET_SEMCAPTURA)
-    except Exception:
-        return pd.DataFrame()
+    return _cargar_hoja_excel(excel_path, SHEET_SEMCAPTURA)
 
-def _excel_semcaptura_bytes(
+
+@st.cache_data
+def _cargar_reprobacion(excel_path: str) -> pd.DataFrame:
+    return _cargar_hoja_excel(excel_path, SHEET_REPROBACION)
+
+
+def _preparar_semcaptura_docente(
+    semcaptura_raw: pd.DataFrame,
     *,
-    plantel: str,
-    docente: str,
-    df_semcaptura: pd.DataFrame
-) -> bytes:
+    sel_docente: str,
+    sel_plantel: Optional[str]
+) -> Tuple[pd.DataFrame, Optional[str]]:
     """
-    Crea un Excel con:
-      - metadatos (Plantel, Docente, Fecha)
-      - tabla SemCaptura filtrada (columnas requeridas)
+    Filtra SemCaptura por docente y plantel.
+    Retorna:
+    - DataFrame listo para mostrar.
+    - Mensaje de error/información si aplica.
     """
-    buffer = io.BytesIO()
-    try:
-        writer = pd.ExcelWriter(buffer, engine="xlsxwriter")
-    except Exception:
-        writer = pd.ExcelWriter(buffer)
+    if semcaptura_raw is None or semcaptura_raw.empty:
+        return pd.DataFrame(), "ℹ️ No se encontró información en la hoja 'SemCaptura' o está vacía."
 
-    with writer:
-        hoja = "Porcentaje de Captura"
-        wb = writer.book
+    col_docente_real = _find_col(semcaptura_raw, [COL_DOCENTE, "Docente"])
+    if not col_docente_real:
+        return pd.DataFrame(), "La hoja 'SemCaptura' no contiene una columna DOCENTE para poder filtrar."
 
-        # Metadatos
-        ahora = datetime.now().strftime("%Y-%m-%d %H:%M")
-        meta = pd.DataFrame(
-            {
-                "Campo": ["Plantel", "Docente", "Generado"],
-                "Valor": [plantel, docente, ahora],
-            }
-        )
-        meta.to_excel(writer, sheet_name=hoja, index=False, startrow=0)
+    df_sc = semcaptura_raw[
+        semcaptura_raw[col_docente_real].apply(_norm_value) == _norm_value(sel_docente)
+    ].copy()
 
-        startrow = len(meta) + 2
-        tabla_out = df_semcaptura.copy() if df_semcaptura is not None else pd.DataFrame(columns=SEMCAPTURA_COLS_REQUERIDAS)
-        tabla_out.to_excel(writer, sheet_name=hoja, index=False, startrow=startrow)
+    col_plantel_real = _find_col(semcaptura_raw, [COL_PLANTEL, "Plantel"])
+    if col_plantel_real and sel_plantel:
+        df_sc = df_sc[
+            df_sc[col_plantel_real].apply(_norm_value) == _norm_value(sel_plantel)
+        ].copy()
 
-        ws = writer.sheets[hoja]
-        try:
-            fmt_bold = wb.add_format({"bold": True, "font_size": 12})
-            ws.write(0, 0, "Campo", fmt_bold)
-            ws.write(0, 1, "Valor", fmt_bold)
-        except Exception:
-            pass
+    if df_sc.empty:
+        return pd.DataFrame(), f"ℹ️ No hay registros en 'SemCaptura' para el docente **{sel_docente}**."
 
-        # Ajustar anchos
-        _auto_width_xlsx(ws, meta, start_col=0)
-        _auto_width_xlsx(ws, tabla_out, start_col=0)
+    df_sc_out = _seleccionar_columnas_case_insensitive(df_sc, SEMCAPTURA_COLS_REQUERIDAS)
 
-    buffer.seek(0)
-    return buffer.getvalue()
+    return df_sc_out.reset_index(drop=True), None
+
+
+def _preparar_reprobacion_docente(
+    reprobacion_raw: pd.DataFrame,
+    *,
+    sel_docente: str,
+    sel_plantel: Optional[str],
+    semana_actual: Optional[int]
+) -> Tuple[pd.DataFrame, Optional[str]]:
+    """
+    Filtra la hoja Reprobacion por docente, plantel y semana actual.
+
+    Ajustes solicitados:
+    - El título se genera aparte con el conteo.
+    - No mostrar campo status/estatus.
+    - Campo MINIMO se renombra a 'Porcentaje Mínimo para aprobar'.
+    - El índice visible de la tabla debe iniciar en 1 y ser consecutivo hasta n.
+    """
+    if reprobacion_raw is None or reprobacion_raw.empty:
+        return pd.DataFrame(), "ℹ️ No se encontró información en la hoja 'Reprobacion' o está vacía."
+
+    col_docente_real = _find_col(reprobacion_raw, [COL_DOCENTE, "Docente"])
+    if not col_docente_real:
+        return pd.DataFrame(), "La hoja 'Reprobacion' no contiene una columna DOCENTE para poder filtrar."
+
+    df_rep = reprobacion_raw[
+        reprobacion_raw[col_docente_real].apply(_norm_value) == _norm_value(sel_docente)
+    ].copy()
+
+    col_plantel_real = _find_col(reprobacion_raw, [COL_PLANTEL, "Plantel"])
+    if col_plantel_real and sel_plantel:
+        df_rep = df_rep[
+            df_rep[col_plantel_real].apply(_norm_value) == _norm_value(sel_plantel)
+        ].copy()
+
+    # Si existe columna Semana en Reprobacion, se filtra por la semana actual del docente.
+    col_semana_real = _find_col(reprobacion_raw, [COL_SEMANA, "Semana"])
+    if col_semana_real and semana_actual is not None:
+        df_rep = df_rep[
+            pd.to_numeric(df_rep[col_semana_real], errors="coerce").astype("Int64") == int(semana_actual)
+        ].copy()
+
+    if df_rep.empty:
+        if semana_actual is not None:
+            return pd.DataFrame(), (
+                f"ℹ️ No hay registros en 'Reprobacion' para el docente **{sel_docente}** "
+                f"en la semana **{semana_actual}**."
+            )
+        return pd.DataFrame(), f"ℹ️ No hay registros en 'Reprobacion' para el docente **{sel_docente}**."
+
+    # No mostrar status/estatus.
+    df_rep = _drop_columns_by_norm(df_rep, ["status", "estatus"])
+
+    # MINIMO debe decir Porcentaje Mínimo para aprobar.
+    df_rep = _rename_column_by_norm(
+        df_rep,
+        "MINIMO",
+        "Porcentaje Mínimo para aprobar"
+    )
+
+    # El número antes de Plantel debe ser consecutivo desde 1 hasta n.
+    df_rep = _set_index_consecutivo(df_rep, inicio=1)
+
+    return df_rep, None
+
+
+def _contar_estudiantes_no_competentes(df_rep_out: pd.DataFrame) -> int:
+    """
+    Cuenta estudiantes para el encabezado.
+    Si existe matrícula, cuenta matrículas únicas; si no existe, cuenta filas.
+    """
+    if df_rep_out is None or df_rep_out.empty:
+        return 0
+
+    col_matricula = _find_col(df_rep_out, ["matricula", "matrícula", "MATRICULA"])
+    if col_matricula:
+        return int(df_rep_out[col_matricula].dropna().astype(str).str.strip().nunique())
+
+    return int(len(df_rep_out))
+
 
 # ------------------ interfaz pública ------------------
 def mostrar(
@@ -325,13 +545,13 @@ def mostrar(
     Usa EXCLUSIVAMENTE la hoja 'Datos' (df) para:
       - Graficar NO COMPETENTES por semana (% sobre TOTAL).
       - Mostrar la tabla de módulos del docente (última semana).
-      - Generar Excel con ambas secciones + semanas transcurridas.
 
     Además:
-      - Mostrar tabla SemCaptura filtrada por docente (y plantel si aplica).
-      - Botón de Excel: "Descarga Porcentaje de Captura".
+      - Mostrar tabla SemCaptura filtrada por docente/plantel.
+      - Mostrar tabla Reprobacion filtrada por docente/plantel/semana actual.
     """
     base = _to_pandas(df)
+
     if base is None or base.shape[0] == 0:
         st.warning("No hay datos para mostrar.")
         return
@@ -341,36 +561,60 @@ def mostrar(
         base,
         [COL_PLANTEL, COL_DOCENTE, COL_SEMANA, COL_NO_COMP, COL_COMPET, COL_TOTAL, COL_MODULO, COL_SEMESTRE]
     )
+
     if faltantes:
         st.error("Faltan columnas requeridas en 'Datos': " + ", ".join(faltantes))
+
         with st.expander("Columnas disponibles"):
             st.write(list(base.columns))
+
         return
 
     # ---------- selección de plantel ----------
     if es_admin:
         planteles = sorted(base[COL_PLANTEL].dropna().astype(str).unique().tolist())
+
+        if not planteles:
+            st.info("No hay planteles disponibles.")
+            return
+
         default_idx = planteles.index(plantel_usuario) if plantel_usuario in planteles else 0
+
         sel_plantel = st.selectbox(
-            "Selecciona un plantel", planteles, index=default_idx, key="cmp_sel_plantel_comportamiento"
+            "Selecciona un plantel",
+            planteles,
+            index=default_idx,
+            key="cmp_sel_plantel_comportamiento"
         )
     else:
         sel_plantel = plantel_usuario
-        st.text_input("Plantel", sel_plantel or "", disabled=True, key="cmp_plantel_ro_comportamiento")
+        st.text_input(
+            "Plantel",
+            sel_plantel or "",
+            disabled=True,
+            key="cmp_plantel_ro_comportamiento"
+        )
 
     df_plantel = base[base[COL_PLANTEL].astype(str) == str(sel_plantel)].copy() if sel_plantel else base.copy()
 
     # ---------- selección de docente ----------
     docentes = sorted(df_plantel[COL_DOCENTE].dropna().astype(str).unique().tolist())
+
     if not docentes:
         st.info("No hay docentes para el plantel seleccionado.")
         return
 
-    sel_docente = st.selectbox("Selecciona un docente", docentes, key="cmp_sel_docente_comportamiento")
+    sel_docente = st.selectbox(
+        "Selecciona un docente",
+        docentes,
+        key="cmp_sel_docente_comportamiento"
+    )
+
     df_docente = df_plantel[df_plantel[COL_DOCENTE].astype(str) == str(sel_docente)].copy()
 
     # ================== Gráfica semanal (desde 'Datos') ==================
     df_docente[COL_SEMANA] = pd.to_numeric(df_docente[COL_SEMANA], errors="coerce").astype("Int64")
+
     sem = (
         df_docente
         .groupby(COL_SEMANA, dropna=False)[[COL_NO_COMP, COL_TOTAL]]
@@ -379,82 +623,78 @@ def mostrar(
         .dropna(subset=[COL_SEMANA])
         .sort_values(COL_SEMANA)
     )
-    sem = sem.rename(columns={COL_SEMANA: "semana", COL_NO_COMP: "no_comp", COL_TOTAL: "total"})
-    _grafica_semanal(sem, titulo=f"Comportamiento semanal - {sel_docente}", color_hex="#c3b08f")
+
+    sem = sem.rename(columns={
+        COL_SEMANA: "semana",
+        COL_NO_COMP: "no_comp",
+        COL_TOTAL: "total"
+    })
+
+    _grafica_semanal(
+        sem,
+        titulo=f"Comportamiento semanal - {sel_docente}",
+        color_hex="#c3b08f"
+    )
 
     # ================== Tabla de módulos (última semana) ==================
     st.markdown("**Módulos que ofrece el docente (última semana disponible)**")
+
     tabla = _tabla_modulos_ultima_semana(df_docente)
     st.dataframe(tabla, use_container_width=True)
 
-    # ================== Botón Excel (docente) ==================
-    docente_slug = _slugify_filename(sel_docente)
-    nombre_excel = f"{docente_slug}_comportamiento.xlsx"
-    excel_bytes = _excel_comportamiento_bytes(
-        plantel=str(sel_plantel or ""),
-        docente=str(sel_docente or ""),
-        semanas_df=sem,
-        tabla_modulos_df=tabla,
-    )
-    st.download_button(
-        label="⬇️ Crear/Descargar Excel del docente",
-        data=excel_bytes,
-        file_name=nombre_excel,
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        help="Genera un Excel con el comportamiento semanal y la tabla de módulos de la última semana.",
-        key="cmp_btn_excel_docente"
-    )
+    # IMPORTANTE:
+    # Se eliminó el apartado "Resumen del docente seleccionado".
+    # Se eliminó el botón "Crear/Descargar Excel del docente".
 
-    # ============================================================
-    # NUEVO: Tabla SemCaptura (filtrada por docente) + Excel
-    # (Se coloca DESPUÉS del botón Excel, como pediste)
-    # ============================================================
+    # ================== Tabla SemCaptura ==================
     st.markdown("---")
     st.subheader("📋 Porcentaje de captura de evaluaciones.")
 
     semcaptura_raw = _cargar_semcaptura(EXCEL_PATH_DEFAULT)
-    if semcaptura_raw is None or semcaptura_raw.empty:
-        st.info("ℹ️ No se encontró información en la hoja 'SemCaptura' o está vacía.")
-        return
-
-    # Buscar columna DOCENTE en SemCaptura
-    map_cols = {_norm_colname(c): c for c in semcaptura_raw.columns}
-    col_docente_real = map_cols.get(_norm_colname(COL_DOCENTE))
-    if not col_docente_real:
-        st.error("La hoja 'SemCaptura' no contiene una columna DOCENTE para poder filtrar.")
-        with st.expander("Columnas disponibles en SemCaptura"):
-            st.write(list(semcaptura_raw.columns))
-        return
-
-    # Filtrar por docente seleccionado
-    df_sc = semcaptura_raw[semcaptura_raw[col_docente_real].astype(str) == str(sel_docente)].copy()
-
-    # Si SemCaptura trae Plantel, filtrar también por plantel seleccionado
-    col_plantel_real = map_cols.get(_norm_colname(COL_PLANTEL))
-    if col_plantel_real and sel_plantel:
-        df_sc = df_sc[df_sc[col_plantel_real].astype(str) == str(sel_plantel)].copy()
-
-    if df_sc.empty:
-        st.info(f"ℹ️ No hay registros en 'SemCaptura' para el docente **{sel_docente}**.")
-        return
-
-    # Seleccionar SOLO las columnas solicitadas (robusto)
-    df_sc_out = _seleccionar_columnas_case_insensitive(df_sc, SEMCAPTURA_COLS_REQUERIDAS)
-
-    # Mostrar tabla
-    st.dataframe(df_sc_out, use_container_width=True, height=380)
-
-    # ✅ Botón Excel solicitado
-    excel_pc = _excel_semcaptura_bytes(
-        plantel=str(sel_plantel or ""),
-        docente=str(sel_docente or ""),
-        df_semcaptura=df_sc_out
+    df_sc_out, msg_sc = _preparar_semcaptura_docente(
+        semcaptura_raw,
+        sel_docente=str(sel_docente or ""),
+        sel_plantel=str(sel_plantel or "") if sel_plantel else None,
     )
-    st.download_button(
-        label="Descarga Porcentaje de Captura",
-        data=excel_pc,
-        file_name=f"{docente_slug}_porcentaje_captura.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        help="Descarga un Excel con la selección mostrada (SemCaptura) para el docente seleccionado.",
-        key="cmp_btn_excel_semcaptura"
+
+    if msg_sc:
+        if msg_sc.startswith("La hoja"):
+            st.error(msg_sc)
+
+            if semcaptura_raw is not None and not semcaptura_raw.empty:
+                with st.expander("Columnas disponibles en SemCaptura"):
+                    st.write(list(semcaptura_raw.columns))
+        else:
+            st.info(msg_sc)
+    else:
+        st.dataframe(df_sc_out, use_container_width=True, height=380)
+
+    # IMPORTANTE:
+    # Se eliminó el botón "Descarga Porcentaje de Captura",
+    # porque la tabla de Streamlit permite descargar datos desde el menú de la tabla.
+
+    # ================== Tabla Reprobacion ==================
+    semana_actual = _current_week_from_docente(df_docente)
+    semana_texto = str(semana_actual) if semana_actual is not None else "actual"
+
+    reprobacion_raw = _cargar_reprobacion(EXCEL_PATH_DEFAULT)
+    df_rep_out, msg_rep = _preparar_reprobacion_docente(
+        reprobacion_raw,
+        sel_docente=str(sel_docente or ""),
+        sel_plantel=str(sel_plantel or "") if sel_plantel else None,
+        semana_actual=semana_actual,
     )
+
+    if msg_rep:
+        st.info(msg_rep)
+        return
+
+    no_estudiantes = _contar_estudiantes_no_competentes(df_rep_out)
+
+    st.markdown(
+        f"### 📋 {no_estudiantes} Estudiantes NO Competentes en la semana {semana_texto}"
+    )
+
+    # El índice de esta tabla queda como 1, 2, 3... n
+    # para evitar que aparezcan índices originales como 20993, 21023, etc.
+    st.dataframe(df_rep_out, use_container_width=True, height=420)
