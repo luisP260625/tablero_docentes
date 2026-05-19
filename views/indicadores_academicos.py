@@ -1,14 +1,17 @@
 # views/indicadores_academicos_v2.py
 import os
 import re
+import math
 import smtplib
 import unicodedata
 from io import BytesIO
+from html import escape
 from datetime import datetime
 from email.message import EmailMessage
 
 import pandas as pd
 import plotly.graph_objects as go
+import plotly.io as pio
 from plotly.subplots import make_subplots
 import streamlit as st
 
@@ -21,6 +24,8 @@ LABEL_FONT_SIZE_PLANTEL = 15
 Y_AXIS_PADDING_MULT = 1.35
 
 PERM_SEND_EMAIL_CODE = "SEND_EMAIL_INDICADORES"
+EMAIL_META_MAX_NO_COMP_PCT = 10.0
+EMAIL_META_SEMANA_OBJETIVO = 18
 
 EXCEL_PATH = "assets/Datos1.xlsx"
 CACHE_DIR = "assets/cache_indicadores"
@@ -37,6 +42,16 @@ REPROBACION_COLS = [
 
 MATRICULA_COLS = ["Plantel", "matriculaTotal"]
 METRICAS_ORDEN = ["pEspecifico", "pAlcanzado", "pRelativo"]
+
+# Columnas que se conservan para cálculos internos, pero se ocultan en la tabla final
+# solicitada para impresión/atención. Esto evita romper funciones como
+# "sin registro de calificaciones", que dependen de pEspecifico.
+COLUMNAS_METRICAS_OCULTAS_PRESENTACION = [
+    "pEspecifico", "pAlcanzado", "pRelativo",
+    "PEspecifico", "PAlcanzado", "pRelativo",
+    "pEspecifico_min", "pAlcanzado_min", "pRelativo_min",
+    "PEspecifico_min", "PAlcanzado_min", "pRelativo_min",
+]
 
 # Categorías usadas para identificar estudiantes por cantidad de módulos NO competentes.
 # Se mantiene el mismo criterio del resumen: 1, 2, 3... 10 y 11 o más.
@@ -84,6 +99,20 @@ def _find_col_like(df, candidates):
             if lo == c or c in lo:
                 return orig
     return None
+
+
+def ocultar_columnas_metricas_presentacion(df):
+    """
+    Oculta columnas de porcentaje/ponderación en vistas finales sin eliminarlas
+    del flujo de cálculo. Se usa únicamente para presentación/exportación final.
+    """
+    if df is None:
+        return df
+
+    d = df.copy()
+    ocultas = {_norm_txt(c) for c in COLUMNAS_METRICAS_OCULTAS_PRESENTACION}
+    columnas_a_ocultar = [c for c in d.columns if _norm_txt(c) in ocultas]
+    return d.drop(columns=columnas_a_ocultar, errors="ignore")
 
 
 def _wk_key(v):
@@ -439,7 +468,7 @@ def construir_resumen_estudiantes_por_modulos(df_detalle):
         return pd.DataFrame()
 
     if "matricula" not in d.columns:
-        return d.copy()
+        return ocultar_columnas_metricas_presentacion(d.copy())
 
     group_cols = ["matricula"]
     if "Plantel" in d.columns:
@@ -455,25 +484,19 @@ def construir_resumen_estudiantes_por_modulos(df_detalle):
     if "DOCENTE" in d.columns:
         agg["DOCENTE"] = _join_unique_values
 
-    for col in METRICAS_ORDEN:
-        if col in d.columns:
-            agg[col] = "min"
-
+    # Las métricas pEspecifico, pAlcanzado y pRelativo se conservan en df_detalle
+    # para cálculos internos, pero no se agregan a la tabla final solicitada.
     resumen = d.groupby(group_cols, dropna=False).agg(agg).reset_index()
 
     rename_map = {
         "MODULO": "MODULOS_NO_COMPETENTES",
         "DOCENTE": "DOCENTES_RELACIONADOS",
-        "pEspecifico": "pEspecifico_min",
-        "pAlcanzado": "pAlcanzado_min",
-        "pRelativo": "pRelativo_min",
     }
     resumen = resumen.rename(columns=rename_map)
 
     orden = [
         "Plantel", "ESTUDIANTE", "matricula", "CARRERA", "grado", "cvegrupo",
-        "modulos_nc", "categoria_modulos_nc", "MODULOS_NO_COMPETENTES", "DOCENTES_RELACIONADOS",
-        "pEspecifico_min", "pAlcanzado_min", "pRelativo_min"
+        "modulos_nc", "categoria_modulos_nc", "MODULOS_NO_COMPETENTES", "DOCENTES_RELACIONADOS"
     ]
     orden = [c for c in orden if c in resumen.columns]
     resto = [c for c in resumen.columns if c not in orden]
@@ -486,7 +509,7 @@ def construir_resumen_estudiantes_por_modulos(df_detalle):
             ascending[sort_cols.index("modulos_nc")] = False
         resumen = resumen.sort_values(sort_cols, ascending=ascending).reset_index(drop=True)
 
-    return resumen
+    return ocultar_columnas_metricas_presentacion(resumen)
 
 
 def construir_resumen_categorias_modulos(df_detalle):
@@ -586,31 +609,17 @@ def render_seccion_impresion_por_modulos(plantel_sel, key_prefix="modulos_nc"):
         st.info("No hay estudiantes para la categoría seleccionada.")
         return
 
-    tab_resumen, tab_detalle = st.tabs(["👤 Resumen por estudiante", "📚 Detalle por módulo"])
-
-    with tab_resumen:
-        st.caption(
-            "Vista recomendada para impresión de atención: una fila por estudiante con sus módulos y docentes relacionados."
-        )
-        mostrar_dataframe_preview(df_resumen_estudiantes, height=430)
-        render_botones_descarga_detalle(
-            df_resumen_estudiantes,
-            plantel_sel,
-            tipo="resumen_por_modulos_no_competentes",
-            key_prefix=f"{key_prefix}_resumen_{_safe_download_name(categorias_label)}"
-        )
-
-    with tab_detalle:
-        st.caption(
-            "Vista completa: conserva cada registro/módulo académico original y agrega la cantidad total de módulos NO competentes del estudiante."
-        )
-        mostrar_dataframe_preview(df_detalle_filtrado, height=520)
-        render_botones_descarga_detalle(
-            df_detalle_filtrado,
-            plantel_sel,
-            tipo="detalle_por_modulos_no_competentes",
-            key_prefix=f"{key_prefix}_detalle_{_safe_download_name(categorias_label)}"
-        )
+    st.caption(
+        "Tabla final para impresión de atención: una fila por estudiante con sus módulos y docentes relacionados."
+    )
+    df_resumen_estudiantes = ocultar_columnas_metricas_presentacion(df_resumen_estudiantes)
+    mostrar_dataframe_preview(df_resumen_estudiantes, height=430)
+    render_botones_descarga_detalle(
+        df_resumen_estudiantes,
+        plantel_sel,
+        tipo="resumen_por_modulos_no_competentes",
+        key_prefix=f"{key_prefix}_resumen_{_safe_download_name(categorias_label)}"
+    )
 
 
 def _mapear_columnas_seguimiento(df):
@@ -683,6 +692,79 @@ def obtener_etiqueta_semana_mas_reciente(df):
     return None
 
 
+def _obtener_matricula_total_plantel(plantel_usuario):
+    """Devuelve la matrícula total del plantel para validar/calcular porcentajes."""
+    try:
+        df_matricula = cargar_matricula()
+    except Exception:
+        return 0.0
+
+    if df_matricula is None or getattr(df_matricula, "empty", True):
+        return 0.0
+
+    col_plantel = _find_col_like(df_matricula, ["Plantel"])
+    col_matricula = _find_col_like(df_matricula, ["matriculaTotal", "Matrícula Total", "matricula total"])
+
+    if not col_plantel or not col_matricula:
+        return 0.0
+
+    objetivo = str(plantel_usuario).strip().lower()
+    dfp = df_matricula[
+        df_matricula[col_plantel].astype(str).str.strip().str.lower() == objetivo
+    ].copy()
+
+    if dfp.empty:
+        return 0.0
+
+    return float(pd.to_numeric(dfp[col_matricula], errors="coerce").fillna(0).sum())
+
+
+def _normalizar_porcentaje_seguimiento(df_semana, plantel_usuario=None):
+    """
+    Corrige el porcentaje del seguimiento semanal sin alterar las cantidades.
+
+    Pandas suele leer las celdas de Excel con formato porcentaje como fracciones:
+    22.21% puede llegar como 0.2221. Esta función detecta ese caso y lo
+    convierte a escala 0-100 para que la gráfica muestre 22.21% y no 0.22%.
+
+    Si existe matrícula del plantel, se usa como referencia para evitar falsos
+    positivos cuando un porcentaje real sea menor a 1%.
+    """
+    if df_semana is None or getattr(df_semana, "empty", True) or "Porcentaje" not in df_semana.columns:
+        return df_semana
+
+    out = df_semana.copy()
+    valores = pd.to_numeric(out["Porcentaje"], errors="coerce")
+
+    max_abs = valores.abs().max(skipna=True)
+    if pd.isna(max_abs):
+        out["Porcentaje"] = 0.0
+        return out
+
+    matricula = _obtener_matricula_total_plantel(plantel_usuario) if plantel_usuario else 0.0
+
+    if matricula > 0 and "Cantidad" in out.columns:
+        cantidades = pd.to_numeric(out["Cantidad"], errors="coerce")
+        pct_calculado = (cantidades / matricula) * 100.0
+        validos = valores.notna() & pct_calculado.notna()
+
+        if max_abs == 0 and pct_calculado.fillna(0).abs().max() > 0:
+            valores = pct_calculado
+        elif max_abs <= 1 and validos.any():
+            diferencia_directa = (valores[validos] - pct_calculado[validos]).abs().median()
+            diferencia_escalada = ((valores[validos] * 100.0) - pct_calculado[validos]).abs().median()
+
+            if diferencia_escalada < diferencia_directa:
+                valores = valores * 100.0
+        elif max_abs <= 1:
+            valores = valores * 100.0
+    elif max_abs <= 1:
+        valores = valores * 100.0
+
+    out["Porcentaje"] = valores.replace([float("inf"), -float("inf")], 0).fillna(0).round(2)
+    return out
+
+
 @st.cache_data(show_spinner=False)
 def obtener_seguimiento_plantel(plantel_usuario):
     df_seguimiento = cargar_seguimiento()
@@ -722,7 +804,7 @@ def obtener_seguimiento_plantel(plantel_usuario):
         rows.append({
             "Semana": semana,
             "Cantidad": int(round(float(cantidad))) if pd.notna(cantidad) else 0,
-            "Porcentaje": round(float(porcentaje), 2) if pd.notna(porcentaje) else 0.0,
+            "Porcentaje": float(porcentaje) if pd.notna(porcentaje) else 0.0,
             "Semana_num": meta.get("week_num") or 0,
         })
 
@@ -731,6 +813,7 @@ def obtener_seguimiento_plantel(plantel_usuario):
         return pd.DataFrame(columns=["Semana", "Cantidad", "Porcentaje", "Etiqueta"])
 
     df_semana = df_semana.sort_values("Semana_num").reset_index(drop=True)
+    df_semana = _normalizar_porcentaje_seguimiento(df_semana, plantel_usuario)
     df_semana["Etiqueta"] = df_semana.apply(
         lambda r: f"{int(r['Cantidad'])} - {float(r['Porcentaje']):.2f}%",
         axis=1
@@ -831,11 +914,11 @@ def _render_cards_resumen(items):
             )
 
 
-def mostrar_grafica_seguimiento_plantel(plantel_objetivo, show_title=True, show_footer=True):
+def construir_figura_seguimiento_plantel(plantel_objetivo, show_title=True):
     seguimiento_plantel = obtener_seguimiento_plantel(plantel_objetivo)
 
     if seguimiento_plantel is None or seguimiento_plantel.empty:
-        return False
+        return None, seguimiento_plantel
 
     fig = make_subplots(specs=[[{"secondary_y": True}]])
     fig.add_trace(
@@ -873,7 +956,7 @@ def mostrar_grafica_seguimiento_plantel(plantel_objetivo, show_title=True, show_
     max_porcentaje = float(seguimiento_plantel["Porcentaje"].max()) if not seguimiento_plantel.empty else 0
 
     fig.update_layout(
-        title=f"Comportamiento semanal — {plantel_objetivo}" if show_title else None,
+        title_text=f"Comportamiento semanal — {plantel_objetivo}" if show_title else "",
         height=560,
         hovermode=False,
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
@@ -906,6 +989,26 @@ def mostrar_grafica_seguimiento_plantel(plantel_objetivo, show_title=True, show_
         range=[0, max_porcentaje * Y_AXIS_PADDING_MULT if max_porcentaje else 1],
         secondary_y=True,
     )
+
+    return fig, seguimiento_plantel
+
+
+def generar_imagen_grafica_seguimiento(plantel_objetivo):
+    fig, _ = construir_figura_seguimiento_plantel(plantel_objetivo, show_title=True)
+    if fig is None:
+        return None
+
+    try:
+        return pio.to_image(fig, format="png", width=1400, height=700, scale=2)
+    except Exception:
+        return None
+
+
+def mostrar_grafica_seguimiento_plantel(plantel_objetivo, show_title=True, show_footer=True):
+    fig, seguimiento_plantel = construir_figura_seguimiento_plantel(plantel_objetivo, show_title=show_title)
+
+    if fig is None or seguimiento_plantel is None or seguimiento_plantel.empty:
+        return False
 
     st.plotly_chart(fig, use_container_width=True)
 
@@ -1452,6 +1555,358 @@ def render_botones_descarga_detalle(df, plantel_sel, tipo="no_competentes", key_
 
 
 # =========================
+# Análisis de seguimiento para correo
+# =========================
+def _obtener_valor_fila(fila_df, col, default=0):
+    if fila_df is None or getattr(fila_df, "empty", True) or col not in fila_df.columns:
+        return default
+    try:
+        valor = fila_df[col].iloc[0]
+        if pd.isna(valor):
+            return default
+        return valor
+    except Exception:
+        return default
+
+
+def _construir_metas_semanales(total_actual, meta_maxima, semana_actual, semana_meta):
+    if semana_actual is None or semana_meta is None or semana_actual >= semana_meta or total_actual <= meta_maxima:
+        return []
+
+    semanas_restantes = int(semana_meta - semana_actual)
+    reduccion_total = max(int(total_actual) - int(meta_maxima), 0)
+    if semanas_restantes <= 0 or reduccion_total <= 0:
+        return []
+
+    reduccion_promedio = reduccion_total / semanas_restantes
+    metas = []
+    for paso in range(1, semanas_restantes + 1):
+        semana = int(semana_actual + paso)
+        meta_semana = math.ceil(total_actual - (reduccion_promedio * paso))
+        meta_semana = max(int(meta_maxima), int(meta_semana))
+        metas.append((semana, meta_semana))
+    return metas
+
+
+def construir_analisis_seguimiento_plantel(plantel, tabla, total_sin_calif=0, semana_meta=EMAIL_META_SEMANA_OBJETIVO, meta_pct=EMAIL_META_MAX_NO_COMP_PCT):
+    fila_p = tabla[tabla["Plantel"] == plantel].copy()
+
+    matricula = int(_obtener_valor_fila(fila_p, "matriculaTotal", 0) or 0)
+    total_no_comp = int(_obtener_valor_fila(fila_p, "Total estudiantes no competentes", 0) or 0)
+    porcentaje_actual = float(_obtener_valor_fila(fila_p, "% Estudiantes no competentes", 0.0) or 0.0)
+
+    meta_maxima = int(math.ceil(matricula * (meta_pct / 100.0))) if matricula > 0 else 0
+    faltan_regularizar = max(total_no_comp - meta_maxima, 0)
+
+    seguimiento = obtener_seguimiento_plantel(plantel)
+    semana_actual = None
+    reduccion_absoluta = 0
+    reduccion_porcentual = 0.0
+    ha_accionado = False
+
+    if seguimiento is not None and not seguimiento.empty:
+        if "Semana_num" in seguimiento.columns and seguimiento["Semana_num"].notna().any():
+            semana_actual = int(seguimiento["Semana_num"].dropna().iloc[-1])
+
+        cantidad_inicial = int(seguimiento["Cantidad"].iloc[0])
+        cantidad_actual = int(seguimiento["Cantidad"].iloc[-1])
+        reduccion_absoluta = max(cantidad_inicial - cantidad_actual, 0)
+        reduccion_porcentual = round((reduccion_absoluta / cantidad_inicial) * 100, 2) if cantidad_inicial > 0 else 0.0
+        ha_accionado = cantidad_actual < cantidad_inicial
+
+    semanas_restantes = None
+    promedio_semanal_necesario = 0
+    if semana_actual is not None:
+        semanas_restantes = max(int(semana_meta - semana_actual), 0)
+        if semanas_restantes > 0 and faltan_regularizar > 0:
+            promedio_semanal_necesario = int(math.ceil(faltan_regularizar / semanas_restantes))
+
+    uno_modulo = int(_obtener_valor_fila(fila_p, "1", 0) or 0)
+    dos_modulos = int(_obtener_valor_fila(fila_p, "2", 0) or 0)
+
+    tendencia = _datos_tendencia_seguimiento(seguimiento)
+    metas_semanales = _construir_metas_semanales(total_no_comp, meta_maxima, semana_actual, semana_meta)
+
+    if faltan_regularizar <= 0:
+        dictamen = (
+            f"El plantel ya se encuentra dentro del parámetro esperado, con {porcentaje_actual:.2f}% de no competencia, "
+            f"igual o menor al {meta_pct:.0f}% permitido."
+        )
+    else:
+        accion_texto = "sí muestra evidencia de haber accionado" if ha_accionado else "no muestra una reducción acumulada suficiente"
+        dictamen = (
+            f"El plantel {accion_texto}; actualmente registra {total_no_comp:,} estudiantes no competentes "
+            f"({porcentaje_actual:.2f}% de su matrícula). Para llegar al {meta_pct:.0f}% como máximo en la semana "
+            f"{semana_meta}, debe regularizar al menos {faltan_regularizar:,} estudiantes adicionales."
+        )
+
+    recomendaciones = []
+    if faltan_regularizar > 0:
+        if promedio_semanal_necesario > 0 and semanas_restantes is not None:
+            recomendaciones.append(
+                f"Establecer una meta operativa de al menos {promedio_semanal_necesario:,} estudiantes regularizados por semana durante las próximas {semanas_restantes} semana(s)."
+            )
+        recomendaciones.append(
+            f"Priorizar a los estudiantes con 1 y 2 módulos no competentes ({uno_modulo:,} y {dos_modulos:,} casos, respectivamente), ya que representan la oportunidad de recuperación más inmediata."
+        )
+        if total_sin_calif > 0:
+            recomendaciones.append(
+                f"Regularizar de inmediato los {int(total_sin_calif):,} estudiantes sin evaluación en algún módulo para evitar que permanezcan dentro del indicador."
+            )
+        recomendaciones.append(
+            "Dar seguimiento puntual a los módulos y docentes con mayor porcentaje de no competencia para focalizar las acciones académicas y de acompañamiento."
+        )
+        recomendaciones.append(
+            "Revisar semanalmente el avance contra la meta y ajustar la intervención si se detecta estancamiento o retroceso."
+        )
+    else:
+        recomendaciones.append(
+            "Mantener el seguimiento semanal y las acciones preventivas para no rebasar nuevamente el umbral del 10% de no competencia."
+        )
+
+    return {
+        "seguimiento": seguimiento,
+        "matricula": matricula,
+        "total_no_comp": total_no_comp,
+        "porcentaje_actual": porcentaje_actual,
+        "meta_maxima": meta_maxima,
+        "faltan_regularizar": faltan_regularizar,
+        "semana_actual": semana_actual,
+        "semana_meta": semana_meta,
+        "semanas_restantes": semanas_restantes,
+        "promedio_semanal_necesario": promedio_semanal_necesario,
+        "ha_accionado": ha_accionado,
+        "reduccion_absoluta": reduccion_absoluta,
+        "reduccion_porcentual": reduccion_porcentual,
+        "tendencia": tendencia,
+        "dictamen": dictamen,
+        "recomendaciones": recomendaciones,
+        "uno_modulo": uno_modulo,
+        "dos_modulos": dos_modulos,
+        "metas_semanales": metas_semanales,
+    }
+
+
+def _render_metas_semanales_texto(metas):
+    if not metas:
+        return ""
+    lines = ["Metas semanales sugeridas para llegar al 10%:"]
+    for semana, meta in metas:
+        lines.append(f"- Semana {int(semana)}: máximo {int(meta):,} estudiantes no competentes")
+    return "\n".join(lines)
+
+
+def _render_metas_semanales_html(metas):
+    if not metas:
+        return ""
+
+    rows = []
+    for semana, meta in metas:
+        rows.append(
+            f"<tr><td style='padding:8px;border:1px solid #D0D5DD;'>Semana {int(semana)}</td>"
+            f"<td style='padding:8px;border:1px solid #D0D5DD;text-align:right;'>{int(meta):,}</td></tr>"
+        )
+
+    return (
+        "<p><strong>Metas semanales sugeridas para llegar al 10%:</strong></p>"
+        "<table style='border-collapse:collapse;width:100%;max-width:420px;'>"
+        "<thead><tr>"
+        "<th style='padding:8px;border:1px solid #D0D5DD;background:#F2F4F7;text-align:left;'>Semana</th>"
+        "<th style='padding:8px;border:1px solid #D0D5DD;background:#F2F4F7;text-align:right;'>Máximo de estudiantes no competentes</th>"
+        "</tr></thead><tbody>"
+        + "".join(rows) + "</tbody></table>"
+    )
+
+
+def _render_top_semestres_html(top_dict, semana_usada):
+    orden = [2, 4, 6]
+    parts = ["<p><strong>Módulos con mayor % de NO competencia por semestre:</strong></p><ul>"]
+    for sem in orden:
+        items = top_dict.get(sem, [])
+        if not items:
+            parts.append(f"<li>Semestre {sem}: sin datos.</li>")
+        else:
+            detalle = ", ".join(f"{escape(mod)} ({pct:.2f}%)" for mod, pct in items)
+            parts.append(f"<li>Semestre {sem}: {detalle}</li>")
+    parts.append("</ul>")
+    if semana_usada is not None:
+        parts.append(f"<p><strong>Semana utilizada para módulos:</strong> {escape(str(semana_usada))}</p>")
+    return "".join(parts)
+
+
+def _render_top_docentes_html(top_list, semana_usada):
+    parts = ["<p><strong>Docentes con mayor % de NO competencia:</strong></p><ol>"]
+    if not top_list:
+        parts.append("<li>Sin datos.</li>")
+    else:
+        for doc, pct in top_list:
+            parts.append(f"<li>{escape(str(doc))} ({pct:.2f}%)</li>")
+    parts.append("</ol>")
+    if semana_usada is not None:
+        parts.append(f"<p><strong>Semana utilizada para docentes:</strong> {escape(str(semana_usada))}</p>")
+    return "".join(parts)
+
+
+def construir_contenido_correo_plantel(
+    plantel,
+    total_no_comp,
+    total_sin_calif,
+    top_por_semestre,
+    semana_modulos,
+    mod_err,
+    top_docentes,
+    semana_docentes,
+    doc_err,
+    analisis,
+    incluir_grafica=True,
+):
+    graph_cid = f"grafica_{_safe_download_name(plantel)}"
+
+    if top_por_semestre and any(len(v) > 0 for v in top_por_semestre.values()):
+        extra_mod_text = "\n" + _formatear_top_por_semestre(top_por_semestre, semana_modulos) + "\n"
+        extra_mod_html = _render_top_semestres_html(top_por_semestre, semana_modulos)
+    else:
+        extra_mod_text = (
+            "\nMódulos con MAYOR % de NO COMPETENCIA por semestre (plantel): "
+            f"No se pudo determinar con certeza. Motivo: {mod_err}\n"
+        )
+        extra_mod_html = (
+            "<p><strong>Módulos con mayor % de NO competencia por semestre:</strong> "
+            f"No se pudo determinar con certeza. Motivo: {escape(str(mod_err or 'Sin información'))}</p>"
+        )
+
+    if top_docentes and len(top_docentes) > 0:
+        extra_doc_text = "\n" + _formatear_top_docentes(top_docentes, semana_docentes) + "\n"
+        extra_doc_html = _render_top_docentes_html(top_docentes, semana_docentes)
+    else:
+        extra_doc_text = (
+            "\nDocentes con MAYOR % de NO COMPETENCIA (plantel): "
+            f"No se pudo determinar con certeza. Motivo: {doc_err}\n"
+        )
+        extra_doc_html = (
+            "<p><strong>Docentes con mayor % de NO competencia:</strong> "
+            f"No se pudo determinar con certeza. Motivo: {escape(str(doc_err or 'Sin información'))}</p>"
+        )
+
+    metas_texto = _render_metas_semanales_texto(analisis.get("metas_semanales", []))
+    metas_html = _render_metas_semanales_html(analisis.get("metas_semanales", []))
+
+    recomendaciones_texto = "\n".join([f"- {item}" for item in analisis.get("recomendaciones", [])])
+    recomendaciones_html = "".join(f"<li>{escape(item)}</li>" for item in analisis.get("recomendaciones", []))
+
+    tendencia = analisis.get("tendencia", {}) or {}
+    tendencia_texto = tendencia.get("texto", "Sin información de tendencia.")
+
+    cuerpo_texto = (
+        f"Estimado Plantel {plantel}:\n"
+        "\nAnteponiendo un cordial saludo, se comparte el análisis actualizado de indicadores académicos del plantel.\n"
+        f"Actualmente registra {total_no_comp:,} estudiantes NO COMPETENTES y {int(total_sin_calif):,} estudiantes SIN EVALUACIÓN en algún módulo.\n"
+        f"Matrícula del plantel: {analisis.get('matricula', 0):,}.\n"
+        f"Porcentaje actual de NO competencia: {analisis.get('porcentaje_actual', 0.0):.2f}%.\n"
+        f"Meta máxima permitida (10%): {analisis.get('meta_maxima', 0):,} estudiantes.\n"
+        f"Estudiantes por regularizar para llegar al 10%: {analisis.get('faltan_regularizar', 0):,}.\n"
+        f"{analisis.get('dictamen', '')}\n"
+        f"{tendencia_texto}\n"
+    )
+
+    if analisis.get("ha_accionado"):
+        cuerpo_texto += (
+            f"El plantel ha reducido {analisis.get('reduccion_absoluta', 0):,} estudiantes desde el inicio del seguimiento, "
+            f"equivalente a {analisis.get('reduccion_porcentual', 0.0):.2f}% de reducción acumulada.\n"
+        )
+
+    if analisis.get("promedio_semanal_necesario", 0) > 0:
+        cuerpo_texto += (
+            f"Para alcanzar la meta en la semana {analisis.get('semana_meta')}, debe regularizar en promedio "
+            f"{analisis.get('promedio_semanal_necesario'):,} estudiantes por semana.\n"
+        )
+
+    if metas_texto:
+        cuerpo_texto += "\n" + metas_texto + "\n"
+
+    cuerpo_texto += (
+        "\nAcciones recomendadas para llegar al 10%:\n"
+        f"{recomendaciones_texto}\n"
+        f"{extra_mod_text}\n"
+        "\nA continuación, se presentan los 5 docentes que registran el mayor porcentaje de NO COMPETENCIA en este cierre de semestre:\n"
+        f"{extra_doc_text}\n"
+        "\nSe adjunta/integra la gráfica de comportamiento semanal del plantel.\n"
+        "Para consultar información detallada, particular o completa sobre los avances y resultados del plantel, "
+        "le invitamos a revisar el tablero institucional en el siguiente enlace:\n"
+        "https://tablero-docentes.conalepmexacademica.app/\n"
+        "\nSin otro particular, reciba un cordial saludo.\n"
+    )
+
+    grafica_html = ""
+    if incluir_grafica:
+        grafica_html = (
+            f"<div style='margin:20px 0;'>"
+            f"<p><strong>Gráfica de seguimiento semanal</strong></p>"
+            f"<img src='cid:{graph_cid}' alt='Gráfica de seguimiento semanal {escape(str(plantel))}' "
+            "style='max-width:100%;height:auto;border:1px solid #D0D5DD;border-radius:8px;' />"
+            f"</div>"
+        )
+
+    cuerpo_html = f"""
+    <html>
+      <body style="font-family:Arial,Helvetica,sans-serif;color:#222;line-height:1.55;">
+        <p>Estimado Plantel <strong>{escape(str(plantel))}</strong>:</p>
+        <p>Anteponiendo un cordial saludo, se comparte el análisis actualizado de indicadores académicos del plantel.</p>
+
+        <table style="border-collapse:collapse;width:100%;max-width:760px;margin:12px 0 20px 0;">
+          <tr>
+            <td style="padding:10px;border:1px solid #D0D5DD;background:#F9FAFB;"><strong>Matrícula</strong><br>{analisis.get('matricula', 0):,}</td>
+            <td style="padding:10px;border:1px solid #D0D5DD;background:#F9FAFB;"><strong>No competentes</strong><br>{total_no_comp:,}</td>
+            <td style="padding:10px;border:1px solid #D0D5DD;background:#F9FAFB;"><strong>% actual</strong><br>{analisis.get('porcentaje_actual', 0.0):.2f}%</td>
+            <td style="padding:10px;border:1px solid #D0D5DD;background:#F9FAFB;"><strong>Meta 10%</strong><br>{analisis.get('meta_maxima', 0):,}</td>
+          </tr>
+        </table>
+
+        <p>{escape(analisis.get('dictamen', ''))}</p>
+        <p><strong>{escape(tendencia_texto)}</strong></p>
+
+        <p>Actualmente el plantel registra <strong>{int(total_sin_calif):,}</strong> estudiantes sin evaluación en algún módulo.</p>
+    """
+
+    if analisis.get("ha_accionado"):
+        cuerpo_html += (
+            f"<p>Durante el seguimiento, el plantel ha reducido <strong>{analisis.get('reduccion_absoluta', 0):,}</strong> "
+            f"estudiantes no competentes, lo que representa una reducción acumulada de "
+            f"<strong>{analisis.get('reduccion_porcentual', 0.0):.2f}%</strong>.</p>"
+        )
+
+    if analisis.get("promedio_semanal_necesario", 0) > 0:
+        cuerpo_html += (
+            f"<p>Para llegar al 10% como máximo en la semana <strong>{analisis.get('semana_meta')}</strong>, "
+            f"es necesario regularizar en promedio al menos <strong>{analisis.get('promedio_semanal_necesario'):,}</strong> "
+            f"estudiantes por semana.</p>"
+        )
+
+    cuerpo_html += grafica_html
+
+    if metas_html:
+        cuerpo_html += metas_html
+
+    cuerpo_html += (
+        "<p><strong>Acciones recomendadas para llegar al 10%:</strong></p>"
+        f"<ul>{recomendaciones_html}</ul>"
+        f"{extra_mod_html}"
+        f"{extra_doc_html}"
+        "<p>Para consultar información detallada, particular o completa sobre los avances y resultados del plantel, "
+        "le invitamos a revisar el tablero institucional en el siguiente enlace:</p>"
+        "<p><a href='https://tablero-docentes.conalepmexacademica.app/'>https://tablero-docentes.conalepmexacademica.app/</a></p>"
+        "<p>Sin otro particular, reciba un cordial saludo.</p>"
+        "</body></html>"
+    )
+
+    return {
+        "text": cuerpo_texto,
+        "html": cuerpo_html,
+        "graph_cid": graph_cid,
+    }
+
+
+# =========================
 # Email (SMTP)
 # =========================
 @st.cache_data(show_spinner=False)
@@ -1520,9 +1975,10 @@ def _smtp_config():
     return host, port, user, password, from_email, use_tls
 
 
-def enviar_correo(destinatarios, asunto, cuerpo, cc=None):
+def enviar_correo(destinatarios, asunto, cuerpo, cc=None, cuerpo_html=None, inline_images=None):
     host, port, user, password, from_email, use_tls = _smtp_config()
     cc = cc or []
+    inline_images = inline_images or []
 
     msg = EmailMessage()
     msg["Subject"] = asunto
@@ -1533,6 +1989,22 @@ def enviar_correo(destinatarios, asunto, cuerpo, cc=None):
         msg["Cc"] = ", ".join(cc)
 
     msg.set_content(cuerpo)
+
+    if cuerpo_html:
+        msg.add_alternative(cuerpo_html, subtype="html")
+        html_part = msg.get_payload()[-1]
+        for img in inline_images:
+            data = img.get("data")
+            cid = img.get("cid")
+            if not data or not cid:
+                continue
+            html_part.add_related(
+                data,
+                maintype="image",
+                subtype=img.get("subtype", "png"),
+                cid=f"<{cid}>",
+                filename=img.get("filename", f"{cid}.png"),
+            )
 
     with smtplib.SMTP(host, port, timeout=30) as server:
         server.ehlo()
@@ -1661,9 +2133,17 @@ def construir_borradores_envio(plantel_sel, planteles_disponibles, tabla, df_rep
 
         top_por_semestre, semana_usada, mod_err = top_modulos_porcentaje_no_competencia_por_semestre(df_datos, p)
         top_docentes, semana_docentes, doc_err = top_docentes_porcentaje_no_competencia(df_datos, p, top_n=5)
+        analisis = construir_analisis_seguimiento_plantel(
+            plantel=p,
+            tabla=tabla,
+            total_sin_calif=total_sin_calif,
+            semana_meta=EMAIL_META_SEMANA_OBJETIVO,
+            meta_pct=EMAIL_META_MAX_NO_COMP_PCT,
+        )
 
         asunto = f"Indicadores académicos - {p}"
-        cuerpo = texto_correo_plantel(
+        img_bytes = generar_imagen_grafica_seguimiento(p)
+        contenido = construir_contenido_correo_plantel(
             plantel=p,
             total_no_comp=total_no_comp,
             total_sin_calif=total_sin_calif,
@@ -1672,15 +2152,28 @@ def construir_borradores_envio(plantel_sel, planteles_disponibles, tabla, df_rep
             mod_err=mod_err,
             top_docentes=top_docentes,
             semana_docentes=semana_docentes,
-            doc_err=doc_err
+            doc_err=doc_err,
+            analisis=analisis,
+            incluir_grafica=bool(img_bytes),
         )
+
+        inline_images = []
+        if img_bytes:
+            inline_images.append({
+                "cid": contenido["graph_cid"],
+                "data": img_bytes,
+                "filename": f"seguimiento_{_safe_download_name(p)}.png",
+                "subtype": "png",
+            })
 
         borradores.append({
             "plantel": p,
             "to": destinatarios,
             "cc": cc_list,
             "subject": asunto,
-            "body": cuerpo,
+            "body": contenido["text"],
+            "body_html": contenido["html"],
+            "inline_images": inline_images,
         })
 
     return borradores, sin_email
@@ -1691,7 +2184,14 @@ def enviar_borradores(borradores):
     fallidos = []
     for b in borradores:
         try:
-            enviar_correo(b["to"], b["subject"], b["body"], cc=b.get("cc", []))
+            enviar_correo(
+                b["to"],
+                b["subject"],
+                b["body"],
+                cc=b.get("cc", []),
+                cuerpo_html=b.get("body_html"),
+                inline_images=b.get("inline_images", []),
+            )
             enviados.append(b["plantel"])
         except Exception as e:
             fallidos.append(f"{b['plantel']} ({e})")
@@ -1791,7 +2291,7 @@ def mostrar_indicadores_academicos():
             )
             tabla_ordenada = tabla_vista.sort_values(by=sort_col, ascending=False).copy()
             tabla_ordenada["etiqueta"] = tabla_ordenada.apply(
-                lambda r: f"{int(r['Total estudiantes no competentes'])} - {float(r['% Estudiantes no competentes']):.1f}%",
+                lambda r: f"{int(r['Total estudiantes no competentes'])} - {float(r['% Estudiantes no competentes']):.2f}%",
                 axis=1
             )
 
