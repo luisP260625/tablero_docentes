@@ -58,13 +58,13 @@ def _menu_por_permisos(perms: set[str], plantel: str | None) -> list[str]:
     """
 
     perm_to_label = {
-        "MENU_DOCENTES_MODULOS": "Docentes y Módulos",
+        "MENU_DOCENTES_MODULOS": "Top 15 Docentes y Módulos",
         "MENU_ESTATAL_DOCENTES_MODULOS": "Estatal Docentes y Módulos",
-        "MENU_DOCENTES_SEGUIMIENTO": "Docentes Seguimiento",
-        "MENU_MODULOS_SEGUIMIENTO": "Módulos Seguimiento",
+        "MENU_DOCENTES_SEGUIMIENTO": "Docentes Seguimiento (FT)",
+        "MENU_MODULOS_SEGUIMIENTO": "Módulos Seguimiento (FT)",
         "MENU_INDICADORES_ACADEMICOS": "Indicadores Académicos",
         "MENU_HISTORICO_INDICADORES": "Histórico de Indicadores",
-        "MENU_CAPTURA_DOCENTES": "Captura Docentes",
+        "MENU_CAPTURA_DOCENTES": "Captura Docentes (FT)",
         "MENU_BITACORA_CONEXIONES": "Bitácora de Conexiones",
         "MENU_ESTUDIANTES_POR_GRUPO": "Estudiantes por Grupo",
 
@@ -73,16 +73,15 @@ def _menu_por_permisos(perms: set[str], plantel: str | None) -> list[str]:
     }
 
     order = [
-        "Docentes y Módulos",
+        "Top 15 Docentes y Módulos",
         "Estatal Docentes y Módulos",
-        "Docentes Seguimiento",
-        "Módulos Seguimiento",
+        "Docentes Seguimiento (FT)",
+        "Módulos Seguimiento (FT)",
+        "Captura Docentes (FT)",
+        "Estudiantes por Grupo",
         "Indicadores Académicos",
         "Histórico de Indicadores",
-        "Captura Docentes",
         "Bitácora de Conexiones",
-        "Acceso Planteles",
-        "Estudiantes por Grupo",
     ]
 
     global_only = {"Bitácora de Conexiones", "Estatal Docentes y Módulos", "Acceso Planteles"}
@@ -105,26 +104,25 @@ def _menu_por_permisos(perms: set[str], plantel: str | None) -> list[str]:
     # ----------------------------
     if plantel:
         allowed = {
-            "Docentes y Módulos",
-            "Docentes Seguimiento",
-            "Módulos Seguimiento",
+            "Top 15 Docentes y Módulos",
+            "Docentes Seguimiento (FT)",
+            "Módulos Seguimiento (FT)",
+            "Captura Docentes (FT)",
+            "Estudiantes por Grupo",
             "Indicadores Académicos",
             "Histórico de Indicadores",
-            "Captura Docentes",
-            "Estudiantes por Grupo",
         }
     else:
         allowed = {
-            "Docentes y Módulos",
+            "Top 15 Docentes y Módulos",
             "Estatal Docentes y Módulos",
-            "Docentes Seguimiento",
-            "Módulos Seguimiento",
+            "Docentes Seguimiento (FT)",
+            "Módulos Seguimiento (FT)",
+            "Captura Docentes (FT)",
+            "Estudiantes por Grupo",
             "Indicadores Académicos",
             "Histórico de Indicadores",
-            "Captura Docentes",
             "Bitácora de Conexiones",
-            "Acceso Planteles",
-            "Estudiantes por Grupo",
         }
 
     return [x for x in order if x in allowed]
@@ -210,16 +208,16 @@ if opcion != "Acceso Planteles":
 # ----------------------------
 # Ruteo
 # ----------------------------
-if opcion == "Docentes y Módulos":
+if opcion == "Top 15 Docentes y Módulos":
     vista_nc.mostrar(df, st.session_state.plantel_usuario, st.session_state.administrador)
 
 elif opcion == "Estatal Docentes y Módulos":
     vista_estatal.mostrar_estatal(df)
 
-elif opcion == "Docentes Seguimiento":
+elif opcion == "Docentes Seguimiento (FT)":
     vista_com.mostrar(df, st.session_state.plantel_usuario, st.session_state.administrador)
 
-elif opcion == "Módulos Seguimiento":
+elif opcion == "Módulos Seguimiento (FT)":
     vista_mc.mostrar(df, st.session_state.plantel_usuario, st.session_state.administrador)
 
 elif opcion == "Indicadores Académicos":
@@ -231,7 +229,7 @@ elif opcion == "Histórico de Indicadores":
 elif opcion == "Bitácora de Conexiones":
     vista_bc.mostrar()
 
-elif opcion == "Captura Docentes":
+elif opcion == "Captura Docentes (FT)":
     df_sc, error_sc = cargar_semcaptura()
     if error_sc:
         st.error(f"❌ Error al cargar SemCaptura: {error_sc}")

@@ -37,20 +37,27 @@ USE_FAST_CACHE = os.getenv("USE_FAST_CACHE", "true").lower() == "true"
 
 REPROBACION_COLS = [
     "Plantel", "ESTUDIANTE", "matricula", "CARRERA", "MODULO",
-    "DOCENTE", "grado", "cvegrupo", "pEspecifico", "pAlcanzado", "pRelativo"
+    "DOCENTE", "grado", "cvegrupo", "MINIMO",
+    "pEspecifico", "pAlcanzado", "pRelativo"
 ]
 
 MATRICULA_COLS = ["Plantel", "matriculaTotal"]
-METRICAS_ORDEN = ["pEspecifico", "pAlcanzado", "pRelativo"]
 
-# Columnas que se conservan para cálculos internos, pero se ocultan en la tabla final
-# solicitada para impresión/atención. Esto evita romper funciones como
-# "sin registro de calificaciones", que dependen de pEspecifico.
+# Métricas internas necesarias para cálculos heredados.
+# pEspecifico y pRelativo ya no se muestran en el detalle final,
+# pero pEspecifico se conserva internamente para detectar registros sin evaluación.
+METRICAS_ORDEN = ["pEspecifico", "pAlcanzado", "pRelativo"]
+METRICAS_DETALLE_PRESENTACION = ["pAlcanzado"]
+MINIMO_COL_NAME = "MINIMO"
+MINIMO_DISPLAY_NAME = "Porcentaje mínimo para aprobar"
+
+# Columnas que se conservan para cálculos internos, pero se ocultan en la tabla final.
+# Se ocultan únicamente pEspecifico y pRelativo; pAlcanzado permanece visible.
 COLUMNAS_METRICAS_OCULTAS_PRESENTACION = [
-    "pEspecifico", "pAlcanzado", "pRelativo",
-    "PEspecifico", "PAlcanzado", "pRelativo",
-    "pEspecifico_min", "pAlcanzado_min", "pRelativo_min",
-    "PEspecifico_min", "PAlcanzado_min", "pRelativo_min",
+    "pEspecifico", "pRelativo",
+    "PEspecifico", "pRelativo",
+    "pEspecifico_min", "pRelativo_min",
+    "PEspecifico_min", "pRelativo_min",
 ]
 
 # Categorías usadas para identificar estudiantes por cantidad de módulos NO competentes.
@@ -101,6 +108,28 @@ def _find_col_like(df, candidates):
     return None
 
 
+def normalizar_columna_minimo(df):
+    """
+    Garantiza una columna estándar MINIMO tomada desde la hoja Reprobacion.
+
+    Soporta variaciones como MÍNIMO, Minimo o minimo. Si la columna todavía
+    no existe en el origen/caché, se crea vacía para no romper la tabla.
+    """
+    if df is None:
+        return df
+
+    d = df.copy()
+    col_minimo = _find_col_like(d, ["MINIMO", "MÍNIMO", "Minimo", "Mínimo", "minimo"])
+
+    if col_minimo and col_minimo != MINIMO_COL_NAME:
+        d = d.rename(columns={col_minimo: MINIMO_COL_NAME})
+
+    if MINIMO_COL_NAME not in d.columns:
+        d[MINIMO_COL_NAME] = pd.NA
+
+    return d
+
+
 def ocultar_columnas_metricas_presentacion(df):
     """
     Oculta columnas de porcentaje/ponderación en vistas finales sin eliminarlas
@@ -113,6 +142,22 @@ def ocultar_columnas_metricas_presentacion(df):
     ocultas = {_norm_txt(c) for c in COLUMNAS_METRICAS_OCULTAS_PRESENTACION}
     columnas_a_ocultar = [c for c in d.columns if _norm_txt(c) in ocultas]
     return d.drop(columns=columnas_a_ocultar, errors="ignore")
+
+
+def renombrar_minimo_presentacion(df):
+    """
+    Renombra MINIMO únicamente para vistas/exportaciones finales.
+
+    Internamente se conserva el nombre MINIMO para no afectar la lectura desde
+    Excel, el caché ni cualquier cálculo que dependa del nombre original.
+    """
+    if df is None:
+        return df
+
+    d = df.copy()
+    if MINIMO_COL_NAME in d.columns:
+        d = d.rename(columns={MINIMO_COL_NAME: MINIMO_DISPLAY_NAME})
+    return d
 
 
 def _wk_key(v):
@@ -180,20 +225,74 @@ def agregar_fila_total(tabla):
     return pd.concat([df, pd.DataFrame([total_row])], ignore_index=True)
 
 
-def _preparar_columnas_detalle(df):
-    df = asegurar_metricas(df.copy())
+def _preparar_columnas_detalle(df, incluir_metricas_internas=False):
+    """
+    Prepara el detalle para mostrar/exportar.
+
+    Por requerimiento, las columnas pEspecifico y pRelativo no se muestran en
+    la tabla final. Sin embargo, siguen existiendo en la carga completa para no
+    romper cálculos internos como la detección de registros sin calificación.
+    """
+    df = normalizar_columna_minimo(df.copy())
+    df = asegurar_metricas(df)
 
     columnas_base = [
         "Plantel", "ESTUDIANTE", "matricula", "CARRERA",
         "MODULO", "DOCENTE", "grado", "cvegrupo"
     ]
-    orden = [c for c in columnas_base if c in df.columns] + [c for c in METRICAS_ORDEN if c in df.columns]
+
+    metricas = METRICAS_ORDEN if incluir_metricas_internas else METRICAS_DETALLE_PRESENTACION
+
+    # Orden solicitado para la vista de detalle:
+    # pAlcanzado debe mostrarse antes del mínimo requerido.
+    orden = (
+        [c for c in columnas_base if c in df.columns]
+        + [c for c in metricas if c in df.columns]
+        + [c for c in [MINIMO_COL_NAME] if c in df.columns]
+    )
 
     if orden:
         return df[orden]
 
     return df
 
+
+
+
+def preparar_detalle_no_competentes_presentacion(df):
+    """
+    Formatea específicamente la tabla de la sección:
+    "Estudiantes NO competentes X (Detalle)".
+
+    Resultado esperado en la vista final:
+    - Incluye el mínimo tomado de la hoja Reprobacion.
+    - Muestra el mínimo con el encabezado: Porcentaje mínimo para aprobar.
+    - Oculta pEspecifico.
+    - Oculta pRelativo.
+    - Mantiene pAlcanzado visible antes del mínimo requerido.
+
+    Esta función es solo de presentación; los cálculos internos siguen usando
+    cargar_reprobacion(), donde pEspecifico, pRelativo y MINIMO permanecen disponibles.
+    """
+    if df is None:
+        return df
+
+    d = normalizar_columna_minimo(df.copy())
+    d = ocultar_columnas_metricas_presentacion(d)
+
+    columnas_preferidas = [
+        "Plantel", "ESTUDIANTE", "matricula", "CARRERA",
+        "MODULO", "DOCENTE", "grado", "cvegrupo",
+        "pAlcanzado", MINIMO_COL_NAME,
+    ]
+
+    orden = [c for c in columnas_preferidas if c in d.columns]
+    resto = [c for c in d.columns if c not in orden]
+
+    if orden:
+        d = d[orden + resto]
+
+    return renombrar_minimo_presentacion(d)
 
 def mostrar_dataframe_preview(df, max_rows=None, height=DEFAULT_TABLE_HEIGHT):
     """
@@ -214,6 +313,19 @@ def mostrar_dataframe_preview(df, max_rows=None, height=DEFAULT_TABLE_HEIGHT):
 @st.cache_data(show_spinner=False)
 def cargar_reprobacion():
     df = _read_fast_or_excel("reprobacion.parquet", "Reprobacion", usecols=None)
+
+    # Si existe un parquet anterior sin MINIMO, se intenta leer nuevamente desde
+    # Excel para traer la columna nueva desde la hoja Reprobacion.
+    col_minimo_actual = _find_col_like(df, ["MINIMO", "MÍNIMO", "Minimo", "Mínimo", "minimo"])
+    if not col_minimo_actual:
+        try:
+            df_excel = _read_excel("Reprobacion", usecols=None)
+            if _find_col_like(df_excel, ["MINIMO", "MÍNIMO", "Minimo", "Mínimo", "minimo"]):
+                df = df_excel
+        except Exception:
+            pass
+
+    df = normalizar_columna_minimo(df)
     return asegurar_metricas(df)
 
 
@@ -353,10 +465,17 @@ def obtener_detalle_no_competentes(plantel_sel):
 
 @st.cache_data(show_spinner=False)
 def obtener_sin_registro_calificaciones(plantel_sel):
-    df = obtener_detalle_no_competentes(plantel_sel)
+    # Se usa la carga completa porque pEspecifico ya no se muestra en el detalle,
+    # pero sigue siendo el criterio interno para detectar registros sin evaluación.
+    df = cargar_reprobacion()
+    if plantel_sel != "Todos":
+        df = df[df["Plantel"] == plantel_sel].copy()
+
     if "pEspecifico" not in df.columns:
-        return pd.DataFrame(columns=df.columns)
-    return df[df["pEspecifico"] == 0].copy()
+        return _preparar_columnas_detalle(df.iloc[0:0].copy())
+
+    df_sin = df[df["pEspecifico"] == 0].copy()
+    return _preparar_columnas_detalle(df_sin)
 
 
 # =========================
@@ -484,8 +603,8 @@ def construir_resumen_estudiantes_por_modulos(df_detalle):
     if "DOCENTE" in d.columns:
         agg["DOCENTE"] = _join_unique_values
 
-    # Las métricas pEspecifico, pAlcanzado y pRelativo se conservan en df_detalle
-    # para cálculos internos, pero no se agregan a la tabla final solicitada.
+    # Las métricas internas se conservan en la carga base para cálculos,
+    # pero no se agregan a la tabla resumida final solicitada.
     resumen = d.groupby(group_cols, dropna=False).agg(agg).reset_index()
 
     rename_map = {
@@ -2203,13 +2322,13 @@ def enviar_borradores(borradores):
 # =========================
 @st.cache_data(show_spinner=False)
 def generar_excel_no_competentes(plantel_sel):
-    df = obtener_detalle_no_competentes(plantel_sel)
+    df = preparar_detalle_no_competentes_presentacion(obtener_detalle_no_competentes(plantel_sel))
     return exportar_excel(df).getvalue()
 
 
 @st.cache_data(show_spinner=False)
 def generar_html_no_competentes(plantel_sel):
-    df = obtener_detalle_no_competentes(plantel_sel)
+    df = preparar_detalle_no_competentes_presentacion(obtener_detalle_no_competentes(plantel_sel))
     return exportar_html_imprimible(
         df,
         titulo="Estudiantes NO competentes",
@@ -2366,7 +2485,7 @@ def mostrar_indicadores_academicos():
                 st.info("Presiona **Aplicar filtros** para cargar el detalle general de todos los planteles.")
             else:
                 with st.spinner("Cargando detalle general de estudiantes NO competentes..."):
-                    df_print = obtener_detalle_no_competentes("Todos")
+                    df_print = preparar_detalle_no_competentes_presentacion(obtener_detalle_no_competentes("Todos"))
 
                 total_nc_admin = (
                     df_print["matricula"].nunique()
@@ -2401,7 +2520,7 @@ def mostrar_indicadores_academicos():
 
                 st.markdown(f"### 🚨 Estudiantes sin registro de Calificaciones {total_sin_registro} (Detalle) — Todos")
                 if df_sin_registro.empty:
-                    st.info("ℹ️ No hay registros con pEspecifico = 0 para **Todos**.")
+                    st.info("ℹ️ No hay registros sin evaluación para **Todos**.")
                 else:
                     mostrar_dataframe_preview(df_sin_registro)
                     render_botones_descarga_detalle(
@@ -2416,7 +2535,7 @@ def mostrar_indicadores_academicos():
                     key_prefix="admin_todos_modulos"
                 )
         else:
-            df_print = obtener_detalle_no_competentes(plantel_sel)
+            df_print = preparar_detalle_no_competentes_presentacion(obtener_detalle_no_competentes(plantel_sel))
 
             fila_sel = tabla[tabla["Plantel"] == plantel_sel]
             if not fila_sel.empty and "Total estudiantes no competentes" in fila_sel.columns:
@@ -2448,7 +2567,7 @@ def mostrar_indicadores_academicos():
 
             st.markdown(f"### 🚨 Estudiantes sin registro de Calificaciones {total_sin_registro} (Detalle) — {plantel_sel}")
             if df_sin_registro.empty:
-                st.info(f"ℹ️ No hay registros con pEspecifico = 0 para **{plantel_sel}**.")
+                st.info(f"ℹ️ No hay registros sin evaluación para **{plantel_sel}**.")
             else:
                 mostrar_dataframe_preview(df_sin_registro)
                 render_botones_descarga_detalle(
@@ -2621,7 +2740,7 @@ def mostrar_indicadores_academicos():
         st.subheader(f"📋 Estudiantes del plantel: {plantel_usuario}")
         st.dataframe(tabla_filtrada, use_container_width=True)
 
-        df_exportar = obtener_detalle_no_competentes(plantel_usuario)
+        df_exportar = preparar_detalle_no_competentes_presentacion(obtener_detalle_no_competentes(plantel_usuario))
 
         st.subheader(f"⚠️ Estudiantes NO competentes {total_nc} (Detalle)")
         if df_exportar.empty:
@@ -2660,7 +2779,7 @@ def mostrar_indicadores_academicos():
         st.subheader(f"🚨 Estudiantes sin registro de Calificaciones {total_sin_registro_plantel} (Detalle)")
 
         if df_sin_registro_plantel.empty:
-            st.info("ℹ️ No hay registros con pEspecifico = 0 para este plantel.")
+            st.info("ℹ️ No hay registros sin evaluación para este plantel.")
         else:
             estudiantes_unicos_sr = (
                 df_sin_registro_plantel["matricula"].nunique()
