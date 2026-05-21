@@ -26,6 +26,7 @@ COL_TOTAL = "TOTAL ALUMNOS"
 SEMCAPTURA_COLS_REQUERIDAS = [
     "Modulo",
     "semestre",
+    "Fecha de captura",
     "grupo",
     "UAPRENDIZAJE",
     "RAPRENDIZAJE",
@@ -35,6 +36,25 @@ SEMCAPTURA_COLS_REQUERIDAS = [
     "TOTALE",
     "ESTATUS",
 ]
+
+
+# Variantes aceptadas para columnas que pueden venir con nombres distintos
+# en el archivo de Excel. Esto evita perder funcionalidad si la columna llega
+# como "FECHA_CAPTURA", "fecha captura", "FechaCaptura", etc.
+SEMCAPTURA_ALIASES = {
+    "Fecha de captura": [
+        "Fecha de captura",
+        "FECHA DE CAPTURA",
+        "fecha captura",
+        "FECHA CAPTURA",
+        "FECHA_CAPTURA",
+        "FechaCaptura",
+        "Fecha_Captura",
+        "FECHACAPTURA",
+        "FCAPTURA",
+        "F CAPTURA",
+    ],
+}
 
 
 # ==========================================================
@@ -180,21 +200,35 @@ def _filter_text_equals(df: pl.DataFrame, col: str, value: Any) -> pl.DataFrame:
 def _seleccionar_columnas_case_insensitive_pl(
     df: pl.DataFrame,
     cols_deseadas: List[str],
+    aliases: Optional[dict[str, List[str]]] = None,
 ) -> pl.DataFrame:
     """
     Selecciona columnas aunque vengan con diferente casing.
     Devuelve las columnas con los nombres indicados en cols_deseadas.
+
+    aliases permite buscar una columna con nombres alternativos.
+    Ejemplo:
+    - "Fecha de captura" puede venir como "FECHA_CAPTURA" o "fecha captura".
     """
     if df is None or df.is_empty():
         return pl.DataFrame({c: [] for c in cols_deseadas})
 
+    aliases = aliases or {}
     mapa = {_norm_colname(c): c for c in df.columns}
 
     exprs = []
 
     for col_deseada in cols_deseadas:
-        key = _norm_colname(col_deseada)
-        col_real = mapa.get(key)
+        nombres_a_buscar = [col_deseada] + aliases.get(col_deseada, [])
+
+        col_real = None
+
+        for nombre in nombres_a_buscar:
+            key = _norm_colname(nombre)
+
+            if key in mapa:
+                col_real = mapa[key]
+                break
 
         if col_real:
             exprs.append(pl.col(col_real).alias(col_deseada))
@@ -499,6 +533,7 @@ def _preparar_semcaptura_docente(
     df_sc_out = _seleccionar_columnas_case_insensitive_pl(
         df_sc,
         SEMCAPTURA_COLS_REQUERIDAS,
+        aliases=SEMCAPTURA_ALIASES,
     )
 
     return df_sc_out.to_pandas().reset_index(drop=True), None
