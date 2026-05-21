@@ -1,6 +1,6 @@
 import streamlit as st
 from data.validator import validar_usuario
-from data.loader import cargar_datos, cargar_semcaptura
+from data.loader import cargar_datos, cargar_semcaptura, cargar_reprobacion
 from data.logger import registrar_acceso
 
 # Importar vistas
@@ -13,10 +13,10 @@ import views.bitacora_conexiones as vista_bc
 import views.captura_docentes as vista_cd
 import views.historico_indicadores as vista_hi
 
-# ✅ módulo
+# Módulo estudiantes por grupo
 from views.estudiantes_por_grupo import mostrar_estudiantes_por_grupo
 
-# ✅ Acceso Planteles
+# Acceso Planteles
 from views.acceso_planteles import mostrar_acceso_planteles
 
 
@@ -31,6 +31,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+
 # ----------------------------
 # Inicializar sesión
 # ----------------------------
@@ -40,21 +41,18 @@ if "logueado" not in st.session_state:
             "logueado": False,
             "usuario": None,
             "plantel_usuario": None,
-            "permisos": set(),        # set[str]
-            "administrador": False,   # scope GLOBAL si no tiene plantel
+            "permisos": set(),
+            "administrador": False,
         }
     )
 
 
 def _menu_por_permisos(perms: set[str], plantel: str | None) -> list[str]:
     """
-    ✅ REGLA DE NEGOCIO:
-    - Si hay permisos (perms no vacío): el menú se arma SOLO por permisos.
-    - Si NO hay permisos: fallback por rol:
-        * Plantel -> menú plantel (sin módulos globales)
-        * GLOBAL  -> menú admin/global (incluye módulos globales)
-    - Módulos "global_only" nunca aparecen a Plantel.
-    - ✅ Se eliminó por completo la opción "Ranking ..."
+    REGLA DE NEGOCIO:
+    - Si hay permisos: el menú se arma SOLO por permisos.
+    - Si no hay permisos: fallback por rol.
+    - Los módulos global_only nunca aparecen a usuarios de plantel.
     """
 
     perm_to_label = {
@@ -67,8 +65,6 @@ def _menu_por_permisos(perms: set[str], plantel: str | None) -> list[str]:
         "MENU_CAPTURA_DOCENTES": "Captura Docentes (FT)",
         "MENU_BITACORA_CONEXIONES": "Bitácora de Conexiones",
         "MENU_ESTUDIANTES_POR_GRUPO": "Estudiantes por Grupo",
-
-        # ✅ nuevo (controlado por permiso)
         "MENU_ACCESO_PLANTELES": "Acceso Planteles",
     }
 
@@ -82,9 +78,15 @@ def _menu_por_permisos(perms: set[str], plantel: str | None) -> list[str]:
         "Indicadores Académicos",
         "Histórico de Indicadores",
         "Bitácora de Conexiones",
+        "Acceso Planteles",
     ]
 
-    global_only = {"Bitácora de Conexiones", "Estatal Docentes y Módulos", "Acceso Planteles"}
+    global_only = {
+        "Bitácora de Conexiones",
+        "Estatal Docentes y Módulos",
+        "Acceso Planteles",
+    }
+
     allowed: set[str] = set()
 
     # ----------------------------
@@ -100,7 +102,7 @@ def _menu_por_permisos(perms: set[str], plantel: str | None) -> list[str]:
         return [x for x in order if x in allowed]
 
     # ----------------------------
-    # 2) NO HAY PERMISOS -> fallback por rol (controlado)
+    # 2) NO HAY PERMISOS -> fallback por rol
     # ----------------------------
     if plantel:
         allowed = {
@@ -141,6 +143,7 @@ if not st.session_state.logueado:
 
         if st.button("Iniciar sesión"):
             ok, plantel, perms, username = validar_usuario(usuario, contrasena)
+
             if ok:
                 is_admin_scope = plantel is None
 
@@ -153,6 +156,7 @@ if not st.session_state.logueado:
                         "administrador": is_admin_scope,
                     }
                 )
+
                 registrar_acceso(username, plantel)
                 st.success("✅ ¡Sesión iniciada!")
                 st.rerun()
@@ -166,6 +170,7 @@ if not st.session_state.logueado:
             st.warning("⚠️ Imagen no disponible o no encontrada.")
 
     st.stop()
+
 
 # ----------------------------
 # Sidebar
@@ -181,6 +186,7 @@ else:
     st.sidebar.info(f"👤 {st.session_state.get('usuario')} (GLOBAL)")
 
 opciones = _menu_por_permisos(perms, plantel)
+
 if not opciones:
     st.error("❌ Este usuario no tiene opciones habilitadas. Revisa permisos/reglas en Datos1.xlsx.")
     st.stop()
@@ -192,49 +198,99 @@ if st.sidebar.button("🚪 Cerrar sesión"):
         st.session_state.pop(key, None)
     st.rerun()
 
-# ----------------------------
-# Cargar Datos1.xlsx para vistas que lo requieren
-# ----------------------------
-df = None
-error = None
 
-# Acceso Planteles no necesita df de cargar_datos()
-if opcion != "Acceso Planteles":
+# ----------------------------
+# Carga optimizada según vista
+# ----------------------------
+VISTAS_REQUIEREN_DATOS = {
+    "Top 15 Docentes y Módulos",
+    "Estatal Docentes y Módulos",
+    "Docentes Seguimiento (FT)",
+    "Módulos Seguimiento (FT)",
+}
+
+df = None
+
+if opcion in VISTAS_REQUIEREN_DATOS:
     df, error = cargar_datos()
+
     if error:
         st.error(f"❌ Error al cargar los datos: {error}")
         st.stop()
+
 
 # ----------------------------
 # Ruteo
 # ----------------------------
 if opcion == "Top 15 Docentes y Módulos":
-    vista_nc.mostrar(df, st.session_state.plantel_usuario, st.session_state.administrador)
+    vista_nc.mostrar(
+        df,
+        st.session_state.plantel_usuario,
+        st.session_state.administrador,
+    )
 
 elif opcion == "Estatal Docentes y Módulos":
     vista_estatal.mostrar_estatal(df)
 
 elif opcion == "Docentes Seguimiento (FT)":
-    vista_com.mostrar(df, st.session_state.plantel_usuario, st.session_state.administrador)
+    df_sc, error_sc = cargar_semcaptura()
+
+    if error_sc:
+        st.error(f"❌ Error al cargar SemCaptura: {error_sc}")
+        st.stop()
+
+    df_rep, error_rep = cargar_reprobacion()
+
+    if error_rep:
+        st.error(f"❌ Error al cargar Reprobacion: {error_rep}")
+        st.stop()
+
+    vista_com.mostrar(
+        df,
+        st.session_state.plantel_usuario,
+        st.session_state.administrador,
+        df_sc,
+        df_rep,
+    )
 
 elif opcion == "Módulos Seguimiento (FT)":
-    vista_mc.mostrar(df, st.session_state.plantel_usuario, st.session_state.administrador)
+    df_sc, error_sc = cargar_semcaptura()
+
+    if error_sc:
+        st.error(f"❌ Error al cargar SemCaptura: {error_sc}")
+        st.stop()
+
+    vista_mc.mostrar(
+        df,
+        st.session_state.plantel_usuario,
+        st.session_state.administrador,
+        df_sc,
+    )
 
 elif opcion == "Indicadores Académicos":
     mostrar_indicadores_academicos()
 
 elif opcion == "Histórico de Indicadores":
-    vista_hi.mostrar(st.session_state.plantel_usuario, st.session_state.administrador)
+    vista_hi.mostrar(
+        st.session_state.plantel_usuario,
+        st.session_state.administrador,
+    )
 
 elif opcion == "Bitácora de Conexiones":
     vista_bc.mostrar()
 
 elif opcion == "Captura Docentes (FT)":
     df_sc, error_sc = cargar_semcaptura()
+
     if error_sc:
         st.error(f"❌ Error al cargar SemCaptura: {error_sc}")
         st.stop()
-    vista_cd.mostrar(df_sc, st.session_state.plantel_usuario, st.session_state.administrador)
+
+    vista_cd.mostrar(
+        df_sc,
+        st.session_state.plantel_usuario,
+        st.session_state.administrador,
+    )
 
 elif opcion == "Acceso Planteles":
     mostrar_acceso_planteles()

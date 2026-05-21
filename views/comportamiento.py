@@ -1,51 +1,79 @@
-# views/comportamiento.py
 import streamlit as st
 import pandas as pd
 import matplotlib.pyplot as plt
 from typing import Optional, Any, List, Tuple
-import io
 import unicodedata
-from datetime import datetime
 
-# ====== Config Excel ======
-EXCEL_PATH_DEFAULT = "assets/Datos1.xlsx"
-SHEET_SEMCAPTURA = "SemCaptura"
-SHEET_REPROBACION = "Reprobacion"
+import polars as pl
 
-# ====== Nombres EXACTOS en tu Excel (hoja "Datos") ======
-COL_PLANTEL   = "Plantel"
-COL_DOCENTE   = "DOCENTE"
-COL_SEMANA    = "Semana"
-COL_MODULO    = "MODULO"
-COL_SEMESTRE  = "SEMESTRE"
-COL_NO_COMP   = "NO COMPETENTES"
-COL_COMPET    = "COMPETENTES"
-COL_TOTAL     = "TOTAL ALUMNOS"
-COL_PCT_LABEL = "% de No competencia"   # solo informativa en Excel; recalculamos en app
 
-# ====== Columnas requeridas en SemCaptura (según tu requerimiento) ======
+# ==========================================================
+# Nombres EXACTOS en hoja Datos
+# ==========================================================
+COL_PLANTEL = "Plantel"
+COL_DOCENTE = "DOCENTE"
+COL_SEMANA = "Semana"
+COL_MODULO = "MODULO"
+COL_SEMESTRE = "SEMESTRE"
+COL_NO_COMP = "NO COMPETENTES"
+COL_COMPET = "COMPETENTES"
+COL_TOTAL = "TOTAL ALUMNOS"
+
+
+# ==========================================================
+# Columnas que se mostrarán desde SemCaptura
+# ==========================================================
 SEMCAPTURA_COLS_REQUERIDAS = [
-    "Modulo", "semestre", "grupo",
-    "UAPRENDIZAJE", "RAPRENDIZAJE",
-    "IEVALUAR", "IEVALUADOS", "PCAPTURA",
-    "TOTALE", "ESTATUS"
+    "Modulo",
+    "semestre",
+    "grupo",
+    "UAPRENDIZAJE",
+    "RAPRENDIZAJE",
+    "IEVALUAR",
+    "IEVALUADOS",
+    "PCAPTURA",
+    "TOTALE",
+    "ESTATUS",
 ]
 
-# ------------------ utilidades ------------------
+
+# ==========================================================
+# Utilidades generales
+# ==========================================================
+def _to_polars(df: Any) -> Optional[pl.DataFrame]:
+    """
+    Convierte diferentes tipos de datos a Polars.
+    """
+    if df is None:
+        return None
+
+    if isinstance(df, pl.DataFrame):
+        return df.clone()
+
+    if isinstance(df, pd.DataFrame):
+        return pl.from_pandas(df)
+
+    try:
+        return pl.DataFrame(df)
+    except Exception:
+        return None
+
+
 def _to_pandas(df: Any) -> Optional[pd.DataFrame]:
-    """Convierte df (polars/pandas/lista de dicts) a pandas.DataFrame."""
+    """
+    Convierte diferentes tipos de datos a Pandas.
+    """
     if df is None:
         return None
 
     if isinstance(df, pd.DataFrame):
         return df.copy()
 
-    try:
-        import polars as pl  # type: ignore
-        if isinstance(df, pl.DataFrame):
+    if isinstance(df, pl.DataFrame):
+        try:
             return df.to_pandas()
-    except Exception:
-        pass
+        except Exception:
+            return pd.DataFrame(df.to_dicts())
 
     try:
         return pd.DataFrame(df)
@@ -53,37 +81,63 @@ def _to_pandas(df: Any) -> Optional[pd.DataFrame]:
         return None
 
 
-def _validar_columnas(base: pd.DataFrame, requeridas: List[str]) -> List[str]:
+def _validar_columnas_polars(base: pl.DataFrame, requeridas: List[str]) -> List[str]:
+    """
+    Valida columnas requeridas en un DataFrame Polars.
+    """
     return [c for c in requeridas if c not in base.columns]
 
 
-def _norm_colname(s: str) -> str:
-    """Normaliza nombres de columna para matching robusto (sin acentos, sin espacios, upper)."""
+def _norm_colname(s: Any) -> str:
+    """
+    Normaliza nombres de columna para matching robusto:
+    sin acentos, sin espacios, sin guiones, en mayúsculas.
+    """
     if s is None:
         return ""
 
     s = str(s)
     s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
-    s = s.strip().replace(" ", "").replace("_", "").replace(".", "").replace("-", "").upper()
+    s = (
+        s.strip()
+        .replace(" ", "")
+        .replace("_", "")
+        .replace(".", "")
+        .replace("-", "")
+        .upper()
+    )
+
     return s
 
 
 def _norm_value(s: Any) -> str:
-    """Normaliza valores para comparar textos de Excel de forma más segura."""
-    if pd.isna(s):
+    """
+    Normaliza valores de texto para comparar docentes, planteles, etc.
+    """
+    if s is None:
         return ""
+
+    try:
+        if pd.isna(s):
+            return ""
+    except Exception:
+        pass
 
     s = str(s)
     s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
+
     return " ".join(s.strip().upper().split())
 
 
-def _find_col(df: pd.DataFrame, nombres_posibles: List[str]) -> Optional[str]:
-    """Busca una columna en df comparando con normalización."""
-    if df is None or df.empty:
+def _find_col_pl(df: pl.DataFrame, nombres_posibles: List[str]) -> Optional[str]:
+    """
+    Busca una columna en un DataFrame Polars usando normalización.
+    """
+    if df is None or df.is_empty():
         return None
 
     mapa = {_norm_colname(c): c for c in df.columns}
+
     for nombre in nombres_posibles:
         key = _norm_colname(nombre)
         if key in mapa:
@@ -92,45 +146,89 @@ def _find_col(df: pd.DataFrame, nombres_posibles: List[str]) -> Optional[str]:
     return None
 
 
-def _seleccionar_columnas_case_insensitive(df: pd.DataFrame, cols_deseadas: List[str]) -> pd.DataFrame:
+def _find_col_pd(df: pd.DataFrame, nombres_posibles: List[str]) -> Optional[str]:
     """
-    Selecciona columnas aunque en Excel vengan con diferente casing/espacios.
-    Devuelve un DF con las columnas renombradas exactamente como cols_deseadas (si existen).
+    Busca una columna en un DataFrame Pandas usando normalización.
     """
     if df is None or df.empty:
-        return pd.DataFrame(columns=cols_deseadas)
+        return None
 
     mapa = {_norm_colname(c): c for c in df.columns}
-    seleccion = {}
 
-    for c in cols_deseadas:
-        key = _norm_colname(c)
+    for nombre in nombres_posibles:
+        key = _norm_colname(nombre)
         if key in mapa:
-            seleccion[c] = mapa[key]
+            return mapa[key]
 
-    out = df[[seleccion[c] for c in cols_deseadas if c in seleccion]].copy()
-    ren = {seleccion[k]: k for k in seleccion}
-    out = out.rename(columns=ren)
+    return None
 
-    for c in cols_deseadas:
-        if c not in out.columns:
-            out[c] = pd.NA
 
-    return out[cols_deseadas]
+def _filter_text_equals(df: pl.DataFrame, col: str, value: Any) -> pl.DataFrame:
+    """
+    Filtra texto con normalización de valor.
+    Es más robusto contra espacios, acentos y mayúsculas.
+    """
+    target = _norm_value(value)
+
+    return df.filter(
+        pl.col(col)
+        .map_elements(_norm_value, return_dtype=pl.Utf8)
+        == target
+    )
+
+
+def _seleccionar_columnas_case_insensitive_pl(
+    df: pl.DataFrame,
+    cols_deseadas: List[str],
+) -> pl.DataFrame:
+    """
+    Selecciona columnas aunque vengan con diferente casing.
+    Devuelve las columnas con los nombres indicados en cols_deseadas.
+    """
+    if df is None or df.is_empty():
+        return pl.DataFrame({c: [] for c in cols_deseadas})
+
+    mapa = {_norm_colname(c): c for c in df.columns}
+
+    exprs = []
+
+    for col_deseada in cols_deseadas:
+        key = _norm_colname(col_deseada)
+        col_real = mapa.get(key)
+
+        if col_real:
+            exprs.append(pl.col(col_real).alias(col_deseada))
+        else:
+            exprs.append(pl.lit(None).alias(col_deseada))
+
+    return df.select(exprs)
 
 
 def _drop_columns_by_norm(df: pd.DataFrame, cols_a_eliminar: List[str]) -> pd.DataFrame:
-    """Elimina columnas por nombre normalizado, por ejemplo status/estatus aunque vengan en mayúsculas."""
+    """
+    Elimina columnas por nombre normalizado.
+    Ejemplo: status / ESTATUS / Estatus.
+    """
     if df is None or df.empty:
         return df
 
     keys_eliminar = {_norm_colname(c) for c in cols_a_eliminar}
-    columnas_finales = [c for c in df.columns if _norm_colname(c) not in keys_eliminar]
+    columnas_finales = [
+        c for c in df.columns
+        if _norm_colname(c) not in keys_eliminar
+    ]
+
     return df[columnas_finales].copy()
 
 
-def _rename_column_by_norm(df: pd.DataFrame, nombre_actual: str, nombre_nuevo: str) -> pd.DataFrame:
-    """Renombra una columna usando matching robusto."""
+def _rename_column_by_norm(
+    df: pd.DataFrame,
+    nombre_actual: str,
+    nombre_nuevo: str,
+) -> pd.DataFrame:
+    """
+    Renombra una columna usando matching robusto.
+    """
     if df is None or df.empty:
         return df
 
@@ -147,26 +245,9 @@ def _rename_column_by_norm(df: pd.DataFrame, nombre_actual: str, nombre_nuevo: s
     return df
 
 
-def _as_numeric_series(s: pd.Series) -> pd.Series:
-    return pd.to_numeric(s, errors="coerce")
-
-
-def _current_week_from_docente(df_docente: pd.DataFrame) -> Optional[int]:
-    """Obtiene la última semana disponible del docente en la hoja Datos."""
-    if df_docente is None or df_docente.empty or COL_SEMANA not in df_docente.columns:
-        return None
-
-    semanas = pd.to_numeric(df_docente[COL_SEMANA], errors="coerce").dropna()
-    if semanas.empty:
-        return None
-
-    return int(semanas.max())
-
-
 def _set_index_consecutivo(df: pd.DataFrame, inicio: int = 1) -> pd.DataFrame:
     """
-    Hace que el número que Streamlit muestra antes de la primera columna
-    sea consecutivo: 1, 2, 3 ... n.
+    Hace que el índice visible inicie en 1.
     """
     if df is None:
         return pd.DataFrame()
@@ -174,13 +255,62 @@ def _set_index_consecutivo(df: pd.DataFrame, inicio: int = 1) -> pd.DataFrame:
     out = df.copy().reset_index(drop=True)
     out.index = range(inicio, inicio + len(out))
     out.index.name = ""
+
     return out
+
+
+def _planteles_desde_polars(df: pl.DataFrame) -> list[str]:
+    """
+    Devuelve lista ordenada de planteles.
+    """
+    if df is None or df.is_empty() or COL_PLANTEL not in df.columns:
+        return []
+
+    return sorted(
+        [str(x) for x in df[COL_PLANTEL].drop_nulls().unique().to_list()]
+    )
+
+
+def _docentes_desde_polars(df: pl.DataFrame) -> list[str]:
+    """
+    Devuelve lista ordenada de docentes.
+    """
+    if df is None or df.is_empty() or COL_DOCENTE not in df.columns:
+        return []
+
+    return sorted(
+        [str(x) for x in df[COL_DOCENTE].drop_nulls().unique().to_list()]
+    )
+
+
+# ==========================================================
+# Cálculos y visuales
+# ==========================================================
+def _current_week_from_docente_pl(df_docente: pl.DataFrame) -> Optional[int]:
+    """
+    Obtiene la última semana disponible del docente desde Polars.
+    """
+    if df_docente is None or df_docente.is_empty() or COL_SEMANA not in df_docente.columns:
+        return None
+
+    df_tmp = df_docente.with_columns(
+        pl.col(COL_SEMANA).cast(pl.Int64, strict=False).alias("_SEMANA_NUM")
+    )
+
+    semana = df_tmp["_SEMANA_NUM"].max()
+
+    if semana is None:
+        return None
+
+    try:
+        return int(semana)
+    except Exception:
+        return None
 
 
 def _grafica_semanal(sem_df: pd.DataFrame, titulo: str, color_hex: str = "#c3b08f") -> None:
     """
-    Dibuja barras por semana con etiqueta 'NO_COMP - %' calculada como
-    suma(NO COMPETENTES)/suma(TOTAL ALUMNOS) de cada semana.
+    Dibuja gráfica semanal de no competentes.
     """
     if sem_df is None or sem_df.shape[0] == 0:
         st.info("Sin datos para la gráfica.")
@@ -188,391 +318,351 @@ def _grafica_semanal(sem_df: pd.DataFrame, titulo: str, color_hex: str = "#c3b08
 
     semanas = sem_df["semana"].astype(int).tolist()
     no_comp = sem_df["no_comp"].astype(int).tolist()
-    total   = sem_df["total"].astype(int).tolist()
+    total = sem_df["total"].astype(int).tolist()
     porcent = [(n / t) if t else 0.0 for n, t in zip(no_comp, total)]
 
     fig, ax = plt.subplots(figsize=(8, 4))
-    bars = ax.bar(semanas, no_comp, width=0.6, align="center", color=color_hex, edgecolor=color_hex)
+
+    bars = ax.bar(
+        semanas,
+        no_comp,
+        width=0.6,
+        align="center",
+        color=color_hex,
+        edgecolor=color_hex,
+    )
 
     if titulo:
         ax.set_title(titulo)
 
     ax.set_xlabel("Semana")
     ax.set_xticks(semanas)
-    ax.set_xlim(min(semanas) - 0.5, max(semanas) + 0.5)
+
+    if semanas:
+        ax.set_xlim(min(semanas) - 0.5, max(semanas) + 0.5)
 
     y_max = max(no_comp) if no_comp else 0
     margen = max(1, int(round(y_max * 0.2))) if y_max > 0 else 1
     ax.set_ylim(0, y_max + margen)
 
-    LABEL_FONTSIZE = 8
     for i, bar in enumerate(bars):
         ax.annotate(
-            f"{no_comp[i]} - {porcent[i]*100:.1f}%",
-            xy=(bar.get_x() + bar.get_width()/2, bar.get_height()),
+            f"{no_comp[i]} - {porcent[i] * 100:.1f}%",
+            xy=(bar.get_x() + bar.get_width() / 2, bar.get_height()),
             xytext=(0, 5),
             textcoords="offset points",
             ha="center",
             va="bottom",
             rotation=90,
-            fontsize=LABEL_FONTSIZE,
+            fontsize=8,
         )
 
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
+
     fig.tight_layout()
+
     st.pyplot(fig)
 
 
-def _tabla_modulos_ultima_semana(df_docente: pd.DataFrame) -> pd.DataFrame:
-    """Devuelve tabla con columnas solicitadas para la última semana disponible."""
-    if df_docente is None or df_docente.shape[0] == 0:
-        return pd.DataFrame(columns=["Modulo", "semestre", "no_com", "competentes", "total", "porcentaje_no_comp"])
+def _preparar_grafica_semanal(df_docente: pl.DataFrame) -> pd.DataFrame:
+    """
+    Prepara el resumen semanal desde Polars.
+    Convierte a Pandas solo el resultado pequeño.
+    """
+    if df_docente is None or df_docente.is_empty():
+        return pd.DataFrame(columns=["semana", "no_comp", "total"])
 
-    ult_sem = _current_week_from_docente(df_docente)
+    sem = (
+        df_docente
+        .with_columns(
+            pl.col(COL_SEMANA).cast(pl.Int64, strict=False).alias("_SEMANA_NUM")
+        )
+        .drop_nulls("_SEMANA_NUM")
+        .group_by("_SEMANA_NUM")
+        .agg(
+            pl.sum(COL_NO_COMP).alias("no_comp"),
+            pl.sum(COL_TOTAL).alias("total"),
+        )
+        .sort("_SEMANA_NUM")
+        .rename({"_SEMANA_NUM": "semana"})
+    )
+
+    return sem.to_pandas()
+
+
+def _tabla_modulos_ultima_semana_pl(df_docente: pl.DataFrame) -> pd.DataFrame:
+    """
+    Devuelve tabla de módulos de la última semana disponible.
+    """
+    columnas_salida = [
+        "Modulo",
+        "semestre",
+        "no_com",
+        "competentes",
+        "total",
+        "porcentaje_no_comp",
+    ]
+
+    if df_docente is None or df_docente.is_empty():
+        return pd.DataFrame(columns=columnas_salida)
+
+    ult_sem = _current_week_from_docente_pl(df_docente)
+
     if ult_sem is None:
-        return pd.DataFrame(columns=["Modulo", "semestre", "no_com", "competentes", "total", "porcentaje_no_comp"])
+        return pd.DataFrame(columns=columnas_salida)
 
-    df_u = df_docente[pd.to_numeric(df_docente[COL_SEMANA], errors="coerce").astype("Int64") == ult_sem].copy()
+    df_u = (
+        df_docente
+        .with_columns(
+            pl.col(COL_SEMANA).cast(pl.Int64, strict=False).alias("_SEMANA_NUM")
+        )
+        .filter(pl.col("_SEMANA_NUM") == ult_sem)
+    )
+
+    if df_u.is_empty():
+        return pd.DataFrame(columns=columnas_salida)
 
     agg = (
-        df_u.groupby([COL_MODULO, COL_SEMESTRE], dropna=False)[[COL_NO_COMP, COL_COMPET, COL_TOTAL]]
-        .sum(numeric_only=True)
-        .reset_index()
-    )
-
-    agg["porcentaje_no_comp"] = agg.apply(
-        lambda r: (r[COL_NO_COMP] / r[COL_TOTAL] * 100) if r[COL_TOTAL] > 0 else 0.0,
-        axis=1
-    )
-
-    agg = agg.rename(columns={
-        COL_MODULO: "Modulo",
-        COL_SEMESTRE: "semestre",
-        COL_NO_COMP: "no_com",
-        COL_COMPET: "competentes",
-        COL_TOTAL:  "total",
-    })
-
-    agg = agg[["Modulo", "semestre", "no_com", "competentes", "total", "porcentaje_no_comp"]]
-    agg["porcentaje_no_comp"] = agg["porcentaje_no_comp"].round(1)
-
-    return agg
-
-
-# ====== helpers Excel ======
-def _slugify_filename(text: str) -> str:
-    """Convierte 'José Pérez / 3A' -> 'Jose_Perez__3A' y limpia caracteres inválidos."""
-    if not isinstance(text, str):
-        text = str(text or "")
-
-    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
-    return "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in text).strip("_")
-
-
-def _auto_width_xlsx(ws, df: pd.DataFrame, start_col=0):
-    """Ajusta el ancho de columnas en xlsxwriter según contenido."""
-    for idx, col in enumerate(df.columns, start=start_col):
-        try:
-            max_len_vals = df[col].astype(str).map(len).max() if not df.empty else 0
-        except Exception:
-            max_len_vals = 0
-
-        header_len = len(str(col))
-        width = min(max(max_len_vals, header_len) + 2, 60)
-
-        try:
-            ws.set_column(idx, idx, width)
-        except Exception:
-            pass
-
-
-def _excel_comportamiento_bytes(
-    *,
-    plantel: str,
-    docente: str,
-    semanas_df: pd.DataFrame,
-    tabla_modulos_df: pd.DataFrame
-) -> bytes:
-    """
-    Se conserva por compatibilidad, aunque ya no se muestra el botón
-    Crear/Descargar Excel del docente.
-    """
-    buffer = io.BytesIO()
-
-    try:
-        writer = pd.ExcelWriter(buffer, engine="xlsxwriter")
-    except Exception:
-        writer = pd.ExcelWriter(buffer)
-
-    with writer:
-        hoja1 = "Comportamiento semanal"
-
-        if semanas_df is not None and not semanas_df.empty:
-            semanas_ord = semanas_df["semana"].dropna().astype(int).sort_values().tolist()
-            sem_min = min(semanas_ord)
-            sem_max = max(semanas_ord)
-            sem_list_str = ", ".join(str(s) for s in semanas_ord)
-        else:
-            sem_min = ""
-            sem_max = ""
-            sem_list_str = ""
-
-        meta1 = pd.DataFrame(
+        df_u
+        .group_by([COL_MODULO, COL_SEMESTRE])
+        .agg(
+            pl.sum(COL_NO_COMP).alias("no_com"),
+            pl.sum(COL_COMPET).alias("competentes"),
+            pl.sum(COL_TOTAL).alias("total"),
+        )
+        .with_columns(
+            (
+                pl.col("no_com")
+                / pl.when(pl.col("total") > 0)
+                .then(pl.col("total"))
+                .otherwise(1)
+                .cast(pl.Float64)
+                * 100
+            )
+            .round(1)
+            .alias("porcentaje_no_comp")
+        )
+        .rename(
             {
-                "Campo": ["Plantel", "Docente", "Semana mínima", "Semana máxima", "Semanas con datos", "Nota"],
-                "Valor": [
-                    plantel,
-                    docente,
-                    sem_min,
-                    sem_max,
-                    sem_list_str,
-                    "El porcentaje corresponde a NO_COMP/TOTAL por semana."
-                ],
+                COL_MODULO: "Modulo",
+                COL_SEMESTRE: "semestre",
             }
         )
+        .select(columnas_salida)
+        .sort(["Modulo", "semestre"])
+    )
 
-        meta1.to_excel(writer, sheet_name=hoja1, index=False, startrow=0)
-
-        if semanas_df is not None and not semanas_df.empty:
-            semanas_out = semanas_df.copy()
-            semanas_out["porcentaje_no_comp"] = semanas_out.apply(
-                lambda r: (r["no_comp"] / r["total"] * 100) if r["total"] else 0.0,
-                axis=1
-            ).round(1)
-
-            semanas_out = semanas_out[["semana", "no_comp", "total", "porcentaje_no_comp"]]
-            startrow = len(meta1) + 2
-            semanas_out.to_excel(writer, sheet_name=hoja1, index=False, startrow=startrow)
-
-        wb = writer.book
-        ws1 = writer.sheets[hoja1]
-
-        try:
-            fmt_bold = wb.add_format({"bold": True, "font_size": 12})
-            ws1.write(0, 0, "Campo", fmt_bold)
-            ws1.write(0, 1, "Valor", fmt_bold)
-        except Exception:
-            fmt_bold = None
-
-        if semanas_df is not None and not semanas_df.empty:
-            _auto_width_xlsx(ws1, semanas_out, start_col=0)
-
-        hoja2 = "Módulos última semana"
-        meta2 = pd.DataFrame({"Campo": ["Plantel", "Docente"], "Valor": [plantel, docente]})
-        meta2.to_excel(writer, sheet_name=hoja2, index=False, startrow=0)
-
-        startrow2 = len(meta2) + 2
-        tabla_out = tabla_modulos_df.copy() if tabla_modulos_df is not None else pd.DataFrame()
-        tabla_out.to_excel(writer, sheet_name=hoja2, index=False, startrow=startrow2)
-
-        ws2 = writer.sheets[hoja2]
-
-        try:
-            if fmt_bold is not None:
-                ws2.write(0, 0, "Campo", fmt_bold)
-                ws2.write(0, 1, "Valor", fmt_bold)
-        except Exception:
-            pass
-
-        _auto_width_xlsx(ws2, tabla_out, start_col=0)
-
-    buffer.seek(0)
-    return buffer.getvalue()
+    return agg.to_pandas()
 
 
-# =========================
-# Cargar hojas auxiliares
-# =========================
-@st.cache_data
-def _cargar_hoja_excel(excel_path: str, sheet_name: str) -> pd.DataFrame:
-    """
-    Carga una hoja de Excel de forma robusta:
-    - intenta el nombre exacto;
-    - si falla, busca por nombre normalizado, por ejemplo Reprobación/Reprobacion.
-    """
-    try:
-        return pd.read_excel(excel_path, sheet_name=sheet_name)
-    except Exception:
-        pass
-
-    try:
-        xls = pd.ExcelFile(excel_path)
-        objetivo = _norm_colname(sheet_name)
-
-        for hoja in xls.sheet_names:
-            if _norm_colname(hoja) == objetivo:
-                return pd.read_excel(excel_path, sheet_name=hoja)
-    except Exception:
-        pass
-
-    return pd.DataFrame()
-
-
-@st.cache_data
-def _cargar_semcaptura(excel_path: str) -> pd.DataFrame:
-    return _cargar_hoja_excel(excel_path, SHEET_SEMCAPTURA)
-
-
-@st.cache_data
-def _cargar_reprobacion(excel_path: str) -> pd.DataFrame:
-    return _cargar_hoja_excel(excel_path, SHEET_REPROBACION)
-
-
+# ==========================================================
+# Preparar SemCaptura
+# ==========================================================
 def _preparar_semcaptura_docente(
-    semcaptura_raw: pd.DataFrame,
-    *,
-    sel_docente: str,
-    sel_plantel: Optional[str]
-) -> Tuple[pd.DataFrame, Optional[str]]:
-    """
-    Filtra SemCaptura por docente y plantel.
-    Retorna:
-    - DataFrame listo para mostrar.
-    - Mensaje de error/información si aplica.
-    """
-    if semcaptura_raw is None or semcaptura_raw.empty:
-        return pd.DataFrame(), "ℹ️ No se encontró información en la hoja 'SemCaptura' o está vacía."
-
-    col_docente_real = _find_col(semcaptura_raw, [COL_DOCENTE, "Docente"])
-    if not col_docente_real:
-        return pd.DataFrame(), "La hoja 'SemCaptura' no contiene una columna DOCENTE para poder filtrar."
-
-    df_sc = semcaptura_raw[
-        semcaptura_raw[col_docente_real].apply(_norm_value) == _norm_value(sel_docente)
-    ].copy()
-
-    col_plantel_real = _find_col(semcaptura_raw, [COL_PLANTEL, "Plantel"])
-    if col_plantel_real and sel_plantel:
-        df_sc = df_sc[
-            df_sc[col_plantel_real].apply(_norm_value) == _norm_value(sel_plantel)
-        ].copy()
-
-    if df_sc.empty:
-        return pd.DataFrame(), f"ℹ️ No hay registros en 'SemCaptura' para el docente **{sel_docente}**."
-
-    df_sc_out = _seleccionar_columnas_case_insensitive(df_sc, SEMCAPTURA_COLS_REQUERIDAS)
-
-    return df_sc_out.reset_index(drop=True), None
-
-
-def _preparar_reprobacion_docente(
-    reprobacion_raw: pd.DataFrame,
+    semcaptura_raw: Any,
     *,
     sel_docente: str,
     sel_plantel: Optional[str],
-    semana_actual: Optional[int]
 ) -> Tuple[pd.DataFrame, Optional[str]]:
     """
-    Filtra la hoja Reprobacion por docente, plantel y semana actual.
-
-    Ajustes solicitados:
-    - El título se genera aparte con el conteo.
-    - No mostrar campo status/estatus.
-    - Campo MINIMO se renombra a 'Porcentaje Mínimo para aprobar'.
-    - El índice visible de la tabla debe iniciar en 1 y ser consecutivo hasta n.
+    Filtra SemCaptura por docente y plantel.
     """
-    if reprobacion_raw is None or reprobacion_raw.empty:
+    semcaptura_pl = _to_polars(semcaptura_raw)
+
+    if semcaptura_pl is None or semcaptura_pl.is_empty():
+        return pd.DataFrame(), "ℹ️ No se encontró información en la hoja 'SemCaptura' o está vacía."
+
+    col_docente_real = _find_col_pl(semcaptura_pl, [COL_DOCENTE, "Docente"])
+
+    if not col_docente_real:
+        return pd.DataFrame(), "La hoja 'SemCaptura' no contiene una columna DOCENTE para poder filtrar."
+
+    df_sc = _filter_text_equals(
+        semcaptura_pl,
+        col_docente_real,
+        sel_docente,
+    )
+
+    col_plantel_real = _find_col_pl(semcaptura_pl, [COL_PLANTEL, "Plantel"])
+
+    if col_plantel_real and sel_plantel:
+        df_sc = _filter_text_equals(
+            df_sc,
+            col_plantel_real,
+            sel_plantel,
+        )
+
+    if df_sc.is_empty():
+        return pd.DataFrame(), f"ℹ️ No hay registros en 'SemCaptura' para el docente **{sel_docente}**."
+
+    df_sc_out = _seleccionar_columnas_case_insensitive_pl(
+        df_sc,
+        SEMCAPTURA_COLS_REQUERIDAS,
+    )
+
+    return df_sc_out.to_pandas().reset_index(drop=True), None
+
+
+# ==========================================================
+# Preparar Reprobacion
+# ==========================================================
+def _preparar_reprobacion_docente(
+    reprobacion_raw: Any,
+    *,
+    sel_docente: str,
+    sel_plantel: Optional[str],
+    semana_actual: Optional[int],
+) -> Tuple[pd.DataFrame, Optional[str]]:
+    """
+    Filtra Reprobacion por docente, plantel y semana actual.
+    """
+    reprobacion_pl = _to_polars(reprobacion_raw)
+
+    if reprobacion_pl is None or reprobacion_pl.is_empty():
         return pd.DataFrame(), "ℹ️ No se encontró información en la hoja 'Reprobacion' o está vacía."
 
-    col_docente_real = _find_col(reprobacion_raw, [COL_DOCENTE, "Docente"])
+    col_docente_real = _find_col_pl(reprobacion_pl, [COL_DOCENTE, "Docente"])
+
     if not col_docente_real:
         return pd.DataFrame(), "La hoja 'Reprobacion' no contiene una columna DOCENTE para poder filtrar."
 
-    df_rep = reprobacion_raw[
-        reprobacion_raw[col_docente_real].apply(_norm_value) == _norm_value(sel_docente)
-    ].copy()
+    df_rep = _filter_text_equals(
+        reprobacion_pl,
+        col_docente_real,
+        sel_docente,
+    )
 
-    col_plantel_real = _find_col(reprobacion_raw, [COL_PLANTEL, "Plantel"])
+    col_plantel_real = _find_col_pl(reprobacion_pl, [COL_PLANTEL, "Plantel"])
+
     if col_plantel_real and sel_plantel:
-        df_rep = df_rep[
-            df_rep[col_plantel_real].apply(_norm_value) == _norm_value(sel_plantel)
-        ].copy()
+        df_rep = _filter_text_equals(
+            df_rep,
+            col_plantel_real,
+            sel_plantel,
+        )
 
-    # Si existe columna Semana en Reprobacion, se filtra por la semana actual del docente.
-    col_semana_real = _find_col(reprobacion_raw, [COL_SEMANA, "Semana"])
+    col_semana_real = _find_col_pl(reprobacion_pl, [COL_SEMANA, "Semana"])
+
     if col_semana_real and semana_actual is not None:
-        df_rep = df_rep[
-            pd.to_numeric(df_rep[col_semana_real], errors="coerce").astype("Int64") == int(semana_actual)
-        ].copy()
+        df_rep = (
+            df_rep
+            .with_columns(
+                pl.col(col_semana_real)
+                .cast(pl.Int64, strict=False)
+                .alias("_SEMANA_NUM")
+            )
+            .filter(pl.col("_SEMANA_NUM") == int(semana_actual))
+            .drop("_SEMANA_NUM")
+        )
 
-    if df_rep.empty:
+    if df_rep.is_empty():
         if semana_actual is not None:
             return pd.DataFrame(), (
                 f"ℹ️ No hay registros en 'Reprobacion' para el docente **{sel_docente}** "
                 f"en la semana **{semana_actual}**."
             )
+
         return pd.DataFrame(), f"ℹ️ No hay registros en 'Reprobacion' para el docente **{sel_docente}**."
 
-    # No mostrar status/estatus.
-    df_rep = _drop_columns_by_norm(df_rep, ["status", "estatus"])
+    df_rep_out = df_rep.to_pandas()
 
-    # MINIMO debe decir Porcentaje Mínimo para aprobar.
-    df_rep = _rename_column_by_norm(
-        df_rep,
-        "MINIMO",
-        "Porcentaje Mínimo para aprobar"
+    # No mostrar status / estatus
+    df_rep_out = _drop_columns_by_norm(
+        df_rep_out,
+        ["status", "estatus"],
     )
 
-    # El número antes de Plantel debe ser consecutivo desde 1 hasta n.
-    df_rep = _set_index_consecutivo(df_rep, inicio=1)
+    # Renombrar MINIMO
+    df_rep_out = _rename_column_by_norm(
+        df_rep_out,
+        "MINIMO",
+        "Porcentaje Mínimo para aprobar",
+    )
 
-    return df_rep, None
+    # Índice 1, 2, 3...
+    df_rep_out = _set_index_consecutivo(df_rep_out, inicio=1)
+
+    return df_rep_out, None
 
 
 def _contar_estudiantes_no_competentes(df_rep_out: pd.DataFrame) -> int:
     """
-    Cuenta estudiantes para el encabezado.
-    Si existe matrícula, cuenta matrículas únicas; si no existe, cuenta filas.
+    Cuenta estudiantes no competentes.
+    Si existe matrícula, cuenta matrículas únicas.
     """
     if df_rep_out is None or df_rep_out.empty:
         return 0
 
-    col_matricula = _find_col(df_rep_out, ["matricula", "matrícula", "MATRICULA"])
+    col_matricula = _find_col_pd(
+        df_rep_out,
+        ["matricula", "matrícula", "MATRICULA"],
+    )
+
     if col_matricula:
-        return int(df_rep_out[col_matricula].dropna().astype(str).str.strip().nunique())
+        return int(
+            df_rep_out[col_matricula]
+            .dropna()
+            .astype(str)
+            .str.strip()
+            .nunique()
+        )
 
     return int(len(df_rep_out))
 
 
-# ------------------ interfaz pública ------------------
+# ==========================================================
+# Interfaz pública
+# ==========================================================
 def mostrar(
     df: Any,
     plantel_usuario: Optional[str] = None,
     es_admin: bool = False,
+    semcaptura_raw: Any = None,
+    reprobacion_raw: Any = None,
 ) -> None:
     """
-    Usa EXCLUSIVAMENTE la hoja 'Datos' (df) para:
-      - Graficar NO COMPETENTES por semana (% sobre TOTAL).
-      - Mostrar la tabla de módulos del docente (última semana).
+    Vista Docentes Seguimiento (FT).
 
-    Además:
-      - Mostrar tabla SemCaptura filtrada por docente/plantel.
-      - Mostrar tabla Reprobacion filtrada por docente/plantel/semana actual.
+    Optimización:
+    - Ya no lee SemCaptura directamente desde Excel.
+    - Ya no lee Reprobacion directamente desde Excel.
+    - Filtra primero en Polars.
+    - Convierte a Pandas solo resultados pequeños para tabla/gráfica.
     """
-    base = _to_pandas(df)
+    base_pl = _to_polars(df)
 
-    if base is None or base.shape[0] == 0:
+    if base_pl is None or base_pl.is_empty():
         st.warning("No hay datos para mostrar.")
         return
 
-    # Validación estricta de columnas (hoja Datos)
-    faltantes = _validar_columnas(
-        base,
-        [COL_PLANTEL, COL_DOCENTE, COL_SEMANA, COL_NO_COMP, COL_COMPET, COL_TOTAL, COL_MODULO, COL_SEMESTRE]
+    faltantes = _validar_columnas_polars(
+        base_pl,
+        [
+            COL_PLANTEL,
+            COL_DOCENTE,
+            COL_SEMANA,
+            COL_NO_COMP,
+            COL_COMPET,
+            COL_TOTAL,
+            COL_MODULO,
+            COL_SEMESTRE,
+        ],
     )
 
     if faltantes:
         st.error("Faltan columnas requeridas en 'Datos': " + ", ".join(faltantes))
 
         with st.expander("Columnas disponibles"):
-            st.write(list(base.columns))
+            st.write(list(base_pl.columns))
 
         return
 
-    # ---------- selección de plantel ----------
+    # ======================================================
+    # Selección de plantel
+    # ======================================================
     if es_admin:
-        planteles = sorted(base[COL_PLANTEL].dropna().astype(str).unique().tolist())
+        planteles = _planteles_desde_polars(base_pl)
 
         if not planteles:
             st.info("No hay planteles disponibles.")
@@ -584,21 +674,33 @@ def mostrar(
             "Selecciona un plantel",
             planteles,
             index=default_idx,
-            key="cmp_sel_plantel_comportamiento"
+            key="cmp_sel_plantel_comportamiento",
         )
     else:
         sel_plantel = plantel_usuario
+
         st.text_input(
             "Plantel",
             sel_plantel or "",
             disabled=True,
-            key="cmp_plantel_ro_comportamiento"
+            key="cmp_plantel_ro_comportamiento",
         )
 
-    df_plantel = base[base[COL_PLANTEL].astype(str) == str(sel_plantel)].copy() if sel_plantel else base.copy()
+    if sel_plantel:
+        df_plantel_pl = base_pl.filter(
+            pl.col(COL_PLANTEL).cast(pl.Utf8) == str(sel_plantel)
+        )
+    else:
+        df_plantel_pl = base_pl
 
-    # ---------- selección de docente ----------
-    docentes = sorted(df_plantel[COL_DOCENTE].dropna().astype(str).unique().tolist())
+    if df_plantel_pl.is_empty():
+        st.info("No hay datos para el plantel seleccionado.")
+        return
+
+    # ======================================================
+    # Selección de docente
+    # ======================================================
+    docentes = _docentes_desde_polars(df_plantel_pl)
 
     if not docentes:
         st.info("No hay docentes para el plantel seleccionado.")
@@ -607,50 +709,46 @@ def mostrar(
     sel_docente = st.selectbox(
         "Selecciona un docente",
         docentes,
-        key="cmp_sel_docente_comportamiento"
+        key="cmp_sel_docente_comportamiento",
     )
 
-    df_docente = df_plantel[df_plantel[COL_DOCENTE].astype(str) == str(sel_docente)].copy()
-
-    # ================== Gráfica semanal (desde 'Datos') ==================
-    df_docente[COL_SEMANA] = pd.to_numeric(df_docente[COL_SEMANA], errors="coerce").astype("Int64")
-
-    sem = (
-        df_docente
-        .groupby(COL_SEMANA, dropna=False)[[COL_NO_COMP, COL_TOTAL]]
-        .sum(numeric_only=True)
-        .reset_index()
-        .dropna(subset=[COL_SEMANA])
-        .sort_values(COL_SEMANA)
+    df_docente_pl = df_plantel_pl.filter(
+        pl.col(COL_DOCENTE).cast(pl.Utf8) == str(sel_docente)
     )
 
-    sem = sem.rename(columns={
-        COL_SEMANA: "semana",
-        COL_NO_COMP: "no_comp",
-        COL_TOTAL: "total"
-    })
+    if df_docente_pl.is_empty():
+        st.info("No hay datos para el docente seleccionado.")
+        return
+
+    # ======================================================
+    # Gráfica semanal
+    # ======================================================
+    sem = _preparar_grafica_semanal(df_docente_pl)
 
     _grafica_semanal(
         sem,
         titulo=f"Comportamiento semanal - {sel_docente}",
-        color_hex="#c3b08f"
+        color_hex="#c3b08f",
     )
 
-    # ================== Tabla de módulos (última semana) ==================
+    # ======================================================
+    # Tabla de módulos última semana
+    # ======================================================
     st.markdown("**Módulos que ofrece el docente (última semana disponible)**")
 
-    tabla = _tabla_modulos_ultima_semana(df_docente)
-    st.dataframe(tabla, use_container_width=True)
+    tabla = _tabla_modulos_ultima_semana_pl(df_docente_pl)
 
-    # IMPORTANTE:
-    # Se eliminó el apartado "Resumen del docente seleccionado".
-    # Se eliminó el botón "Crear/Descargar Excel del docente".
+    st.dataframe(
+        tabla,
+        use_container_width=True,
+    )
 
-    # ================== Tabla SemCaptura ==================
+    # ======================================================
+    # Tabla SemCaptura
+    # ======================================================
     st.markdown("---")
     st.subheader("📋 Porcentaje de captura de evaluaciones.")
 
-    semcaptura_raw = _cargar_semcaptura(EXCEL_PATH_DEFAULT)
     df_sc_out, msg_sc = _preparar_semcaptura_docente(
         semcaptura_raw,
         sel_docente=str(sel_docente or ""),
@@ -661,23 +759,26 @@ def mostrar(
         if msg_sc.startswith("La hoja"):
             st.error(msg_sc)
 
-            if semcaptura_raw is not None and not semcaptura_raw.empty:
+            semcaptura_pd = _to_pandas(semcaptura_raw)
+
+            if semcaptura_pd is not None and not semcaptura_pd.empty:
                 with st.expander("Columnas disponibles en SemCaptura"):
-                    st.write(list(semcaptura_raw.columns))
+                    st.write(list(semcaptura_pd.columns))
         else:
             st.info(msg_sc)
     else:
-        st.dataframe(df_sc_out, use_container_width=True, height=380)
+        st.dataframe(
+            df_sc_out,
+            use_container_width=True,
+            height=380,
+        )
 
-    # IMPORTANTE:
-    # Se eliminó el botón "Descarga Porcentaje de Captura",
-    # porque la tabla de Streamlit permite descargar datos desde el menú de la tabla.
-
-    # ================== Tabla Reprobacion ==================
-    semana_actual = _current_week_from_docente(df_docente)
+    # ======================================================
+    # Tabla Reprobacion
+    # ======================================================
+    semana_actual = _current_week_from_docente_pl(df_docente_pl)
     semana_texto = str(semana_actual) if semana_actual is not None else "actual"
 
-    reprobacion_raw = _cargar_reprobacion(EXCEL_PATH_DEFAULT)
     df_rep_out, msg_rep = _preparar_reprobacion_docente(
         reprobacion_raw,
         sel_docente=str(sel_docente or ""),
@@ -695,6 +796,8 @@ def mostrar(
         f"### 📋 {no_estudiantes} Estudiantes NO Competentes en la semana {semana_texto}"
     )
 
-    # El índice de esta tabla queda como 1, 2, 3... n
-    # para evitar que aparezcan índices originales como 20993, 21023, etc.
-    st.dataframe(df_rep_out, use_container_width=True, height=420)
+    st.dataframe(
+        df_rep_out,
+        use_container_width=True,
+        height=420,
+    )
