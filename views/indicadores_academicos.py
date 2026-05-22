@@ -29,11 +29,23 @@ EMAIL_META_SEMANA_OBJETIVO = 18
 
 EXCEL_PATH = "assets/Datos1.xlsx"
 CACHE_DIR = "assets/cache_indicadores"
-MAX_PREVIEW_ROWS = 500  # Compatibilidad: ya no se usa para recortar la tabla.
-DEFAULT_TABLE_HEIGHT = 520
-USE_PLANTEL_DETAIL_CACHE = os.getenv("USE_PLANTEL_DETAIL_CACHE", "false").lower() == "true"
+# Rendimiento / visualización
+# MAX_PREVIEW_ROWS ahora vuelve a proteger la interfaz: muestra una vista previa
+# y evita mandar tablas gigantes al navegador en cada rerun de Streamlit.
+MAX_PREVIEW_ROWS = int(os.getenv("MAX_PREVIEW_ROWS", "500"))
+MAX_RENDER_ROWS = int(os.getenv("MAX_RENDER_ROWS", str(MAX_PREVIEW_ROWS)))
+DEFAULT_TABLE_HEIGHT = int(os.getenv("DEFAULT_TABLE_HEIGHT", "520"))
 
+# Si realmente se necesita ver todo en pantalla, el usuario podrá activarlo con checkbox.
+# Para forzarlo globalmente desde servidor: ALLOW_FULL_TABLE_RENDER=true
+ALLOW_FULL_TABLE_RENDER = os.getenv("ALLOW_FULL_TABLE_RENDER", "false").lower() == "true"
+SHOW_FULL_TABLE_CHECKBOX = os.getenv("SHOW_FULL_TABLE_CHECKBOX", "true").lower() == "true"
+
+# Caché rápido. Si existen archivos parquet, se usan. Si no existen, se lee Excel
+# y opcionalmente se intenta crear el parquet para próximas cargas.
+USE_PLANTEL_DETAIL_CACHE = os.getenv("USE_PLANTEL_DETAIL_CACHE", "false").lower() == "true"
 USE_FAST_CACHE = os.getenv("USE_FAST_CACHE", "true").lower() == "true"
+AUTO_WRITE_PARQUET_CACHE = os.getenv("AUTO_WRITE_PARQUET_CACHE", "true").lower() == "true"
 
 REPROBACION_COLS = [
     "Plantel", "ESTUDIANTE", "matricula", "CARRERA", "MODULO",
@@ -76,17 +88,52 @@ def _cache_path(name):
     return os.path.join(CACHE_DIR, name)
 
 
+def _ensure_parent_dir(file_path):
+    parent = os.path.dirname(file_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
 def _read_excel(sheet_name, usecols=None):
     return pd.read_excel(EXCEL_PATH, sheet_name=sheet_name, usecols=usecols)
 
 
+def _write_parquet_cache_safe(df, parquet_path):
+    """
+    Intenta guardar caché parquet sin romper el flujo si el servidor no tiene
+    pyarrow/fastparquet o permisos de escritura.
+    """
+    if not AUTO_WRITE_PARQUET_CACHE or df is None:
+        return
+
+    try:
+        _ensure_parent_dir(parquet_path)
+        df.to_parquet(parquet_path, index=False)
+    except Exception:
+        # La app debe seguir funcionando aunque no pueda crear parquet.
+        pass
+
+
 def _read_fast_or_excel(parquet_name, sheet_name, usecols=None):
+    """
+    Lee primero parquet si existe. Si no existe, lee Excel y deja preparado
+    el parquet para acelerar las próximas ejecuciones.
+    """
     parquet_path = _cache_path(parquet_name)
 
     if USE_FAST_CACHE and os.path.exists(parquet_path):
-        return pd.read_parquet(parquet_path)
+        try:
+            return pd.read_parquet(parquet_path)
+        except Exception:
+            # Si el parquet está corrupto o desactualizado, se regresa a Excel.
+            pass
 
-    return _read_excel(sheet_name, usecols=usecols)
+    df = _read_excel(sheet_name, usecols=usecols)
+
+    if USE_FAST_CACHE:
+        _write_parquet_cache_safe(df, parquet_path)
+
+    return df
 
 
 def _norm_txt(x):
@@ -294,17 +341,58 @@ def preparar_detalle_no_competentes_presentacion(df):
 
     return renombrar_minimo_presentacion(d)
 
+def _next_dataframe_widget_key(prefix="df_preview"):
+    """Genera llaves estables por rerun para evitar DuplicateWidgetID."""
+    counter_key = "_indicadores_dataframe_widget_counter"
+    current = int(st.session_state.get(counter_key, 0)) + 1
+    st.session_state[counter_key] = current
+    return f"{prefix}_{current}"
+
+
 def mostrar_dataframe_preview(df, max_rows=None, height=DEFAULT_TABLE_HEIGHT):
     """
-    Muestra el DataFrame completo.
+    Muestra una vista previa segura para rendimiento.
 
-    Antes se usaba df.head(MAX_PREVIEW_ROWS), lo que provocaba que si un plantel
-    tenía más de 500 registros solo se vieran los primeros 500. Se mantiene el
-    nombre de la función para no romper llamadas existentes, pero ya no recorta.
+    No elimina funcionalidad: si el usuario necesita ver todos los registros,
+    puede activar el checkbox de tabla completa. Por defecto se evita enviar
+    DataFrames muy grandes al navegador, que es una causa común de lentitud,
+    timeout o cierre de sesión en Streamlit.
     """
-    total = len(df) if df is not None else 0
-    st.caption(f"Mostrando {total:,} registro(s). La tabla no está recortada; usa el scroll para revisar todos los registros.")
-    st.dataframe(df, use_container_width=True, height=height)
+    if df is None:
+        st.info("No hay datos para mostrar.")
+        return
+
+    total = len(df)
+    max_rows = int(max_rows or MAX_RENDER_ROWS or MAX_PREVIEW_ROWS)
+
+    if total == 0:
+        st.caption("Mostrando 0 registro(s).")
+        st.dataframe(df, use_container_width=True, height=height)
+        return
+
+    show_full = ALLOW_FULL_TABLE_RENDER or total <= max_rows
+
+    if total > max_rows and SHOW_FULL_TABLE_CHECKBOX:
+        show_full = st.checkbox(
+            f"Mostrar los {total:,} registros en pantalla (puede tardar)",
+            value=ALLOW_FULL_TABLE_RENDER,
+            key=_next_dataframe_widget_key("mostrar_todo_dataframe"),
+            help=(
+                "Por rendimiento, el tablero muestra primero una vista previa. "
+                "Activa esta opción solo cuando realmente necesites ver todos los registros en pantalla."
+            ),
+        )
+
+    if show_full:
+        st.caption(f"Mostrando {total:,} de {total:,} registro(s).")
+        st.dataframe(df, use_container_width=True, height=height)
+    else:
+        df_preview = df.head(max_rows)
+        st.caption(
+            f"Mostrando vista previa de {len(df_preview):,} de {total:,} registro(s). "
+            "Esto mejora el tiempo de carga y evita saturar la sesión."
+        )
+        st.dataframe(df_preview, use_container_width=True, height=height)
 
 
 # =========================
@@ -514,23 +602,20 @@ def _join_unique_values(series):
     return " | ".join(values)
 
 
-def agregar_conteo_modulos_no_competentes(df):
+def agregar_conteo_modulos_no_competentes(df, ordenar=True):
     """
     Agrega a cada registro académico dos columnas:
     - modulos_nc: cantidad de módulos/registros NO competentes del estudiante.
     - categoria_modulos_nc: 1, 2, 3... 10, 11 o más.
 
-    Se agrupa por Plantel + matrícula cuando ambas columnas existen. Esto permite
-    que el usuario identifique todos los datos completos de los estudiantes que
-    tienen 1, 2, 7, 11 o más módulos NO competentes, sin perder el detalle original.
+    Optimización: usa groupby().transform("size") para evitar crear un DataFrame
+    auxiliar y hacer merge. Esto reduce memoria y tiempo en detalles grandes.
     """
     if df is None or getattr(df, "empty", True):
         base_cols = list(df.columns) if df is not None else []
         return pd.DataFrame(columns=base_cols + ["modulos_nc", "categoria_modulos_nc"])
 
     d = df.copy()
-    # Si el DataFrame ya venía filtrado/con conteo previo, se recalcula para evitar
-    # columnas duplicadas con sufijos _x/_y al hacer merge.
     d = d.drop(columns=["modulos_nc", "categoria_modulos_nc"], errors="ignore")
 
     if "matricula" not in d.columns:
@@ -542,30 +627,33 @@ def agregar_conteo_modulos_no_competentes(df):
     if "Plantel" in d.columns:
         group_cols = ["Plantel", "matricula"]
 
-    conteo = (
-        d.groupby(group_cols, dropna=False)
-        .size()
-        .reset_index(name="modulos_nc")
+    d["modulos_nc"] = (
+        d.groupby(group_cols, dropna=False)["matricula"]
+        .transform("size")
+        .fillna(0)
+        .astype(int)
     )
-    conteo["modulos_nc"] = pd.to_numeric(conteo["modulos_nc"], errors="coerce").fillna(0).astype(int)
-    conteo["categoria_modulos_nc"] = conteo["modulos_nc"].apply(_categoria_modulos_nc)
+    d["categoria_modulos_nc"] = d["modulos_nc"].apply(_categoria_modulos_nc)
 
-    d = d.merge(conteo, on=group_cols, how="left")
-    d["modulos_nc"] = pd.to_numeric(d["modulos_nc"], errors="coerce").fillna(0).astype(int)
-    d["categoria_modulos_nc"] = d["categoria_modulos_nc"].fillna(d["modulos_nc"].apply(_categoria_modulos_nc))
-
-    sort_cols = [c for c in ["Plantel", "modulos_nc", "ESTUDIANTE", "matricula", "MODULO"] if c in d.columns]
-    if sort_cols:
-        ascending = [True] * len(sort_cols)
-        if "modulos_nc" in sort_cols:
-            ascending[sort_cols.index("modulos_nc")] = False
-        d = d.sort_values(sort_cols, ascending=ascending).reset_index(drop=True)
+    if ordenar:
+        sort_cols = [c for c in ["Plantel", "modulos_nc", "ESTUDIANTE", "matricula", "MODULO"] if c in d.columns]
+        if sort_cols:
+            ascending = [True] * len(sort_cols)
+            if "modulos_nc" in sort_cols:
+                ascending[sort_cols.index("modulos_nc")] = False
+            d = d.sort_values(sort_cols, ascending=ascending).reset_index(drop=True)
 
     return d
 
 
 def filtrar_detalle_por_categorias_modulos(df, categorias):
-    d = agregar_conteo_modulos_no_competentes(df)
+    if df is None or getattr(df, "empty", True):
+        d = agregar_conteo_modulos_no_competentes(df, ordenar=False)
+    elif {"modulos_nc", "categoria_modulos_nc"}.issubset(df.columns):
+        d = df.copy()
+    else:
+        d = agregar_conteo_modulos_no_competentes(df, ordenar=False)
+
     if d.empty or not categorias:
         return d.iloc[0:0].copy()
 
@@ -582,7 +670,11 @@ def construir_resumen_estudiantes_por_modulos(df_detalle):
     if df_detalle is None or getattr(df_detalle, "empty", True):
         return pd.DataFrame()
 
-    d = agregar_conteo_modulos_no_competentes(df_detalle)
+    if {"modulos_nc", "categoria_modulos_nc"}.issubset(df_detalle.columns):
+        d = df_detalle.copy()
+    else:
+        d = agregar_conteo_modulos_no_competentes(df_detalle, ordenar=False)
+
     if d.empty:
         return pd.DataFrame()
 
@@ -635,7 +727,11 @@ def construir_resumen_categorias_modulos(df_detalle):
     if df_detalle is None or getattr(df_detalle, "empty", True):
         return pd.DataFrame(columns=["Módulos NO competentes", "Estudiantes", "Registros académicos"])
 
-    d = agregar_conteo_modulos_no_competentes(df_detalle)
+    if {"modulos_nc", "categoria_modulos_nc"}.issubset(df_detalle.columns):
+        d = df_detalle.copy()
+    else:
+        d = agregar_conteo_modulos_no_competentes(df_detalle, ordenar=False)
+
     if d.empty or "categoria_modulos_nc" not in d.columns:
         return pd.DataFrame(columns=["Módulos NO competentes", "Estudiantes", "Registros académicos"])
 
@@ -688,7 +784,7 @@ def render_seccion_impresion_por_modulos(plantel_sel, key_prefix="modulos_nc"):
         st.info(f"ℹ️ No hay registros de NO competentes para **{plantel_sel}**.")
         return
 
-    df_con_conteo = agregar_conteo_modulos_no_competentes(df_base)
+    df_con_conteo = agregar_conteo_modulos_no_competentes(df_base, ordenar=False)
     resumen_categorias = construir_resumen_categorias_modulos(df_con_conteo)
 
     categorias_disponibles = sorted(
@@ -708,7 +804,7 @@ def render_seccion_impresion_por_modulos(plantel_sel, key_prefix="modulos_nc"):
         st.info("Selecciona al menos una categoría para mostrar e imprimir estudiantes.")
         return
 
-    df_detalle_filtrado = filtrar_detalle_por_categorias_modulos(df_base, seleccion)
+    df_detalle_filtrado = filtrar_detalle_por_categorias_modulos(df_con_conteo, seleccion)
     df_resumen_estudiantes = construir_resumen_estudiantes_por_modulos(df_detalle_filtrado)
 
     estudiantes_unicos = (
@@ -933,10 +1029,9 @@ def obtener_seguimiento_plantel(plantel_usuario):
 
     df_semana = df_semana.sort_values("Semana_num").reset_index(drop=True)
     df_semana = _normalizar_porcentaje_seguimiento(df_semana, plantel_usuario)
-    df_semana["Etiqueta"] = df_semana.apply(
-        lambda r: f"{int(r['Cantidad'])} - {float(r['Porcentaje']):.2f}%",
-        axis=1
-    )
+    cantidades_label = pd.to_numeric(df_semana["Cantidad"], errors="coerce").fillna(0).round().astype(int).astype(str)
+    porcentajes_label = pd.to_numeric(df_semana["Porcentaje"], errors="coerce").fillna(0).map(lambda v: f"{float(v):.2f}%")
+    df_semana["Etiqueta"] = cantidades_label + " - " + porcentajes_label
     return df_semana
 
 
@@ -2364,6 +2459,7 @@ def generar_html_tabla_agrupada():
 # =========================
 def mostrar_indicadores_academicos():
     st.title("📊 Indicadores Académicos")
+    st.session_state["_indicadores_dataframe_widget_counter"] = 0
 
     tabla = cargar_resumen()
     df_matricula = cargar_matricula()
@@ -2409,10 +2505,15 @@ def mostrar_indicadores_academicos():
                 else "% Estudiantes no competentes"
             )
             tabla_ordenada = tabla_vista.sort_values(by=sort_col, ascending=False).copy()
-            tabla_ordenada["etiqueta"] = tabla_ordenada.apply(
-                lambda r: f"{int(r['Total estudiantes no competentes'])} - {float(r['% Estudiantes no competentes']):.2f}%",
-                axis=1
-            )
+            total_label = pd.to_numeric(
+                tabla_ordenada["Total estudiantes no competentes"],
+                errors="coerce"
+            ).fillna(0).round().astype(int).astype(str)
+            pct_label = pd.to_numeric(
+                tabla_ordenada["% Estudiantes no competentes"],
+                errors="coerce"
+            ).fillna(0).map(lambda v: f"{float(v):.2f}%")
+            tabla_ordenada["etiqueta"] = total_label + " - " + pct_label
 
             if vista == "% NO competencia":
                 y_col = "% Estudiantes no competentes"
