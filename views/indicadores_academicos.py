@@ -179,7 +179,7 @@ def construir_titulo_indicadores():
     semana = obtener_numero_semana_indicadores()
     if semana == "" or semana is None:
         return "📊 Indicadores Académicos"
-    return f"📊 Indicadores Académicos, semana {semana}"
+    return f"📊 Indicadores Académicos semana {semana}"
 
 
 def _cache_path(name):
@@ -407,7 +407,7 @@ def _preparar_columnas_detalle(df, incluir_metricas_internas=False):
 def preparar_detalle_no_competentes_presentacion(df):
     """
     Formatea específicamente la tabla de la sección:
-    "Estudiantes NO competentes X (Detalle)".
+    "Detalle de estudiantes con sus respectivos módulos NO competentes.".
 
     Resultado esperado en la vista final:
     - Incluye el mínimo tomado de la hoja Reprobacion.
@@ -1587,6 +1587,7 @@ def mostrar_grafica_seguimiento_estatal(show_title=True, show_footer=True):
         {
             "titulo": "Matrícula estatal",
             "valor": f"{matricula_val:,}",
+            "detalle": f"Tomada de la fila {SEGUIMIENTO_ESTATAL_NOMBRE} en la hoja Seguimiento.",
         },
         {
             "titulo": "Último total estatal NO competente",
@@ -2807,7 +2808,7 @@ def generar_html_no_competentes(plantel_sel):
     df = preparar_detalle_no_competentes_presentacion(obtener_detalle_no_competentes(plantel_sel))
     return exportar_html_imprimible(
         df,
-        titulo="Estudiantes NO competentes",
+        titulo="Detalle de estudiantes con sus respectivos módulos NO competentes",
         subtitulo=f"Plantel: {plantel_sel}",
     ).getvalue()
 
@@ -2829,7 +2830,7 @@ def generar_html_tabla_agrupada():
     tabla_con_total = agregar_fila_total(cargar_resumen())
     return exportar_html_imprimible(
         tabla_con_total,
-        titulo="Estudiantes agrupados por módulos NO competentes",
+        titulo="Estudiantes agrupados por el número de módulos NO competentes",
         subtitulo="(Vista agrupada con TOTAL)",
         filename="agrupados_no_competentes.html",
     ).getvalue()
@@ -2971,7 +2972,7 @@ def mostrar_indicadores_academicos():
                 if not mostrar_grafica_seguimiento_plantel(plantel_sel, show_title=False, show_footer=True):
                     st.info(f"ℹ️ No hay datos de seguimiento semanal para **{plantel_sel}** en la hoja SEGUIMIENTO.")
 
-            st.subheader("📋 Estudiantes agrupados por módulos NO competentes")
+            st.subheader("📋 Estudiantes agrupados por el número de módulos NO competentes")
             tabla_con_total = agregar_fila_total(tabla_vista)
             st.dataframe(tabla_con_total, use_container_width=True)
             render_botones_descarga_detalle(
@@ -2991,7 +2992,7 @@ def mostrar_indicadores_academicos():
 
         if plantel_sel == "Todos":
             if not st.session_state.get("indicadores_admin_filtros_aplicados", False):
-                st.markdown("### ⚠️ Estudiantes NO competentes (Detalle) — Todos")
+                st.markdown("### ⚠️ Detalle de estudiantes con sus respectivos módulos NO competentes. – Todos")
                 st.info("Presiona **Aplicar filtros** para cargar el detalle general de todos los planteles.")
             else:
                 with st.spinner("Cargando detalle general de estudiantes NO competentes..."):
@@ -3003,7 +3004,8 @@ def mostrar_indicadores_academicos():
                     else len(df_print)
                 )
 
-                st.markdown(f"### ⚠️ Estudiantes NO competentes {total_nc_admin} (Detalle) — Todos")
+                st.markdown("### ⚠️ Detalle de estudiantes con sus respectivos módulos NO competentes. – Todos")
+                st.caption(f"Total de estudiantes NO competentes: {total_nc_admin:,}")
                 if df_print.empty:
                     st.info("ℹ️ No hay registros de NO competentes para **Todos**.")
                 else:
@@ -3053,7 +3055,8 @@ def mostrar_indicadores_academicos():
             else:
                 total_nc_admin = df_print["matricula"].nunique() if "matricula" in df_print.columns else len(df_print)
 
-            st.markdown(f"### ⚠️ Estudiantes NO competentes {total_nc_admin} (Detalle) — {plantel_sel}")
+            st.markdown(f"### ⚠️ Detalle de estudiantes con sus respectivos módulos NO competentes. – {plantel_sel}")
+            st.caption(f"Total de estudiantes NO competentes: {total_nc_admin:,}")
             if df_print.empty:
                 st.info(f"ℹ️ No hay registros de NO competentes para **{plantel_sel}**.")
             else:
@@ -3247,12 +3250,13 @@ def mostrar_indicadores_academicos():
             },
         ])
 
-        st.subheader(f"📋 Estudiantes del plantel: {plantel_usuario}")
+        st.subheader(f"📋 Estudiantes agrupados por el número de módulos NO competentes – {plantel_usuario}")
         st.dataframe(tabla_filtrada, use_container_width=True)
 
         df_exportar = preparar_detalle_no_competentes_presentacion(obtener_detalle_no_competentes(plantel_usuario))
 
-        st.subheader(f"⚠️ Estudiantes NO competentes {total_nc} (Detalle)")
+        st.subheader(f"⚠️ Detalle de estudiantes con sus respectivos módulos NO competentes. – {plantel_usuario}")
+        st.caption(f"Total de estudiantes NO competentes: {total_nc:,}")
         if df_exportar.empty:
             st.info("ℹ️ No hay registros de NO competentes para este plantel.")
         else:
