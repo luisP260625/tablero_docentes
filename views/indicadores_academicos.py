@@ -76,12 +76,110 @@ COLUMNAS_METRICAS_OCULTAS_PRESENTACION = [
 # Se mantiene el mismo criterio del resumen: 1, 2, 3... 10 y 11 o más.
 CATEGORIAS_MODULOS_NC = [str(i) for i in range(1, 11)] + ["11 o más"]
 
+# Fila estatal que se toma desde la hoja Seguimiento.
+SEGUIMIENTO_ESTATAL_NOMBRE = "CONALEP Estado de México"
+VISTA_COMPORTAMIENTO_ESTATAL = "Comportamiento estatal"
+
 
 # =========================
 # Helpers base
 # =========================
 def slug(v):
     return re.sub(r"[^a-zA-Z0-9_-]+", "_", str(v).strip())
+
+
+def obtener_numero_semana_indicadores():
+    """
+    Devuelve la semana académica que debe mostrarse en el encabezado.
+
+    Importante:
+    - NO usa la semana calendario del sistema.
+    - Toma la semana más reciente con información desde la hoja Seguimiento.
+    - Prioriza la fila estatal: CONALEP Estado de México.
+    - Si no encuentra la fila estatal, revisa todas las filas de Seguimiento.
+    """
+
+    def _semana_maxima_con_datos(df_semana):
+        if df_semana is None or getattr(df_semana, "empty", True):
+            return None
+        if "Semana_num" not in df_semana.columns:
+            return None
+
+        d = df_semana.copy()
+        d["Semana_num"] = pd.to_numeric(d["Semana_num"], errors="coerce")
+        d = d[d["Semana_num"].notna()].copy()
+
+        if d.empty:
+            return None
+
+        # Preferir semanas que realmente tengan información capturada.
+        # Esto evita tomar columnas futuras vacías o precargadas.
+        mascara = pd.Series(False, index=d.index)
+        if "Cantidad" in d.columns:
+            cantidad = pd.to_numeric(d["Cantidad"], errors="coerce").fillna(0)
+            mascara = mascara | (cantidad.abs() > 0)
+        if "Porcentaje" in d.columns:
+            porcentaje = pd.to_numeric(d["Porcentaje"], errors="coerce").fillna(0)
+            mascara = mascara | (porcentaje.abs() > 0)
+
+        if mascara.any():
+            return int(d.loc[mascara, "Semana_num"].max())
+
+        return int(d["Semana_num"].max())
+
+    # 1) Primero intentar con la fila estatal de Seguimiento.
+    try:
+        seguimiento_estatal, _ = obtener_seguimiento_estatal()
+        semana = _semana_maxima_con_datos(seguimiento_estatal)
+        if semana is not None:
+            return semana
+    except Exception:
+        pass
+
+    # 2) Respaldo: revisar todas las filas de la hoja Seguimiento.
+    try:
+        df_seguimiento = cargar_seguimiento()
+        if df_seguimiento is None or getattr(df_seguimiento, "empty", True):
+            return ""
+
+        mapping = _mapear_columnas_seguimiento(df_seguimiento)
+        semanas_con_datos = []
+
+        for _, meta in mapping.items():
+            week_num = meta.get("week_num")
+            if week_num is None:
+                continue
+
+            tiene_datos = False
+            col_cantidad = meta.get("cantidad")
+            col_porcentaje = meta.get("porcentaje")
+
+            if col_cantidad is not None and col_cantidad in df_seguimiento.columns:
+                valores = pd.to_numeric(df_seguimiento[col_cantidad], errors="coerce")
+                if valores.fillna(0).abs().sum() > 0:
+                    tiene_datos = True
+
+            if col_porcentaje is not None and col_porcentaje in df_seguimiento.columns:
+                valores = pd.to_numeric(df_seguimiento[col_porcentaje], errors="coerce")
+                if valores.fillna(0).abs().sum() > 0:
+                    tiene_datos = True
+
+            if tiene_datos:
+                semanas_con_datos.append(int(week_num))
+
+        if semanas_con_datos:
+            return max(semanas_con_datos)
+    except Exception:
+        pass
+
+    return ""
+
+
+def construir_titulo_indicadores():
+    semana = obtener_numero_semana_indicadores()
+    if semana == "" or semana is None:
+        return "📊 Indicadores Académicos"
+    return f"📊 Indicadores Académicos, semana {semana}"
 
 
 def _cache_path(name):
@@ -934,6 +1032,51 @@ def _obtener_matricula_total_plantel(plantel_usuario):
     return float(pd.to_numeric(dfp[col_matricula], errors="coerce").fillna(0).sum())
 
 
+def _normalizar_porcentaje_seguimiento_con_matricula(df_semana, matricula=0.0):
+    """
+    Normaliza una serie de porcentajes usando una matrícula conocida.
+
+    Se usa para el comportamiento estatal porque la matrícula debe leerse desde
+    la misma fila de la hoja Seguimiento, no desde la hoja Matricula por plantel.
+    """
+    if df_semana is None or getattr(df_semana, "empty", True) or "Porcentaje" not in df_semana.columns:
+        return df_semana
+
+    out = df_semana.copy()
+    valores = pd.to_numeric(out["Porcentaje"], errors="coerce")
+
+    max_abs = valores.abs().max(skipna=True)
+    if pd.isna(max_abs):
+        out["Porcentaje"] = 0.0
+        return out
+
+    try:
+        matricula = float(matricula or 0)
+    except Exception:
+        matricula = 0.0
+
+    if matricula > 0 and "Cantidad" in out.columns:
+        cantidades = pd.to_numeric(out["Cantidad"], errors="coerce")
+        pct_calculado = (cantidades / matricula) * 100.0
+        validos = valores.notna() & pct_calculado.notna()
+
+        if max_abs == 0 and pct_calculado.fillna(0).abs().max() > 0:
+            valores = pct_calculado
+        elif max_abs <= 1 and validos.any():
+            diferencia_directa = (valores[validos] - pct_calculado[validos]).abs().median()
+            diferencia_escalada = ((valores[validos] * 100.0) - pct_calculado[validos]).abs().median()
+
+            if diferencia_escalada < diferencia_directa:
+                valores = valores * 100.0
+        elif max_abs <= 1:
+            valores = valores * 100.0
+    elif max_abs <= 1:
+        valores = valores * 100.0
+
+    out["Porcentaje"] = valores.replace([float("inf"), -float("inf")], 0).fillna(0).round(2)
+    return out
+
+
 def _normalizar_porcentaje_seguimiento(df_semana, plantel_usuario=None):
     """
     Corrige el porcentaje del seguimiento semanal sin alterar las cantidades.
@@ -1033,6 +1176,124 @@ def obtener_seguimiento_plantel(plantel_usuario):
     porcentajes_label = pd.to_numeric(df_semana["Porcentaje"], errors="coerce").fillna(0).map(lambda v: f"{float(v):.2f}%")
     df_semana["Etiqueta"] = cantidades_label + " - " + porcentajes_label
     return df_semana
+
+
+def _filtrar_fila_estatal_seguimiento(df_seguimiento):
+    """Localiza la fila CONALEP Estado de México dentro de la hoja Seguimiento."""
+    if df_seguimiento is None or getattr(df_seguimiento, "empty", True):
+        return pd.DataFrame()
+
+    objetivo_norm = _norm_txt(SEGUIMIENTO_ESTATAL_NOMBRE)
+    columnas_preferidas = [
+        _find_col_like(df_seguimiento, ["Plantel"]),
+        _find_col_like(df_seguimiento, ["Nombre", "Institución", "Institucion", "Entidad"]),
+    ]
+    columnas_preferidas = [c for c in columnas_preferidas if c is not None]
+
+    columnas_busqueda = columnas_preferidas or list(df_seguimiento.columns)
+
+    for col in columnas_busqueda:
+        try:
+            valores_norm = df_seguimiento[col].apply(_norm_txt)
+            exact = df_seguimiento[valores_norm == objetivo_norm].copy()
+            if not exact.empty:
+                return exact
+
+            contiene = df_seguimiento[
+                valores_norm.apply(lambda v: bool(v) and (objetivo_norm in v or v in objetivo_norm))
+            ].copy()
+            if not contiene.empty:
+                return contiene
+        except Exception:
+            continue
+
+    return pd.DataFrame()
+
+
+def _obtener_matricula_fila_seguimiento(df_fila):
+    """Extrae la matrícula desde la fila estatal de Seguimiento."""
+    if df_fila is None or getattr(df_fila, "empty", True):
+        return 0.0
+
+    col_matricula = _find_col_like(
+        df_fila,
+        [
+            "matriculaTotal", "matrícula total", "matricula total",
+            "Matrícula", "Matricula", "matricula", "MATRICULA",
+        ],
+    )
+
+    if not col_matricula or col_matricula not in df_fila.columns:
+        return 0.0
+
+    valores = pd.to_numeric(df_fila[col_matricula], errors="coerce").fillna(0)
+    if valores.empty:
+        return 0.0
+
+    # Normalmente existe una sola fila estatal; si hubiera más de una, se toma
+    # el total acumulado para no perder información.
+    return float(valores.sum())
+
+
+@st.cache_data(show_spinner=False)
+def obtener_seguimiento_estatal():
+    """
+    Devuelve el comportamiento estatal desde la hoja Seguimiento.
+
+    La fuente es exclusivamente la fila que dice CONALEP Estado de México.
+    De esa misma fila se toman:
+    - matrícula,
+    - columnas Sem X,
+    - columnas Sem X %.
+    """
+    columnas_default = ["Semana", "Cantidad", "Porcentaje", "Etiqueta", "Semana_num"]
+
+    df_seguimiento = cargar_seguimiento()
+    if df_seguimiento is None or getattr(df_seguimiento, "empty", True):
+        return pd.DataFrame(columns=columnas_default), 0.0
+
+    df_estado = _filtrar_fila_estatal_seguimiento(df_seguimiento)
+    if df_estado is None or df_estado.empty:
+        return pd.DataFrame(columns=columnas_default), 0.0
+
+    matricula_estatal = _obtener_matricula_fila_seguimiento(df_estado)
+    mapping = _mapear_columnas_seguimiento(df_estado)
+    if not mapping:
+        return pd.DataFrame(columns=columnas_default), matricula_estatal
+
+    rows = []
+    for semana, meta in mapping.items():
+        col_cantidad = meta.get("cantidad")
+        col_porcentaje = meta.get("porcentaje")
+
+        cantidad = 0
+        porcentaje = 0.0
+
+        if col_cantidad is not None and col_cantidad in df_estado.columns:
+            cantidad = pd.to_numeric(df_estado[col_cantidad], errors="coerce").fillna(0).sum()
+
+        if col_porcentaje is not None and col_porcentaje in df_estado.columns:
+            porcentaje = pd.to_numeric(df_estado[col_porcentaje], errors="coerce").fillna(0).mean()
+
+        rows.append({
+            "Semana": semana,
+            "Cantidad": int(round(float(cantidad))) if pd.notna(cantidad) else 0,
+            "Porcentaje": float(porcentaje) if pd.notna(porcentaje) else 0.0,
+            "Semana_num": meta.get("week_num") or 0,
+        })
+
+    df_semana = pd.DataFrame(rows)
+    if df_semana.empty:
+        return pd.DataFrame(columns=columnas_default), matricula_estatal
+
+    df_semana = df_semana.sort_values("Semana_num").reset_index(drop=True)
+    df_semana = _normalizar_porcentaje_seguimiento_con_matricula(df_semana, matricula_estatal)
+
+    cantidades_label = pd.to_numeric(df_semana["Cantidad"], errors="coerce").fillna(0).round().astype(int).astype(str)
+    porcentajes_label = pd.to_numeric(df_semana["Porcentaje"], errors="coerce").fillna(0).map(lambda v: f"{float(v):.2f}%")
+    df_semana["Etiqueta"] = cantidades_label + " - " + porcentajes_label
+
+    return df_semana, matricula_estatal
 
 
 def _datos_tendencia_seguimiento(df):
@@ -1227,6 +1488,126 @@ def mostrar_grafica_seguimiento_plantel(plantel_objetivo, show_title=True, show_
     st.plotly_chart(fig, use_container_width=True)
 
     resumen = _resumen_tendencia_seguimiento(seguimiento_plantel)
+    if show_footer and resumen:
+        st.caption(resumen)
+
+    return True
+
+
+def construir_figura_seguimiento_estatal(show_title=True):
+    seguimiento_estatal, matricula_estatal = obtener_seguimiento_estatal()
+
+    if seguimiento_estatal is None or seguimiento_estatal.empty:
+        return None, seguimiento_estatal, matricula_estatal
+
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    fig.add_trace(
+        go.Bar(
+            x=seguimiento_estatal["Semana"],
+            y=seguimiento_estatal["Cantidad"],
+            name="Cantidad",
+            text=seguimiento_estatal["Etiqueta"],
+            textposition="outside",
+            textangle=-90,
+            marker_color="#FFC107",
+            cliponaxis=False,
+            outsidetextfont=dict(size=LABEL_FONT_SIZE_ADMIN + 2, color="#2b2b2b"),
+            hoverinfo="skip",
+            hovertemplate="",
+            customdata=seguimiento_estatal["Porcentaje"],
+        ),
+        secondary_y=False,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=seguimiento_estatal["Semana"],
+            y=seguimiento_estatal["Porcentaje"],
+            name="% NO competencia estatal",
+            mode="lines+markers",
+            line=dict(color="#1f77b4", width=3),
+            marker=dict(size=9),
+            hoverinfo="skip",
+            hovertemplate="",
+        ),
+        secondary_y=True,
+    )
+
+    max_cantidad = float(seguimiento_estatal["Cantidad"].max()) if not seguimiento_estatal.empty else 0
+    max_porcentaje = float(seguimiento_estatal["Porcentaje"].max()) if not seguimiento_estatal.empty else 0
+
+    fig.update_layout(
+        title_text=f"Comportamiento estatal — {SEGUIMIENTO_ESTATAL_NOMBRE}" if show_title else "",
+        height=560,
+        hovermode=False,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        uniformtext=dict(minsize=LABEL_FONT_SIZE_ADMIN + 2, mode="show"),
+        margin=dict(t=90 if show_title else 40, b=40),
+    )
+    fig.update_xaxes(
+        title_text="",
+        showticklabels=True,
+        ticks="",
+        showgrid=False,
+        tickangle=0,
+        tickfont=dict(size=12),
+    )
+    fig.update_yaxes(
+        title_text="",
+        showticklabels=False,
+        ticks="",
+        showgrid=False,
+        zeroline=False,
+        range=[0, max_cantidad * Y_AXIS_PADDING_MULT if max_cantidad else 1],
+        secondary_y=False,
+    )
+    fig.update_yaxes(
+        title_text="",
+        showticklabels=False,
+        ticks="",
+        showgrid=False,
+        zeroline=False,
+        range=[0, max_porcentaje * Y_AXIS_PADDING_MULT if max_porcentaje else 1],
+        secondary_y=True,
+    )
+
+    return fig, seguimiento_estatal, matricula_estatal
+
+
+def mostrar_grafica_seguimiento_estatal(show_title=True, show_footer=True):
+    fig, seguimiento_estatal, matricula_estatal = construir_figura_seguimiento_estatal(show_title=show_title)
+
+    if fig is None or seguimiento_estatal is None or seguimiento_estatal.empty:
+        return False
+
+    ultimo = seguimiento_estatal.iloc[-1]
+    tendencia = _datos_tendencia_seguimiento(seguimiento_estatal)
+    matricula_val = int(round(float(matricula_estatal or 0)))
+
+    _render_cards_resumen([
+        {
+            "titulo": "Matrícula estatal",
+            "valor": f"{matricula_val:,}",
+        },
+        {
+            "titulo": "Último total estatal NO competente",
+            "valor": f"{int(ultimo['Cantidad']):,}",
+            "detalle": f"Dato de {ultimo['Semana']}.",
+        },
+        {
+            "titulo": "Último porcentaje estatal",
+            "valor": f"{float(ultimo['Porcentaje']):.2f}%",
+            "detalle": f"Dato de {ultimo['Semana']}.",
+        },
+        {
+            "titulo": "Tendencia estatal vs semana previa",
+            "valor": tendencia["valor_card"],
+            "detalle": tendencia["detalle_card"],
+        },
+    ])
+
+    st.plotly_chart(fig, use_container_width=True)
+
+    resumen = _resumen_tendencia_seguimiento(seguimiento_estatal)
     if show_footer and resumen:
         st.caption(resumen)
 
@@ -2458,7 +2839,7 @@ def generar_html_tabla_agrupada():
 # Función principal
 # =========================
 def mostrar_indicadores_academicos():
-    st.title("📊 Indicadores Académicos")
+    st.title(construir_titulo_indicadores())
     st.session_state["_indicadores_dataframe_widget_counter"] = 0
 
     tabla = cargar_resumen()
@@ -2479,14 +2860,42 @@ def mostrar_indicadores_academicos():
         if "indicadores_admin_filtros_aplicados" not in st.session_state:
             st.session_state.indicadores_admin_filtros_aplicados = False
 
+        vista = st.radio(
+            "Visualización de la gráfica:",
+            ["% NO competencia", "Total NO competentes", VISTA_COMPORTAMIENTO_ESTATAL],
+            horizontal=True,
+            key="indicadores_admin_vista_grafica",
+        )
+        es_vista_estatal = vista == VISTA_COMPORTAMIENTO_ESTATAL
+
         with st.form("filtros_indicadores_admin"):
-            vista = st.radio(
-                "Visualización de la gráfica:",
-                ["% NO competencia", "Total NO competentes"],
-                horizontal=True
-            )
-            plantel_sel = st.selectbox("Selecciona un plantel", opciones_plantel)
-            filtros_aplicados = st.form_submit_button("Aplicar filtros")
+            if es_vista_estatal:
+                st.selectbox(
+                    "Selecciona un plantel",
+                    ["No aplica para comportamiento estatal"],
+                    index=0,
+                    disabled=True,
+                    key="indicadores_admin_plantel_estatal_bloqueado",
+                    help="En comportamiento estatal se toma exclusivamente la fila CONALEP Estado de México de la hoja Seguimiento.",
+                )
+                filtros_aplicados = st.form_submit_button("Aplicar filtros", disabled=True)
+                plantel_sel = "Todos"
+            else:
+                plantel_sel = st.selectbox(
+                    "Selecciona un plantel",
+                    opciones_plantel,
+                    key="indicadores_admin_plantel_sel",
+                )
+                filtros_aplicados = st.form_submit_button("Aplicar filtros")
+
+        if es_vista_estatal:
+            st.markdown(f"### 📈 Comportamiento estatal — {SEGUIMIENTO_ESTATAL_NOMBRE}")
+            if not mostrar_grafica_seguimiento_estatal(show_title=False, show_footer=True):
+                st.info(
+                    f"ℹ️ No hay datos estatales para **{SEGUIMIENTO_ESTATAL_NOMBRE}** en la hoja Seguimiento. "
+                    "Verifica que exista una fila con ese nombre y columnas tipo Sem X y Sem X %."
+                )
+            return
 
         if filtros_aplicados:
             st.session_state.indicadores_admin_filtros_aplicados = True
