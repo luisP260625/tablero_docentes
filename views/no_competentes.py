@@ -1,10 +1,15 @@
+import base64
+import io
+import json
 import re
+import uuid
 from typing import List, Optional, Sequence
 
 import pandas as pd
 import plotly.graph_objects as go
 import polars as pl
 import streamlit as st
+import streamlit.components.v1 as components
 
 
 # ============================================================
@@ -237,6 +242,230 @@ def calcular_top_no_competencia(
     )
 
 
+def calcular_no_competencia_completa(
+    df_filtrado: pl.DataFrame,
+    columna: str,
+    semana: str,
+    plantel: str,
+) -> pl.DataFrame:
+    """
+    Calcula la tabla completa para exportar a Excel.
+
+    Importante:
+    - No limita a Top 15.
+    - Usa exactamente el DataFrame ya filtrado por semana y plantel.
+    - Agrupa por la misma columna que usa la gráfica: DOCENTE o MODULO.
+    """
+    if df_filtrado.is_empty() or columna not in df_filtrado.columns:
+        return pl.DataFrame()
+
+    return (
+        df_filtrado
+        .lazy()
+        .filter(
+            pl.col(columna).is_not_null()
+            & (
+                ~pl.col(columna)
+                .str.to_lowercase()
+                .is_in(["", "nan", "none", "null"])
+            )
+        )
+        .group_by(columna)
+        .agg([
+            pl.sum("NO COMPETENTES").alias("NO_COMP"),
+            pl.sum("TOTAL ALUMNOS").alias("TOTAL"),
+        ])
+        .filter(pl.col("TOTAL") > 0)
+        .with_columns([
+            pl.lit(str(semana)).alias("SEMANA"),
+            pl.lit(str(plantel)).alias("PLANTEL"),
+            (pl.col("TOTAL") - pl.col("NO_COMP")).alias("COMPETENTES"),
+            ((pl.col("NO_COMP") / pl.col("TOTAL") * 100).round(2)).alias("PORCENTAJE"),
+        ])
+        .select([
+            "SEMANA",
+            "PLANTEL",
+            columna,
+            "NO_COMP",
+            "COMPETENTES",
+            "TOTAL",
+            "PORCENTAJE",
+        ])
+        .sort(
+            by=["PORCENTAJE", "NO_COMP", "TOTAL", columna],
+            descending=[True, True, True, False],
+        )
+        .collect()
+    )
+
+
+def _limpiar_nombre_archivo(texto: str) -> str:
+    """
+    Genera nombres de archivo seguros para la descarga.
+    """
+    texto_limpio = re.sub(r"[^A-Za-z0-9_-]+", "_", str(texto or "").strip())
+    texto_limpio = texto_limpio.strip("_")
+
+    return texto_limpio or "archivo"
+
+
+def _generar_excel_base64(
+    df_exportar: pl.DataFrame,
+    columna: str,
+    nombre_hoja: str,
+) -> str:
+    """
+    Convierte el DataFrame completo a Excel y lo deja listo para descargar
+    desde el botón personalizado de la barra de herramientas de Plotly.
+    """
+    if df_exportar is None or df_exportar.is_empty():
+        return ""
+
+    df_excel = df_exportar.to_pandas()
+
+    df_excel = df_excel.rename(columns={
+        "SEMANA": "Semana",
+        "PLANTEL": "Plantel",
+        "NO_COMP": "No competentes",
+        "COMPETENTES": "Competentes",
+        "TOTAL": "Total alumnos",
+        "PORCENTAJE": "% No competencia",
+    })
+
+    columnas_ordenadas = [
+        "Semana",
+        "Plantel",
+        columna,
+        "No competentes",
+        "Competentes",
+        "Total alumnos",
+        "% No competencia",
+    ]
+    columnas_existentes = [col for col in columnas_ordenadas if col in df_excel.columns]
+    df_excel = df_excel[columnas_existentes]
+
+    salida = io.BytesIO()
+
+    try:
+        with pd.ExcelWriter(salida, engine="openpyxl") as writer:
+            sheet_name = nombre_hoja[:31] or "Datos"
+            df_excel.to_excel(writer, index=False, sheet_name=sheet_name)
+
+            worksheet = writer.sheets[sheet_name]
+
+            # Ajuste sencillo de anchos para que el archivo sea legible al abrirlo.
+            for column_cells in worksheet.columns:
+                max_length = 0
+                column_letter = column_cells[0].column_letter
+
+                for cell in column_cells:
+                    value = "" if cell.value is None else str(cell.value)
+                    max_length = max(max_length, len(value))
+
+                worksheet.column_dimensions[column_letter].width = min(max_length + 2, 55)
+
+            # Formato numérico del porcentaje.
+            if "% No competencia" in df_excel.columns:
+                porcentaje_col_idx = df_excel.columns.get_loc("% No competencia") + 1
+                for row in range(2, worksheet.max_row + 1):
+                    worksheet.cell(row=row, column=porcentaje_col_idx).number_format = '0.00'
+
+    except Exception as exc:
+        st.error(
+            "No se pudo generar el Excel. Verifica que tengas instalado openpyxl "
+            "en tu entorno de Streamlit. Detalle: " + str(exc)
+        )
+        return ""
+
+    return base64.b64encode(salida.getvalue()).decode("utf-8")
+
+
+def _renderizar_plotly_con_descarga_excel(
+    fig: go.Figure,
+    alto: int,
+    nombre_archivo_imagen: str,
+    nombre_archivo_excel: str,
+    excel_base64: str,
+):
+    """
+    Renderiza Plotly como componente HTML para poder agregar un botón
+    personalizado en la barra de herramientas que descargue el Excel completo.
+    """
+    plot_id = f"plotly_{uuid.uuid4().hex}"
+    fig_json = fig.to_json()
+
+    html = f"""
+    <div id="{plot_id}" style="width:100%;height:{alto}px;"></div>
+    <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+    <script>
+        const fig = {fig_json};
+        const excelBase64 = {json.dumps(excel_base64)};
+        const excelFileName = {json.dumps(nombre_archivo_excel)};
+
+        const excelDownloadButton = {{
+            name: 'Descargar Excel completo',
+            title: 'Descargar Excel completo',
+            icon: {{
+                width: 512,
+                height: 512,
+                path: 'M256 32c17.7 0 32 14.3 32 32v192h70.1c28.5 0 42.8 34.5 22.6 54.6L278.6 412.7c-12.5 12.5-32.8 12.5-45.3 0L131.2 310.6c-20.2-20.2-5.9-54.6 22.6-54.6H224V64c0-17.7 14.3-32 32-32zM96 432h320c17.7 0 32 14.3 32 32s-14.3 32-32 32H96c-17.7 0-32-14.3-32-32s14.3-32 32-32z'
+            }},
+            click: function() {{
+                if (!excelBase64) {{
+                    alert('No hay datos disponibles para exportar.');
+                    return;
+                }}
+
+                const link = document.createElement('a');
+                link.href = 'data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,' + excelBase64;
+                link.download = excelFileName;
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+            }}
+        }};
+
+        const config = {{
+            displayModeBar: true,
+            displaylogo: false,
+            scrollZoom: false,
+            responsive: true,
+            modeBarButtonsToAdd: excelBase64 ? [excelDownloadButton] : [],
+            modeBarButtonsToRemove: [
+                'zoom2d',
+                'pan2d',
+                'select2d',
+                'lasso2d',
+                'autoScale2d',
+                'resetScale2d',
+                'zoomIn2d',
+                'zoomOut2d'
+            ],
+            toImageButtonOptions: {{
+                format: 'png',
+                filename: {json.dumps(nombre_archivo_imagen)},
+                height: 700,
+                width: 1400,
+                scale: 2
+            }}
+        }};
+
+        const graphDiv = document.getElementById('{plot_id}');
+        Plotly.newPlot(graphDiv, fig.data, fig.layout, config);
+
+        window.addEventListener('resize', function() {{
+            Plotly.Plots.resize(graphDiv);
+        }});
+    </script>
+    """
+
+    components.html(
+        html,
+        height=alto + 45,
+        scrolling=False,
+    )
+
+
 # ============================================================
 # GRÁFICA HORIZONTAL COLOR VINO
 # ============================================================
@@ -245,6 +474,8 @@ def graficar_barras_horizontales(
     columna: str,
     titulo: str = "",
     nombre_archivo: str = "grafica_no_competencia",
+    df_excel_completo: Optional[pl.DataFrame] = None,
+    nombre_archivo_excel: str = "datos_no_competencia.xlsx",
 ):
     """
     Muestra gráfica horizontal tipo color vino.
@@ -255,6 +486,7 @@ def graficar_barras_horizontales(
     - Etiquetas a la derecha: NO_COMP - PORCENTAJE%.
     - Eje X inferior con porcentaje.
     - Herramientas de Plotly habilitadas para descargar imagen.
+    - Ícono extra en la barra de herramientas para descargar Excel completo.
     """
     if df is None or df.is_empty():
         st.info("No hay datos para graficar.")
@@ -271,6 +503,7 @@ def graficar_barras_horizontales(
 
     max_x = max(porcentajes) if porcentajes else 0
     rango_x = max_x * 1.22 if max_x > 0 else 1
+    alto_grafica = max(520, len(etiquetas) * 38 + 120)
 
     fig = go.Figure()
 
@@ -309,7 +542,7 @@ def graficar_barras_horizontales(
                 color="#222222",
             ),
         ),
-        height=max(520, len(etiquetas) * 38 + 120),
+        height=alto_grafica,
         margin=dict(
             l=260,
             r=160,
@@ -364,22 +597,18 @@ def graficar_barras_horizontales(
         fixedrange=False,
     )
 
-    st.plotly_chart(
-        fig,
-        use_container_width=True,
-        config={
-            "displayModeBar": True,
-            "displaylogo": False,
-            "scrollZoom": True,
-            "responsive": True,
-            "toImageButtonOptions": {
-                "format": "png",
-                "filename": nombre_archivo,
-                "height": 700,
-                "width": 1400,
-                "scale": 2,
-            },
-        },
+    excel_base64 = _generar_excel_base64(
+        df_exportar=df_excel_completo,
+        columna=columna,
+        nombre_hoja=columna.title(),
+    )
+
+    _renderizar_plotly_con_descarga_excel(
+        fig=fig,
+        alto=alto_grafica,
+        nombre_archivo_imagen=nombre_archivo,
+        nombre_archivo_excel=nombre_archivo_excel,
+        excel_base64=excel_base64,
     )
 
 
@@ -439,6 +668,9 @@ def mostrar(df, plantel_usuario, es_admin):
         st.warning("No hay datos para la semana y plantel seleccionados.")
         return
 
+    nombre_seguro_plantel = _limpiar_nombre_archivo(plantel)
+    nombre_seguro_semana = _limpiar_nombre_archivo(semana)
+
     # ========================================================
     # TOP 15 DOCENTES
     # ========================================================
@@ -451,12 +683,24 @@ def mostrar(df, plantel_usuario, es_admin):
         incluir_plantel=plantel,
     )
 
+    docentes_excel = calcular_no_competencia_completa(
+        df_filtrado=df_filtrado,
+        columna="DOCENTE",
+        semana=semana,
+        plantel=plantel,
+    )
+
     if not docentes_top.is_empty():
         graficar_barras_horizontales(
             docentes_top,
             columna="DOCENTE",
-            titulo="Top 15 Docente con Mayor % de No Competencia",
-            nombre_archivo=f"top_15_docentes_no_competencia_{plantel}",
+            titulo="Top 15 Docentes con Mayor % de No Competencia",
+            nombre_archivo=f"top_15_docentes_no_competencia_{nombre_seguro_plantel}",
+            df_excel_completo=docentes_excel,
+            nombre_archivo_excel=(
+                f"docentes_no_competencia_{nombre_seguro_plantel}_"
+                f"semana_{nombre_seguro_semana}.xlsx"
+            ),
         )
     else:
         st.info("No hay datos disponibles para docentes.")
@@ -472,12 +716,24 @@ def mostrar(df, plantel_usuario, es_admin):
         top_n=15,
     )
 
+    modulos_excel = calcular_no_competencia_completa(
+        df_filtrado=df_filtrado,
+        columna="MODULO",
+        semana=semana,
+        plantel=plantel,
+    )
+
     if not modulos_top.is_empty():
         graficar_barras_horizontales(
             modulos_top,
             columna="MODULO",
-            titulo="Top 15 Módulo con Mayor % de No Competencia",
-            nombre_archivo=f"top_15_modulos_no_competencia_{plantel}",
+            titulo="Top 15 Módulos con Mayor % de No Competencia",
+            nombre_archivo=f"top_15_modulos_no_competencia_{nombre_seguro_plantel}",
+            df_excel_completo=modulos_excel,
+            nombre_archivo_excel=(
+                f"modulos_no_competencia_{nombre_seguro_plantel}_"
+                f"semana_{nombre_seguro_semana}.xlsx"
+            ),
         )
     else:
         st.info("No hay datos disponibles para módulos.")
