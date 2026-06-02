@@ -3,7 +3,7 @@ import io
 import json
 import re
 import uuid
-from typing import List, Optional, Sequence
+from typing import List, Optional, Sequence, Tuple
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -28,6 +28,8 @@ COLUMNAS_REQUERIDAS = [
     "NO COMPETENTES",
     "TOTAL ALUMNOS",
 ]
+
+VALORES_TEXTO_INVALIDOS = ["", "nan", "none", "null"]
 
 
 # ============================================================
@@ -110,6 +112,37 @@ def _validar_columnas(df: pl.DataFrame) -> bool:
         return False
 
     return True
+
+
+def _filtro_texto_valido(columna: str):
+    """
+    Genera una expresión Polars para descartar textos vacíos o inválidos.
+    """
+    return (
+        pl.col(columna).is_not_null()
+        & (
+            ~pl.col(columna)
+            .str.strip_chars()
+            .str.to_lowercase()
+            .is_in(VALORES_TEXTO_INVALIDOS)
+        )
+    )
+
+
+def _obtener_config_relacion(columna: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    Define qué columna relacionada debe agregarse al Excel.
+
+    - Si el Excel es por DOCENTE, se agrega la lista de MODULOS.
+    - Si el Excel es por MODULO, se agrega la lista de DOCENTES.
+    """
+    if columna == "DOCENTE":
+        return "MODULO", "MODULOS_RELACIONADOS", "Módulos que imparte"
+
+    if columna == "MODULO":
+        return "DOCENTE", "DOCENTES_RELACIONADOS", "Docentes que imparten el módulo"
+
+    return None, None, None
 
 
 def preparar_dataframe_base(df) -> pl.DataFrame:
@@ -195,11 +228,9 @@ def calcular_top_no_competencia(
     Fórmula:
     PORCENTAJE = NO_COMP / TOTAL * 100
 
-    Optimización:
-    - Trabaja sobre el DataFrame ya filtrado.
-    - Usa LazyFrame de Polars.
-    - No convierte a pandas.
-    - No genera Excel en memoria.
+    Importante:
+    - Esta función sigue limitada a Top 15 para la gráfica.
+    - El Excel completo se calcula en otra función.
     """
     if df_filtrado.is_empty() or columna not in df_filtrado.columns:
         return pl.DataFrame()
@@ -218,14 +249,7 @@ def calcular_top_no_competencia(
     return (
         df_filtrado
         .lazy()
-        .filter(
-            pl.col(columna).is_not_null()
-            & (
-                ~pl.col(columna)
-                .str.to_lowercase()
-                .is_in(["", "nan", "none", "null"])
-            )
-        )
+        .filter(_filtro_texto_valido(columna))
         .group_by(columna)
         .agg([
             pl.sum("NO COMPETENTES").alias("NO_COMP"),
@@ -254,43 +278,67 @@ def calcular_no_competencia_completa(
     Importante:
     - No limita a Top 15.
     - Usa exactamente el DataFrame ya filtrado por semana y plantel.
-    - Agrupa por la misma columna que usa la gráfica: DOCENTE o MODULO.
+    - Si se exporta por DOCENTE, agrega los módulos que imparte.
+    - Si se exporta por MODULO, agrega los docentes que imparten ese módulo.
     """
     if df_filtrado.is_empty() or columna not in df_filtrado.columns:
         return pl.DataFrame()
 
+    columna_relacionada, alias_relacion, _ = _obtener_config_relacion(columna)
+
+    agregaciones = [
+        pl.sum("NO COMPETENTES").alias("NO_COMP"),
+        pl.sum("TOTAL ALUMNOS").alias("TOTAL"),
+    ]
+
+    if columna_relacionada and columna_relacionada in df_filtrado.columns:
+        agregaciones.append(
+            pl.col(columna_relacionada)
+            .filter(_filtro_texto_valido(columna_relacionada))
+            .unique()
+            .sort()
+            .alias(alias_relacion)
+        )
+
+    expresiones_post = [
+        pl.lit(str(semana)).alias("SEMANA"),
+        pl.lit(str(plantel)).alias("PLANTEL"),
+        (pl.col("TOTAL") - pl.col("NO_COMP")).alias("COMPETENTES"),
+        ((pl.col("NO_COMP") / pl.col("TOTAL") * 100).round(2)).alias("PORCENTAJE"),
+    ]
+
+    if alias_relacion:
+        expresiones_post.append(
+            pl.col(alias_relacion)
+            .list.join("| ")
+            .alias(alias_relacion)
+        )
+
+    columnas_salida = [
+        "SEMANA",
+        "PLANTEL",
+        columna,
+    ]
+
+    if alias_relacion:
+        columnas_salida.append(alias_relacion)
+
+    columnas_salida.extend([
+        "NO_COMP",
+        "COMPETENTES",
+        "TOTAL",
+        "PORCENTAJE",
+    ])
+
     return (
         df_filtrado
         .lazy()
-        .filter(
-            pl.col(columna).is_not_null()
-            & (
-                ~pl.col(columna)
-                .str.to_lowercase()
-                .is_in(["", "nan", "none", "null"])
-            )
-        )
+        .filter(_filtro_texto_valido(columna))
         .group_by(columna)
-        .agg([
-            pl.sum("NO COMPETENTES").alias("NO_COMP"),
-            pl.sum("TOTAL ALUMNOS").alias("TOTAL"),
-        ])
+        .agg(agregaciones)
         .filter(pl.col("TOTAL") > 0)
-        .with_columns([
-            pl.lit(str(semana)).alias("SEMANA"),
-            pl.lit(str(plantel)).alias("PLANTEL"),
-            (pl.col("TOTAL") - pl.col("NO_COMP")).alias("COMPETENTES"),
-            ((pl.col("NO_COMP") / pl.col("TOTAL") * 100).round(2)).alias("PORCENTAJE"),
-        ])
-        .select([
-            "SEMANA",
-            "PLANTEL",
-            columna,
-            "NO_COMP",
-            "COMPETENTES",
-            "TOTAL",
-            "PORCENTAJE",
-        ])
+        .with_columns(expresiones_post)
+        .select(columnas_salida)
         .sort(
             by=["PORCENTAJE", "NO_COMP", "TOTAL", columna],
             descending=[True, True, True, False],
@@ -321,26 +369,43 @@ def _generar_excel_base64(
     if df_exportar is None or df_exportar.is_empty():
         return ""
 
+    _, alias_relacion, nombre_columna_relacion = _obtener_config_relacion(columna)
+
     df_excel = df_exportar.to_pandas()
 
-    df_excel = df_excel.rename(columns={
+    nombre_columna_principal = "Docente" if columna == "DOCENTE" else "Módulo"
+
+    rename_map = {
         "SEMANA": "Semana",
         "PLANTEL": "Plantel",
+        columna: nombre_columna_principal,
         "NO_COMP": "No competentes",
         "COMPETENTES": "Competentes",
         "TOTAL": "Total alumnos",
         "PORCENTAJE": "% No competencia",
-    })
+    }
+
+    if alias_relacion and nombre_columna_relacion:
+        rename_map[alias_relacion] = nombre_columna_relacion
+
+    df_excel = df_excel.rename(columns=rename_map)
 
     columnas_ordenadas = [
         "Semana",
         "Plantel",
-        columna,
+        nombre_columna_principal,
+    ]
+
+    if nombre_columna_relacion:
+        columnas_ordenadas.append(nombre_columna_relacion)
+
+    columnas_ordenadas.extend([
         "No competentes",
         "Competentes",
         "Total alumnos",
         "% No competencia",
-    ]
+    ])
+
     columnas_existentes = [col for col in columnas_ordenadas if col in df_excel.columns]
     df_excel = df_excel[columnas_existentes]
 
@@ -353,6 +418,9 @@ def _generar_excel_base64(
 
             worksheet = writer.sheets[sheet_name]
 
+            # Congelar encabezado para revisar mejor archivos largos.
+            worksheet.freeze_panes = "A2"
+
             # Ajuste sencillo de anchos para que el archivo sea legible al abrirlo.
             for column_cells in worksheet.columns:
                 max_length = 0
@@ -362,7 +430,7 @@ def _generar_excel_base64(
                     value = "" if cell.value is None else str(cell.value)
                     max_length = max(max_length, len(value))
 
-                worksheet.column_dimensions[column_letter].width = min(max_length + 2, 55)
+                worksheet.column_dimensions[column_letter].width = min(max_length + 2, 70)
 
             # Formato numérico del porcentaje.
             if "% No competencia" in df_excel.columns:
@@ -485,8 +553,9 @@ def graficar_barras_horizontales(
     - Color vino.
     - Etiquetas a la derecha: NO_COMP - PORCENTAJE%.
     - Eje X inferior con porcentaje.
-    - Herramientas de Plotly habilitadas para descargar imagen.
+    - La gráfica conserva solo Top 15.
     - Ícono extra en la barra de herramientas para descargar Excel completo.
+    - Se ocultan íconos de Zoom, Pan, Box Select, Lasso Select, Autoscale y Reset Axes.
     """
     if df is None or df.is_empty():
         st.info("No hay datos para graficar.")
@@ -554,6 +623,7 @@ def graficar_barras_horizontales(
         bargap=0.25,
         showlegend=False,
         hovermode=False,
+        dragmode=False,
         font=dict(
             family="Arial, sans-serif",
             color=TEXT_COLOR,
@@ -578,7 +648,7 @@ def graficar_barras_horizontales(
             size=14,
             color="#333333",
         ),
-        fixedrange=False,
+        fixedrange=True,
     )
 
     fig.update_yaxes(
@@ -594,7 +664,7 @@ def graficar_barras_horizontales(
             color="#333333",
         ),
         automargin=True,
-        fixedrange=False,
+        fixedrange=True,
     )
 
     excel_base64 = _generar_excel_base64(
