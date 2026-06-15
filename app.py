@@ -32,6 +32,77 @@ st.markdown(
 )
 
 
+# ==========================================================
+# Configuración rol docente
+# ==========================================================
+# Recomendado: en tu archivo de usuarios/permisos agregar ROL_DOCENTE.
+# Compatibilidad: si el campo plantel viene como "*NOMBRE DOCENTE",
+# también se toma como rol docente.
+ROL_DOCENTE_CODES = {
+    "ROL_DOCENTE",
+    "DOCENTE",
+    "TIPO_DOCENTE",
+    "USUARIO_DOCENTE",
+}
+
+
+def _normalizar_permisos(perms) -> set[str]:
+    """
+    Convierte permisos a set[str] aunque vengan como lista, tupla, None o texto.
+    """
+    if perms is None:
+        return set()
+
+    if isinstance(perms, set):
+        return {str(p).strip() for p in perms if str(p).strip()}
+
+    if isinstance(perms, (list, tuple)):
+        return {str(p).strip() for p in perms if str(p).strip()}
+
+    if isinstance(perms, str):
+        raw = perms.replace("|", ",").replace(";", ",").split(",")
+        return {p.strip() for p in raw if p.strip()}
+
+    try:
+        return {str(p).strip() for p in perms if str(p).strip()}
+    except Exception:
+        return set()
+
+
+def _valor_parece_docente(valor) -> bool:
+    """
+    Detecta el caso actual donde validar_usuario devuelve en plantel
+    el nombre del docente con prefijo '*'.
+    Ejemplo: *ALVIRDE SALVADOR ARLINE GEORGINA
+    """
+    if valor is None:
+        return False
+
+    return str(valor).strip().startswith("*")
+
+
+def _limpiar_nombre_docente(valor) -> str | None:
+    """
+    Limpia el nombre de docente cuando viene como '*NOMBRE'.
+    """
+    if valor is None:
+        return None
+
+    nombre = str(valor).strip()
+
+    if nombre.startswith("*"):
+        nombre = nombre[1:].strip()
+
+    return nombre or None
+
+
+def _es_rol_docente(perms: set[str], plantel_o_marca) -> bool:
+    """
+    Determina si el usuario pertenece al rol docente.
+    """
+    return bool(ROL_DOCENTE_CODES.intersection(perms)) or _valor_parece_docente(plantel_o_marca)
+
+
 # ----------------------------
 # Inicializar sesión
 # ----------------------------
@@ -43,17 +114,31 @@ if "logueado" not in st.session_state:
             "plantel_usuario": None,
             "permisos": set(),
             "administrador": False,
+            "es_docente": False,
+            "clave_docente": None,
+            "nombre_docente_login": None,
         }
     )
 
 
-def _menu_por_permisos(perms: set[str], plantel: str | None) -> list[str]:
+def _menu_por_permisos(
+    perms: set[str],
+    plantel: str | None,
+    es_docente: bool = False,
+) -> list[str]:
     """
     REGLA DE NEGOCIO:
+    - Si es docente: solo ve Docentes Seguimiento (FT).
     - Si hay permisos: el menú se arma SOLO por permisos.
     - Si no hay permisos: fallback por rol.
     - Los módulos global_only nunca aparecen a usuarios de plantel.
     """
+
+    # ----------------------------
+    # Nuevo rol docente
+    # ----------------------------
+    if es_docente:
+        return ["Docentes Seguimiento (FT)"]
 
     perm_to_label = {
         "MENU_DOCENTES_MODULOS": "Top 15 Docentes y Módulos",
@@ -145,15 +230,34 @@ if not st.session_state.logueado:
             ok, plantel, perms, username = validar_usuario(usuario, contrasena)
 
             if ok:
-                is_admin_scope = plantel is None
+                perms = _normalizar_permisos(perms)
+
+                # En tu caso actual, validar_usuario está devolviendo algo como:
+                # plantel = "*ALVIRDE SALVADOR ARLINE GEORGINA"
+                # Eso NO debe usarse como plantel, porque realmente es el nombre del docente.
+                es_docente = _es_rol_docente(perms, plantel)
+
+                clave_docente = str(username or usuario).strip() if es_docente else None
+                nombre_docente_login = _limpiar_nombre_docente(plantel) if es_docente else None
+
+                # Si es docente, plantel_usuario debe quedar en None.
+                # El plantel real se obtiene después desde la hoja Datos,
+                # una vez filtrado por clave_docente.
+                plantel_usuario = None if es_docente else plantel
+
+                # Si es docente, nunca es administrador aunque plantel_usuario sea None.
+                is_admin_scope = (plantel_usuario is None) and not es_docente
 
                 st.session_state.update(
                     {
                         "logueado": True,
                         "usuario": username,
-                        "plantel_usuario": plantel,
+                        "plantel_usuario": plantel_usuario,
                         "permisos": perms,
                         "administrador": is_admin_scope,
+                        "es_docente": es_docente,
+                        "clave_docente": clave_docente,
+                        "nombre_docente_login": nombre_docente_login,
                     }
                 )
 
@@ -179,13 +283,22 @@ st.sidebar.success("✅ Sesión activa")
 
 perms = st.session_state.get("permisos", set())
 plantel = st.session_state.get("plantel_usuario")
+es_docente = st.session_state.get("es_docente", False)
 
-if plantel:
+if es_docente:
+    nombre_docente = st.session_state.get("nombre_docente_login")
+    clave_docente = st.session_state.get("clave_docente")
+
+    if nombre_docente:
+        st.sidebar.info(f"👨‍🏫 {clave_docente} (Docente: {nombre_docente})")
+    else:
+        st.sidebar.info(f"👨‍🏫 {clave_docente} (Docente)")
+elif plantel:
     st.sidebar.info(f"👤 {st.session_state.get('usuario')} (Plantel: {plantel})")
 else:
     st.sidebar.info(f"👤 {st.session_state.get('usuario')} (GLOBAL)")
 
-opciones = _menu_por_permisos(perms, plantel)
+opciones = _menu_por_permisos(perms, plantel, es_docente=es_docente)
 
 if not opciones:
     st.error("❌ Este usuario no tiene opciones habilitadas. Revisa permisos/reglas en Datos1.xlsx.")
@@ -194,8 +307,18 @@ if not opciones:
 opcion = st.sidebar.selectbox("📂 MENÚ PRINCIPAL", opciones)
 
 if st.sidebar.button("🚪 Cerrar sesión"):
-    for key in ["logueado", "usuario", "plantel_usuario", "permisos", "administrador"]:
+    for key in [
+        "logueado",
+        "usuario",
+        "plantel_usuario",
+        "permisos",
+        "administrador",
+        "es_docente",
+        "clave_docente",
+        "nombre_docente_login",
+    ]:
         st.session_state.pop(key, None)
+
     st.rerun()
 
 
@@ -245,12 +368,21 @@ elif opcion == "Docentes Seguimiento (FT)":
         st.error(f"❌ Error al cargar Reprobacion: {error_rep}")
         st.stop()
 
+    # IMPORTANTE:
+    # Se usan parámetros nombrados para evitar que df_sc o df_rep
+    # se pasen accidentalmente como es_docente o clave_docente_usuario.
+    #
+    # Si es docente, plantel_usuario se manda como None para NO filtrar por
+    # el nombre del docente como si fuera plantel.
     vista_com.mostrar(
-        df,
-        st.session_state.plantel_usuario,
-        st.session_state.administrador,
-        df_sc,
-        df_rep,
+        df=df,
+        plantel_usuario=None if st.session_state.get("es_docente", False) else st.session_state.get("plantel_usuario"),
+        es_admin=False if st.session_state.get("es_docente", False) else st.session_state.get("administrador", False),
+        es_docente=st.session_state.get("es_docente", False),
+        clave_docente_usuario=st.session_state.get("clave_docente"),
+        nombre_docente_usuario=st.session_state.get("nombre_docente_login"),
+        semcaptura_raw=df_sc,
+        reprobacion_raw=df_rep,
     )
 
 elif opcion == "Módulos Seguimiento (FT)":

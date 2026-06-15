@@ -1,4 +1,5 @@
 from pathlib import Path
+import unicodedata
 
 import streamlit as st
 import pandas as pd
@@ -17,6 +18,9 @@ CACHE_SEMCAPTURA = CACHE_DIR / "semcaptura.parquet"
 CACHE_REPROBACION = CACHE_DIR / "reprobacion.parquet"
 
 
+# ==========================================================
+# Utilidades de cache
+# ==========================================================
 def _mtime(path: str | Path) -> float:
     path = Path(path)
 
@@ -36,6 +40,111 @@ def _cache_vigente(cache_path: Path, excel_path: str | Path) -> bool:
         return False
 
     return cache_path.stat().st_mtime >= excel_path.stat().st_mtime
+
+
+# ==========================================================
+# Utilidades de normalización
+# ==========================================================
+def _norm_colname(s) -> str:
+    """
+    Normaliza nombres de columna:
+    CLAVE_DOCENTE, clave docente, Clave Docente -> CLAVEDOCENTE
+    """
+    if s is None:
+        return ""
+
+    s = str(s)
+    s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
+
+    return (
+        s.strip()
+        .replace(" ", "")
+        .replace("_", "")
+        .replace("-", "")
+        .replace(".", "")
+        .upper()
+    )
+
+
+def _es_columna_clave_docente(columna) -> bool:
+    """
+    Detecta cualquier variante de la columna CLAVE_DOCENTE.
+    """
+    return _norm_colname(columna) == "CLAVEDOCENTE"
+
+
+def _limpiar_valor_clave_docente(valor) -> str:
+    """
+    Convierte CLAVE_DOCENTE a texto seguro.
+
+    Evita errores como:
+    Expected bytes, got a 'int' object
+    Conversion failed for column CLAVE_DOCENTE with type object
+
+    Soporta:
+    - Vacíos
+    - NaN
+    - bytes
+    - int
+    - float
+    - texto
+    - valores como 8100003.0
+    """
+    if valor is None:
+        return ""
+
+    try:
+        if pd.isna(valor):
+            return ""
+    except Exception:
+        pass
+
+    if isinstance(valor, bytes):
+        valor = valor.decode("utf-8", errors="ignore")
+
+    try:
+        if isinstance(valor, float) and valor.is_integer():
+            valor = int(valor)
+    except Exception:
+        pass
+
+    texto = str(valor).strip()
+
+    if texto.endswith(".0"):
+        posible_numero = texto[:-2]
+        if posible_numero.isdigit():
+            texto = posible_numero
+
+    return texto
+
+
+def _normalizar_clave_docente_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normaliza cualquier columna CLAVE_DOCENTE antes de guardar Parquet
+    y antes de convertir a Polars.
+
+    Esto evita errores por tipos mezclados provenientes de Excel.
+    """
+    if df is None or df.empty:
+        return df
+
+    df = df.copy()
+
+    for col in df.columns:
+        if _es_columna_clave_docente(col):
+            df[col] = df[col].map(_limpiar_valor_clave_docente).astype("string").fillna("")
+
+    return df
+
+
+def _tiene_columna_normalizada(df: pd.DataFrame, nombre_normalizado: str) -> bool:
+    """
+    Revisa si existe una columna por nombre normalizado.
+    """
+    if df is None or df.empty:
+        return False
+
+    return any(_norm_colname(c) == nombre_normalizado for c in df.columns)
 
 
 def _leer_excel_rapido(excel_path: str, sheet_name: str, usecols=None) -> pd.DataFrame:
@@ -77,7 +186,6 @@ def formatear_fecha_captura(serie: pd.Series) -> pd.Series:
     - Fechas convertidas a timestamp en milisegundos
     - Fechas como número serial de Excel
     """
-
     serie_original = serie.copy()
 
     if pd.api.types.is_datetime64_any_dtype(serie):
@@ -128,17 +236,19 @@ def _cargar_datos_cacheados(excel_mtime: float):
 
     1. Si existe assets/cache_indicadores/datos.parquet actualizado, lo usa.
     2. Si no existe o está desactualizado, lee Datos1.xlsx y regenera el Parquet.
+    3. Normaliza CLAVE_DOCENTE para evitar errores de tipos mixtos.
     """
-
     try:
         if _cache_vigente(CACHE_DATOS, EXCEL_FILE):
             df_pandas = pd.read_parquet(CACHE_DATOS)
+            df_pandas = _normalizar_clave_docente_dataframe(df_pandas)
         else:
             df_pandas = _leer_excel_rapido(
                 EXCEL_FILE,
                 sheet_name=SHEET_DATOS,
             )
 
+            df_pandas = _normalizar_clave_docente_dataframe(df_pandas)
             df_pandas.to_parquet(CACHE_DATOS, index=False)
 
         df = pl.from_pandas(df_pandas)
@@ -174,10 +284,11 @@ def _cargar_semcaptura_cacheada(excel_mtime: float):
 
     1. Si existe assets/cache_indicadores/semcaptura.parquet actualizado, lo usa.
     2. Si no existe o está desactualizado, lee Datos1.xlsx y regenera el Parquet.
+    3. Incluye CLAVE_DOCENTE si existe, para poder filtrar por rol docente.
+    4. Normaliza CLAVE_DOCENTE para evitar errores de tipos mixtos.
     """
-
     try:
-        columnas = [
+        columnas_requeridas = [
             "Plantel",
             "DOCENTE",
             "MODULO",
@@ -193,26 +304,51 @@ def _cargar_semcaptura_cacheada(excel_mtime: float):
             "ESTATUS",
         ]
 
-        if _cache_vigente(CACHE_SEMCAPTURA, EXCEL_FILE):
+        columnas_opcionales = [
+            "CLAVE_DOCENTE",
+            "clave_docente",
+            "Clave Docente",
+            "CLAVE DOCENTE",
+            "ClaveDocente",
+        ]
+
+        columnas_lectura = columnas_requeridas + columnas_opcionales
+
+        leer_desde_excel = not _cache_vigente(CACHE_SEMCAPTURA, EXCEL_FILE)
+
+        if not leer_desde_excel:
             df_pandas = pd.read_parquet(CACHE_SEMCAPTURA)
-        else:
+            df_pandas = _normalizar_clave_docente_dataframe(df_pandas)
+
+            # Si el cache fue creado por una versión anterior y no trae CLAVE_DOCENTE,
+            # se fuerza lectura desde Excel para recuperar esa columna.
+            if not _tiene_columna_normalizada(df_pandas, "CLAVEDOCENTE"):
+                leer_desde_excel = True
+
+        if leer_desde_excel:
             df_pandas = _leer_excel_rapido(
                 EXCEL_FILE,
                 sheet_name=SHEET_SEMCAPTURA,
-                usecols=lambda col: col in columnas,
+                usecols=lambda col: col in columnas_lectura,
             )
 
-            faltantes = [c for c in columnas if c not in df_pandas.columns]
+            faltantes = [c for c in columnas_requeridas if c not in df_pandas.columns]
 
             if faltantes:
                 return None, f"Faltan columnas en '{SHEET_SEMCAPTURA}': {faltantes}"
 
-            df_pandas = df_pandas[columnas]
+            columnas_existentes = [
+                c for c in columnas_requeridas + columnas_opcionales
+                if c in df_pandas.columns
+            ]
+
+            df_pandas = df_pandas[columnas_existentes]
 
             df_pandas["FECHA_CAPTURA"] = formatear_fecha_captura(
                 df_pandas["FECHA_CAPTURA"]
             )
 
+            df_pandas = _normalizar_clave_docente_dataframe(df_pandas)
             df_pandas.to_parquet(CACHE_SEMCAPTURA, index=False)
 
         df = pl.from_pandas(df_pandas)
@@ -256,17 +392,19 @@ def _cargar_reprobacion_cacheada(excel_mtime: float):
 
     1. Si existe assets/cache_indicadores/reprobacion.parquet actualizado, lo usa.
     2. Si no existe o está desactualizado, lee Datos1.xlsx y regenera el Parquet.
+    3. Normaliza CLAVE_DOCENTE para evitar errores de tipos mixtos.
     """
-
     try:
         if _cache_vigente(CACHE_REPROBACION, EXCEL_FILE):
             df_pandas = pd.read_parquet(CACHE_REPROBACION)
+            df_pandas = _normalizar_clave_docente_dataframe(df_pandas)
         else:
             df_pandas = _leer_excel_rapido(
                 EXCEL_FILE,
                 sheet_name=SHEET_REPROBACION,
             )
 
+            df_pandas = _normalizar_clave_docente_dataframe(df_pandas)
             df_pandas.to_parquet(CACHE_REPROBACION, index=False)
 
         df = pl.from_pandas(df_pandas)

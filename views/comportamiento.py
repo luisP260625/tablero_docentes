@@ -19,6 +19,21 @@ COL_NO_COMP = "NO COMPETENTES"
 COL_COMPET = "COMPETENTES"
 COL_TOTAL = "TOTAL ALUMNOS"
 
+# ==========================================================
+# Nuevo campo para rol docente
+# ==========================================================
+COL_CLAVE_DOCENTE = "CLAVE_DOCENTE"
+
+CLAVE_DOCENTE_ALIASES = [
+    "clave_docente",
+    "CLAVE_DOCENTE",
+    "Clave Docente",
+    "CLAVE DOCENTE",
+    "ClaveDocente",
+    "CLAVEDOCENTE",
+    "clave docente",
+]
+
 
 # ==========================================================
 # Columnas que se mostrarán desde SemCaptura
@@ -39,8 +54,7 @@ SEMCAPTURA_COLS_REQUERIDAS = [
 
 
 # Variantes aceptadas para columnas que pueden venir con nombres distintos
-# en el archivo de Excel. Esto evita perder funcionalidad si la columna llega
-# como "FECHA_CAPTURA", "fecha captura", "FechaCaptura", etc.
+# en el archivo de Excel.
 SEMCAPTURA_ALIASES = {
     "Fecha de captura": [
         "Fecha de captura",
@@ -132,7 +146,8 @@ def _norm_colname(s: Any) -> str:
 
 def _norm_value(s: Any) -> str:
     """
-    Normaliza valores de texto para comparar docentes, planteles, etc.
+    Normaliza valores de texto para comparar planteles, textos generales, etc.
+    Evita problemas cuando Excel convierte valores numéricos a 123.0.
     """
     if s is None:
         return ""
@@ -143,10 +158,51 @@ def _norm_value(s: Any) -> str:
     except Exception:
         pass
 
-    s = str(s)
+    try:
+        if isinstance(s, float) and s.is_integer():
+            s = int(s)
+    except Exception:
+        pass
+
+    s = str(s).strip()
+
+    if s.endswith(".0"):
+        posible_numero = s[:-2]
+        if posible_numero.isdigit():
+            s = posible_numero
+
     s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
 
     return " ".join(s.strip().upper().split())
+
+
+def _norm_clave_docente(s: Any) -> str:
+    """
+    Normaliza clave_docente para que 08100003, 8100003 y 8100003.0 coincidan.
+    """
+    v = _norm_value(s)
+
+    if v.endswith(".0"):
+        v = v[:-2]
+
+    if v.isdigit():
+        return v.lstrip("0") or "0"
+
+    return v
+
+
+def _norm_docente_nombre(s: Any) -> str:
+    """
+    Normaliza nombre docente.
+    Quita el prefijo '*' porque en Datos, Planteles, SemCaptura y Reprobacion
+    puede venir como '*NOMBRE DOCENTE'.
+    """
+    v = _norm_value(s)
+
+    while v.startswith("*"):
+        v = v[1:].strip()
+
+    return v
 
 
 def _find_col_pl(df: pl.DataFrame, nombres_posibles: List[str]) -> Optional[str]:
@@ -186,7 +242,7 @@ def _find_col_pd(df: pd.DataFrame, nombres_posibles: List[str]) -> Optional[str]
 def _filter_text_equals(df: pl.DataFrame, col: str, value: Any) -> pl.DataFrame:
     """
     Filtra texto con normalización de valor.
-    Es más robusto contra espacios, acentos y mayúsculas.
+    Es más robusto contra espacios, acentos, mayúsculas y valores tipo 123.0.
     """
     target = _norm_value(value)
 
@@ -197,6 +253,168 @@ def _filter_text_equals(df: pl.DataFrame, col: str, value: Any) -> pl.DataFrame:
     )
 
 
+def _filter_clave_docente_equals(df: pl.DataFrame, col: str, value: Any) -> pl.DataFrame:
+    """
+    Filtra clave_docente permitiendo coincidencia con o sin ceros a la izquierda.
+    """
+    target = _norm_clave_docente(value)
+
+    return df.filter(
+        pl.col(col)
+        .map_elements(_norm_clave_docente, return_dtype=pl.Utf8)
+        == target
+    )
+
+
+def _filter_docente_nombre_equals(df: pl.DataFrame, col: str, value: Any) -> pl.DataFrame:
+    """
+    Filtra por nombre de docente ignorando el prefijo '*'.
+    """
+    target = _norm_docente_nombre(value)
+
+    return df.filter(
+        pl.col(col)
+        .map_elements(_norm_docente_nombre, return_dtype=pl.Utf8)
+        == target
+    )
+
+
+def _filtrar_docente_seguro_pl(
+    df: pl.DataFrame,
+    *,
+    clave_docente: Optional[str] = None,
+    nombre_docente: Optional[str] = None,
+    hoja_nombre: str = "Datos",
+) -> Tuple[Optional[pl.DataFrame], Optional[str]]:
+    """
+    Filtra información del docente en modo seguro.
+
+    Seguridad:
+    - Nunca regresa todo el DataFrame.
+    - Nunca filtra únicamente por plantel.
+    - Si la hoja tiene CLAVE_DOCENTE, usa la clave como regla fuerte.
+    - Si hay filas históricas sin CLAVE_DOCENTE, solo las incluye cuando:
+        1. el nombre DOCENTE coincide con el nombre autenticado,
+        2. no existe una CLAVE_DOCENTE diferente en esas filas,
+        3. el filtro por nombre no genera una ambigüedad detectable.
+    - Si detecta una inconsistencia, bloquea la vista en lugar de mostrar datos dudosos.
+    """
+    if df is None or df.is_empty():
+        return df, None
+
+    clave_norm = _norm_clave_docente(clave_docente)
+    nombre_norm = _norm_docente_nombre(nombre_docente)
+
+    if not clave_norm and not nombre_norm:
+        return pl.DataFrame(), (
+            f"No se recibió clave_docente ni nombre de docente para filtrar '{hoja_nombre}'."
+        )
+
+    col_clave_real = _find_col_pl(df, CLAVE_DOCENTE_ALIASES)
+    col_docente_real = _find_col_pl(df, [COL_DOCENTE, "Docente"])
+
+    candidatos = None
+    mensajes = []
+
+    # ------------------------------------------------------
+    # 1) Filtro por nombre autenticado.
+    # ------------------------------------------------------
+    # Para la hoja Datos esto es necesario porque existen semanas históricas
+    # donde CLAVE_DOCENTE está vacía, pero DOCENTE sí está informado.
+    if nombre_norm and col_docente_real:
+        candidatos = _filter_docente_nombre_equals(
+            df,
+            col_docente_real,
+            nombre_docente,
+        )
+
+        if candidatos is not None and not candidatos.is_empty():
+            # Si existe columna de clave, se validan las claves dentro de los candidatos.
+            # Se permiten claves vacías y la clave del login. Se bloquea cualquier clave distinta.
+            if col_clave_real and clave_norm:
+                claves_encontradas = (
+                    candidatos
+                    .select(
+                        pl.col(col_clave_real)
+                        .map_elements(_norm_clave_docente, return_dtype=pl.Utf8)
+                        .alias("_CLAVE_NORM")
+                    )
+                    .filter(pl.col("_CLAVE_NORM") != "")
+                    .unique()
+                    .get_column("_CLAVE_NORM")
+                    .to_list()
+                )
+
+                claves_distintas = [c for c in claves_encontradas if c != clave_norm]
+
+                if claves_distintas:
+                    return pl.DataFrame(), (
+                        f"Se bloqueó la consulta por seguridad. En '{hoja_nombre}' hay registros "
+                        f"con el mismo DOCENTE, pero con CLAVE_DOCENTE diferente a la del login. "
+                        f"Clave login: {clave_norm}. Claves encontradas: {', '.join(claves_encontradas)}."
+                    )
+
+            return candidatos, None
+
+        mensajes.append(
+            f"No hubo coincidencias seguras por DOCENTE en '{hoja_nombre}'."
+        )
+    elif nombre_norm and not col_docente_real:
+        mensajes.append(
+            f"No se encontró columna DOCENTE en '{hoja_nombre}'."
+        )
+
+    # ------------------------------------------------------
+    # 2) Filtro por clave como respaldo.
+    # ------------------------------------------------------
+    # Se usa cuando no se encontró por nombre, pero la hoja tiene clave.
+    if clave_norm and col_clave_real:
+        df_por_clave = _filter_clave_docente_equals(
+            df,
+            col_clave_real,
+            clave_docente,
+        )
+
+        if df_por_clave is not None and not df_por_clave.is_empty():
+            # Si además tenemos nombre, validamos que no se esté trayendo otro docente.
+            if nombre_norm and col_docente_real:
+                docentes_encontrados = (
+                    df_por_clave
+                    .select(
+                        pl.col(col_docente_real)
+                        .map_elements(_norm_docente_nombre, return_dtype=pl.Utf8)
+                        .alias("_DOCENTE_NORM")
+                    )
+                    .filter(pl.col("_DOCENTE_NORM") != "")
+                    .unique()
+                    .get_column("_DOCENTE_NORM")
+                    .to_list()
+                )
+
+                docentes_distintos = [d for d in docentes_encontrados if d != nombre_norm]
+
+                if docentes_distintos:
+                    return pl.DataFrame(), (
+                        f"Se bloqueó la consulta por seguridad. En '{hoja_nombre}' la CLAVE_DOCENTE "
+                        f"del login está asociada a otro nombre de DOCENTE. "
+                        f"Docente login: {nombre_norm}. Docentes encontrados: {', '.join(docentes_encontrados)}."
+                    )
+
+            return df_por_clave, None
+
+        mensajes.append(
+            f"No hubo coincidencias por CLAVE_DOCENTE en '{hoja_nombre}'."
+        )
+    elif clave_norm and not col_clave_real:
+        mensajes.append(
+            f"No se encontró columna CLAVE_DOCENTE en '{hoja_nombre}'."
+        )
+
+    return pl.DataFrame(), (
+        "No se encontró información segura para el docente. "
+        + " ".join(mensajes)
+    )
+
 def _seleccionar_columnas_case_insensitive_pl(
     df: pl.DataFrame,
     cols_deseadas: List[str],
@@ -205,10 +423,6 @@ def _seleccionar_columnas_case_insensitive_pl(
     """
     Selecciona columnas aunque vengan con diferente casing.
     Devuelve las columnas con los nombres indicados en cols_deseadas.
-
-    aliases permite buscar una columna con nombres alternativos.
-    Ejemplo:
-    - "Fecha de captura" puede venir como "FECHA_CAPTURA" o "fecha captura".
     """
     if df is None or df.is_empty():
         return pl.DataFrame({c: [] for c in cols_deseadas})
@@ -342,7 +556,11 @@ def _current_week_from_docente_pl(df_docente: pl.DataFrame) -> Optional[int]:
         return None
 
 
-def _grafica_semanal(sem_df: pd.DataFrame, titulo: str, color_hex: str = "#c3b08f") -> None:
+def _grafica_semanal(
+    sem_df: pd.DataFrame,
+    titulo: str,
+    color_hex: str = "#c3b08f",
+) -> None:
     """
     Dibuja gráfica semanal de no competentes.
     """
@@ -498,25 +716,42 @@ def _preparar_semcaptura_docente(
     *,
     sel_docente: str,
     sel_plantel: Optional[str],
+    clave_docente_usuario: Optional[str] = None,
+    nombre_docente_usuario: Optional[str] = None,
+    es_docente: bool = False,
 ) -> Tuple[pd.DataFrame, Optional[str]]:
     """
     Filtra SemCaptura por docente y plantel.
+
+    Si el rol es docente, filtra por clave_docente y, si es necesario,
+    por nombre de docente.
     """
     semcaptura_pl = _to_polars(semcaptura_raw)
 
     if semcaptura_pl is None or semcaptura_pl.is_empty():
         return pd.DataFrame(), "ℹ️ No se encontró información en la hoja 'SemCaptura' o está vacía."
 
-    col_docente_real = _find_col_pl(semcaptura_pl, [COL_DOCENTE, "Docente"])
+    if es_docente:
+        df_sc, msg_doc = _filtrar_docente_seguro_pl(
+            semcaptura_pl,
+            clave_docente=clave_docente_usuario,
+            nombre_docente=nombre_docente_usuario or sel_docente,
+            hoja_nombre="SemCaptura",
+        )
 
-    if not col_docente_real:
-        return pd.DataFrame(), "La hoja 'SemCaptura' no contiene una columna DOCENTE para poder filtrar."
+        if msg_doc and (df_sc is None or df_sc.is_empty()):
+            return pd.DataFrame(), msg_doc
+    else:
+        col_docente_real = _find_col_pl(semcaptura_pl, [COL_DOCENTE, "Docente"])
 
-    df_sc = _filter_text_equals(
-        semcaptura_pl,
-        col_docente_real,
-        sel_docente,
-    )
+        if not col_docente_real:
+            return pd.DataFrame(), "La hoja 'SemCaptura' no contiene una columna DOCENTE para poder filtrar."
+
+        df_sc = _filter_docente_nombre_equals(
+            semcaptura_pl,
+            col_docente_real,
+            sel_docente,
+        )
 
     col_plantel_real = _find_col_pl(semcaptura_pl, [COL_PLANTEL, "Plantel"])
 
@@ -527,7 +762,12 @@ def _preparar_semcaptura_docente(
             sel_plantel,
         )
 
-    if df_sc.is_empty():
+    if df_sc is None or df_sc.is_empty():
+        if es_docente:
+            return pd.DataFrame(), (
+                "ℹ️ No hay registros en 'SemCaptura' para tu usuario docente."
+            )
+
         return pd.DataFrame(), f"ℹ️ No hay registros en 'SemCaptura' para el docente **{sel_docente}**."
 
     df_sc_out = _seleccionar_columnas_case_insensitive_pl(
@@ -548,25 +788,42 @@ def _preparar_reprobacion_docente(
     sel_docente: str,
     sel_plantel: Optional[str],
     semana_actual: Optional[int],
+    clave_docente_usuario: Optional[str] = None,
+    nombre_docente_usuario: Optional[str] = None,
+    es_docente: bool = False,
 ) -> Tuple[pd.DataFrame, Optional[str]]:
     """
     Filtra Reprobacion por docente, plantel y semana actual.
+
+    Si el rol es docente, filtra por clave_docente y, si es necesario,
+    por nombre de docente.
     """
     reprobacion_pl = _to_polars(reprobacion_raw)
 
     if reprobacion_pl is None or reprobacion_pl.is_empty():
         return pd.DataFrame(), "ℹ️ No se encontró información en la hoja 'Reprobacion' o está vacía."
 
-    col_docente_real = _find_col_pl(reprobacion_pl, [COL_DOCENTE, "Docente"])
+    if es_docente:
+        df_rep, msg_doc = _filtrar_docente_seguro_pl(
+            reprobacion_pl,
+            clave_docente=clave_docente_usuario,
+            nombre_docente=nombre_docente_usuario or sel_docente,
+            hoja_nombre="Reprobacion",
+        )
 
-    if not col_docente_real:
-        return pd.DataFrame(), "La hoja 'Reprobacion' no contiene una columna DOCENTE para poder filtrar."
+        if msg_doc and (df_rep is None or df_rep.is_empty()):
+            return pd.DataFrame(), msg_doc
+    else:
+        col_docente_real = _find_col_pl(reprobacion_pl, [COL_DOCENTE, "Docente"])
 
-    df_rep = _filter_text_equals(
-        reprobacion_pl,
-        col_docente_real,
-        sel_docente,
-    )
+        if not col_docente_real:
+            return pd.DataFrame(), "La hoja 'Reprobacion' no contiene una columna DOCENTE para poder filtrar."
+
+        df_rep = _filter_docente_nombre_equals(
+            reprobacion_pl,
+            col_docente_real,
+            sel_docente,
+        )
 
     col_plantel_real = _find_col_pl(reprobacion_pl, [COL_PLANTEL, "Plantel"])
 
@@ -591,7 +848,16 @@ def _preparar_reprobacion_docente(
             .drop("_SEMANA_NUM")
         )
 
-    if df_rep.is_empty():
+    if df_rep is None or df_rep.is_empty():
+        if es_docente:
+            if semana_actual is not None:
+                return pd.DataFrame(), (
+                    f"ℹ️ No hay registros en 'Reprobacion' para tu usuario docente "
+                    f"en la semana **{semana_actual}**."
+                )
+
+            return pd.DataFrame(), "ℹ️ No hay registros en 'Reprobacion' para tu usuario docente."
+
         if semana_actual is not None:
             return pd.DataFrame(), (
                 f"ℹ️ No hay registros en 'Reprobacion' para el docente **{sel_docente}** "
@@ -653,17 +919,28 @@ def mostrar(
     df: Any,
     plantel_usuario: Optional[str] = None,
     es_admin: bool = False,
+    es_docente: bool = False,
+    clave_docente_usuario: Optional[str] = None,
+    nombre_docente_usuario: Optional[str] = None,
     semcaptura_raw: Any = None,
     reprobacion_raw: Any = None,
 ) -> None:
     """
     Vista Docentes Seguimiento (FT).
 
-    Optimización:
-    - Ya no lee SemCaptura directamente desde Excel.
-    - Ya no lee Reprobacion directamente desde Excel.
-    - Filtra primero en Polars.
-    - Convierte a Pandas solo resultados pequeños para tabla/gráfica.
+    Roles:
+    - Admin:
+        Puede seleccionar plantel y docente.
+
+    - Usuario de plantel:
+        Ve su plantel y puede seleccionar docente.
+
+    - Docente:
+        Entra con clave_docente.
+        Solo ve información correspondiente a su propio usuario.
+        Para Datos usa clave_docente si existe con datos; si está vacía,
+        usa nombre_docente_usuario.
+        Para SemCaptura/Reprobacion usa clave_docente y fallback por nombre.
     """
     base_pl = _to_polars(df)
 
@@ -694,9 +971,60 @@ def mostrar(
         return
 
     # ======================================================
+    # Filtro inicial por rol docente
+    # ======================================================
+    if es_docente:
+        base_pl_filtrado, msg_doc = _filtrar_docente_seguro_pl(
+            base_pl,
+            clave_docente=clave_docente_usuario,
+            nombre_docente=nombre_docente_usuario,
+            hoja_nombre="Datos",
+        )
+
+        if base_pl_filtrado is None or base_pl_filtrado.is_empty():
+            st.info(
+                "No hay información disponible para tu usuario docente en la hoja 'Datos'."
+            )
+
+            if msg_doc:
+                with st.expander("Detalle técnico del filtro"):
+                    st.write(msg_doc)
+
+            with st.expander("Columnas disponibles en Datos"):
+                st.write(list(base_pl.columns))
+
+            return
+
+        base_pl = base_pl_filtrado
+
+    # ======================================================
     # Selección de plantel
     # ======================================================
-    if es_admin:
+    if es_docente:
+        planteles_docente = _planteles_desde_polars(base_pl)
+
+        if not planteles_docente:
+            st.info("No hay planteles disponibles para tu usuario docente.")
+            return
+
+        # Si el docente aparece en varios planteles, solo puede elegir entre los suyos.
+        if len(planteles_docente) == 1:
+            sel_plantel = planteles_docente[0]
+
+            st.text_input(
+                "Plantel",
+                sel_plantel or "",
+                disabled=True,
+                key="cmp_plantel_ro_comportamiento_docente",
+            )
+        else:
+            sel_plantel = st.selectbox(
+                "Selecciona un plantel",
+                planteles_docente,
+                key="cmp_sel_plantel_comportamiento_docente",
+            )
+
+    elif es_admin:
         planteles = _planteles_desde_polars(base_pl)
 
         if not planteles:
@@ -722,8 +1050,10 @@ def mostrar(
         )
 
     if sel_plantel:
-        df_plantel_pl = base_pl.filter(
-            pl.col(COL_PLANTEL).cast(pl.Utf8) == str(sel_plantel)
+        df_plantel_pl = _filter_text_equals(
+            base_pl,
+            COL_PLANTEL,
+            sel_plantel,
         )
     else:
         df_plantel_pl = base_pl
@@ -741,15 +1071,30 @@ def mostrar(
         st.info("No hay docentes para el plantel seleccionado.")
         return
 
-    sel_docente = st.selectbox(
-        "Selecciona un docente",
-        docentes,
-        key="cmp_sel_docente_comportamiento",
-    )
+    if es_docente:
+        # En rol docente NO se permite seleccionar otro docente.
+        sel_docente = docentes[0] if len(docentes) == 1 else " | ".join(docentes)
 
-    df_docente_pl = df_plantel_pl.filter(
-        pl.col(COL_DOCENTE).cast(pl.Utf8) == str(sel_docente)
-    )
+        st.text_input(
+            "Docente",
+            sel_docente or "",
+            disabled=True,
+            key="cmp_docente_ro_comportamiento",
+        )
+
+        df_docente_pl = df_plantel_pl
+    else:
+        sel_docente = st.selectbox(
+            "Selecciona un docente",
+            docentes,
+            key="cmp_sel_docente_comportamiento",
+        )
+
+        df_docente_pl = _filter_docente_nombre_equals(
+            df_plantel_pl,
+            COL_DOCENTE,
+            sel_docente,
+        )
 
     if df_docente_pl.is_empty():
         st.info("No hay datos para el docente seleccionado.")
@@ -788,10 +1133,17 @@ def mostrar(
         semcaptura_raw,
         sel_docente=str(sel_docente or ""),
         sel_plantel=str(sel_plantel or "") if sel_plantel else None,
+        clave_docente_usuario=clave_docente_usuario,
+        nombre_docente_usuario=nombre_docente_usuario,
+        es_docente=es_docente,
     )
 
     if msg_sc:
-        if msg_sc.startswith("La hoja"):
+        if (
+            msg_sc.startswith("La hoja")
+            or msg_sc.startswith("No se encontró")
+            or "No se encontró información" in msg_sc
+        ):
             st.error(msg_sc)
 
             semcaptura_pd = _to_pandas(semcaptura_raw)
@@ -819,6 +1171,9 @@ def mostrar(
         sel_docente=str(sel_docente or ""),
         sel_plantel=str(sel_plantel or "") if sel_plantel else None,
         semana_actual=semana_actual,
+        clave_docente_usuario=clave_docente_usuario,
+        nombre_docente_usuario=nombre_docente_usuario,
+        es_docente=es_docente,
     )
 
     if msg_rep:
