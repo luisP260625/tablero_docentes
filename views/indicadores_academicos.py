@@ -29,64 +29,56 @@ EMAIL_META_SEMANA_OBJETIVO = 18
 
 EXCEL_PATH = "assets/Datos1.xlsx"
 CACHE_DIR = "assets/cache_indicadores"
-MAX_PREVIEW_ROWS = 500  # Compatibilidad: ya no se usa para recortar la tabla.
-DEFAULT_TABLE_HEIGHT = 520
-USE_PLANTEL_DETAIL_CACHE = os.getenv("USE_PLANTEL_DETAIL_CACHE", "false").lower() == "true"
+# Rendimiento / visualización
+# MAX_PREVIEW_ROWS ahora vuelve a proteger la interfaz: muestra una vista previa
+# y evita mandar tablas gigantes al navegador en cada rerun de Streamlit.
+MAX_PREVIEW_ROWS = int(os.getenv("MAX_PREVIEW_ROWS", "500"))
+MAX_RENDER_ROWS = int(os.getenv("MAX_RENDER_ROWS", str(MAX_PREVIEW_ROWS)))
+DEFAULT_TABLE_HEIGHT = int(os.getenv("DEFAULT_TABLE_HEIGHT", "520"))
 
+# Si realmente se necesita ver todo en pantalla, el usuario podrá activarlo con checkbox.
+# Para forzarlo globalmente desde servidor: ALLOW_FULL_TABLE_RENDER=true
+ALLOW_FULL_TABLE_RENDER = os.getenv("ALLOW_FULL_TABLE_RENDER", "false").lower() == "true"
+SHOW_FULL_TABLE_CHECKBOX = os.getenv("SHOW_FULL_TABLE_CHECKBOX", "true").lower() == "true"
+
+# Caché rápido. Si existen archivos parquet, se usan. Si no existen, se lee Excel
+# y opcionalmente se intenta crear el parquet para próximas cargas.
+USE_PLANTEL_DETAIL_CACHE = os.getenv("USE_PLANTEL_DETAIL_CACHE", "false").lower() == "true"
 USE_FAST_CACHE = os.getenv("USE_FAST_CACHE", "true").lower() == "true"
+AUTO_WRITE_PARQUET_CACHE = os.getenv("AUTO_WRITE_PARQUET_CACHE", "true").lower() == "true"
 
 REPROBACION_COLS = [
     "Plantel", "ESTUDIANTE", "matricula", "CARRERA", "MODULO",
-    "DOCENTE", "grado", "cvegrupo", "pEspecifico", "pAlcanzado", "pRelativo"
+    "DOCENTE", "grado", "cvegrupo", "MINIMO",
+    "pEspecifico", "pAlcanzado", "pRelativo"
 ]
 
 MATRICULA_COLS = ["Plantel", "matriculaTotal"]
+
+# Métricas internas necesarias para cálculos heredados.
+# pEspecifico y pRelativo ya no se muestran en el detalle final,
+# pero pEspecifico se conserva internamente para detectar registros sin evaluación.
 METRICAS_ORDEN = ["pEspecifico", "pAlcanzado", "pRelativo"]
+METRICAS_DETALLE_PRESENTACION = ["pAlcanzado"]
+MINIMO_COL_NAME = "MINIMO"
+MINIMO_DISPLAY_NAME = "Porcentaje mínimo para aprobar"
+
+# Columnas que se conservan para cálculos internos, pero se ocultan en la tabla final.
+# Se ocultan únicamente pEspecifico y pRelativo; pAlcanzado permanece visible.
+COLUMNAS_METRICAS_OCULTAS_PRESENTACION = [
+    "pEspecifico", "pRelativo",
+    "PEspecifico", "pRelativo",
+    "pEspecifico_min", "pRelativo_min",
+    "PEspecifico_min", "pRelativo_min",
+]
 
 # Categorías usadas para identificar estudiantes por cantidad de módulos NO competentes.
 # Se mantiene el mismo criterio del resumen: 1, 2, 3... 10 y 11 o más.
 CATEGORIAS_MODULOS_NC = [str(i) for i in range(1, 11)] + ["11 o más"]
 
-
-# =========================
-# Seguimiento académico de estudiantes NO competentes
-# =========================
-# Este archivo CSV permite iniciar sin base de datos.
-# Si después migras a BD, estas funciones pueden cambiarse por consultas SQL.
-SEGUIMIENTO_NC_PATH = os.getenv(
-    "SEGUIMIENTO_NC_PATH",
-    "assets/seguimiento_no_competentes.csv"
-)
-
-CAUSAS_NO_COMPETENCIA = [
-    "",
-    "Ausentismo",
-    "Económica",
-    "Emocional",
-    "Académica",
-]
-
-# Responsables solicitados para captura directa en tabla.
-# Se guardan en el campo responsable_nombre para mantener compatibilidad con el CSV existente.
-RESPONSABLES_SEGUIMIENTO = [
-    "",
-    "JPFT",
-    "FPSE",
-    "TTA",
-    "OE",
-    "TB",
-]
-
-# Se conserva este nombre porque algunas funciones previas lo usan.
-# En esta versión se iguala al catálogo de responsables solicitado.
-FUNCIONES_SEGUIMIENTO = RESPONSABLES_SEGUIMIENTO
-
-ESTADOS_SEGUIMIENTO = [
-    "Sin seguimiento",
-    "En proceso",
-    "Recuperado",
-]
-
+# Fila estatal que se toma desde la hoja Seguimiento.
+SEGUIMIENTO_ESTATAL_NOMBRE = "CONALEP Estado de México"
+VISTA_COMPORTAMIENTO_ESTATAL = "Comportamiento estatal"
 
 
 # =========================
@@ -96,21 +88,150 @@ def slug(v):
     return re.sub(r"[^a-zA-Z0-9_-]+", "_", str(v).strip())
 
 
+def obtener_numero_semana_indicadores():
+    """
+    Devuelve la semana académica que debe mostrarse en el encabezado.
+
+    Importante:
+    - NO usa la semana calendario del sistema.
+    - Toma la semana más reciente con información desde la hoja Seguimiento.
+    - Prioriza la fila estatal: CONALEP Estado de México.
+    - Si no encuentra la fila estatal, revisa todas las filas de Seguimiento.
+    """
+
+    def _semana_maxima_con_datos(df_semana):
+        if df_semana is None or getattr(df_semana, "empty", True):
+            return None
+        if "Semana_num" not in df_semana.columns:
+            return None
+
+        d = df_semana.copy()
+        d["Semana_num"] = pd.to_numeric(d["Semana_num"], errors="coerce")
+        d = d[d["Semana_num"].notna()].copy()
+
+        if d.empty:
+            return None
+
+        # Preferir semanas que realmente tengan información capturada.
+        # Esto evita tomar columnas futuras vacías o precargadas.
+        mascara = pd.Series(False, index=d.index)
+        if "Cantidad" in d.columns:
+            cantidad = pd.to_numeric(d["Cantidad"], errors="coerce").fillna(0)
+            mascara = mascara | (cantidad.abs() > 0)
+        if "Porcentaje" in d.columns:
+            porcentaje = pd.to_numeric(d["Porcentaje"], errors="coerce").fillna(0)
+            mascara = mascara | (porcentaje.abs() > 0)
+
+        if mascara.any():
+            return int(d.loc[mascara, "Semana_num"].max())
+
+        return int(d["Semana_num"].max())
+
+    # 1) Primero intentar con la fila estatal de Seguimiento.
+    try:
+        seguimiento_estatal, _ = obtener_seguimiento_estatal()
+        semana = _semana_maxima_con_datos(seguimiento_estatal)
+        if semana is not None:
+            return semana
+    except Exception:
+        pass
+
+    # 2) Respaldo: revisar todas las filas de la hoja Seguimiento.
+    try:
+        df_seguimiento = cargar_seguimiento()
+        if df_seguimiento is None or getattr(df_seguimiento, "empty", True):
+            return ""
+
+        mapping = _mapear_columnas_seguimiento(df_seguimiento)
+        semanas_con_datos = []
+
+        for _, meta in mapping.items():
+            week_num = meta.get("week_num")
+            if week_num is None:
+                continue
+
+            tiene_datos = False
+            col_cantidad = meta.get("cantidad")
+            col_porcentaje = meta.get("porcentaje")
+
+            if col_cantidad is not None and col_cantidad in df_seguimiento.columns:
+                valores = pd.to_numeric(df_seguimiento[col_cantidad], errors="coerce")
+                if valores.fillna(0).abs().sum() > 0:
+                    tiene_datos = True
+
+            if col_porcentaje is not None and col_porcentaje in df_seguimiento.columns:
+                valores = pd.to_numeric(df_seguimiento[col_porcentaje], errors="coerce")
+                if valores.fillna(0).abs().sum() > 0:
+                    tiene_datos = True
+
+            if tiene_datos:
+                semanas_con_datos.append(int(week_num))
+
+        if semanas_con_datos:
+            return max(semanas_con_datos)
+    except Exception:
+        pass
+
+    return ""
+
+
+def construir_titulo_indicadores():
+    semana = obtener_numero_semana_indicadores()
+    if semana == "" or semana is None:
+        return "📊 Indicadores Académicos"
+    return f"📊 Indicadores Académicos semana {semana}"
+
+
 def _cache_path(name):
     return os.path.join(CACHE_DIR, name)
+
+
+def _ensure_parent_dir(file_path):
+    parent = os.path.dirname(file_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
 
 
 def _read_excel(sheet_name, usecols=None):
     return pd.read_excel(EXCEL_PATH, sheet_name=sheet_name, usecols=usecols)
 
 
+def _write_parquet_cache_safe(df, parquet_path):
+    """
+    Intenta guardar caché parquet sin romper el flujo si el servidor no tiene
+    pyarrow/fastparquet o permisos de escritura.
+    """
+    if not AUTO_WRITE_PARQUET_CACHE or df is None:
+        return
+
+    try:
+        _ensure_parent_dir(parquet_path)
+        df.to_parquet(parquet_path, index=False)
+    except Exception:
+        # La app debe seguir funcionando aunque no pueda crear parquet.
+        pass
+
+
 def _read_fast_or_excel(parquet_name, sheet_name, usecols=None):
+    """
+    Lee primero parquet si existe. Si no existe, lee Excel y deja preparado
+    el parquet para acelerar las próximas ejecuciones.
+    """
     parquet_path = _cache_path(parquet_name)
 
     if USE_FAST_CACHE and os.path.exists(parquet_path):
-        return pd.read_parquet(parquet_path)
+        try:
+            return pd.read_parquet(parquet_path)
+        except Exception:
+            # Si el parquet está corrupto o desactualizado, se regresa a Excel.
+            pass
 
-    return _read_excel(sheet_name, usecols=usecols)
+    df = _read_excel(sheet_name, usecols=usecols)
+
+    if USE_FAST_CACHE:
+        _write_parquet_cache_safe(df, parquet_path)
+
+    return df
 
 
 def _norm_txt(x):
@@ -130,6 +251,58 @@ def _find_col_like(df, candidates):
             if lo == c or c in lo:
                 return orig
     return None
+
+
+def normalizar_columna_minimo(df):
+    """
+    Garantiza una columna estándar MINIMO tomada desde la hoja Reprobacion.
+
+    Soporta variaciones como MÍNIMO, Minimo o minimo. Si la columna todavía
+    no existe en el origen/caché, se crea vacía para no romper la tabla.
+    """
+    if df is None:
+        return df
+
+    d = df.copy()
+    col_minimo = _find_col_like(d, ["MINIMO", "MÍNIMO", "Minimo", "Mínimo", "minimo"])
+
+    if col_minimo and col_minimo != MINIMO_COL_NAME:
+        d = d.rename(columns={col_minimo: MINIMO_COL_NAME})
+
+    if MINIMO_COL_NAME not in d.columns:
+        d[MINIMO_COL_NAME] = pd.NA
+
+    return d
+
+
+def ocultar_columnas_metricas_presentacion(df):
+    """
+    Oculta columnas de porcentaje/ponderación en vistas finales sin eliminarlas
+    del flujo de cálculo. Se usa únicamente para presentación/exportación final.
+    """
+    if df is None:
+        return df
+
+    d = df.copy()
+    ocultas = {_norm_txt(c) for c in COLUMNAS_METRICAS_OCULTAS_PRESENTACION}
+    columnas_a_ocultar = [c for c in d.columns if _norm_txt(c) in ocultas]
+    return d.drop(columns=columnas_a_ocultar, errors="ignore")
+
+
+def renombrar_minimo_presentacion(df):
+    """
+    Renombra MINIMO únicamente para vistas/exportaciones finales.
+
+    Internamente se conserva el nombre MINIMO para no afectar la lectura desde
+    Excel, el caché ni cualquier cálculo que dependa del nombre original.
+    """
+    if df is None:
+        return df
+
+    d = df.copy()
+    if MINIMO_COL_NAME in d.columns:
+        d = d.rename(columns={MINIMO_COL_NAME: MINIMO_DISPLAY_NAME})
+    return d
 
 
 def _wk_key(v):
@@ -197,14 +370,31 @@ def agregar_fila_total(tabla):
     return pd.concat([df, pd.DataFrame([total_row])], ignore_index=True)
 
 
-def _preparar_columnas_detalle(df):
-    df = asegurar_metricas(df.copy())
+def _preparar_columnas_detalle(df, incluir_metricas_internas=False):
+    """
+    Prepara el detalle para mostrar/exportar.
+
+    Por requerimiento, las columnas pEspecifico y pRelativo no se muestran en
+    la tabla final. Sin embargo, siguen existiendo en la carga completa para no
+    romper cálculos internos como la detección de registros sin calificación.
+    """
+    df = normalizar_columna_minimo(df.copy())
+    df = asegurar_metricas(df)
 
     columnas_base = [
         "Plantel", "ESTUDIANTE", "matricula", "CARRERA",
         "MODULO", "DOCENTE", "grado", "cvegrupo"
     ]
-    orden = [c for c in columnas_base if c in df.columns] + [c for c in METRICAS_ORDEN if c in df.columns]
+
+    metricas = METRICAS_ORDEN if incluir_metricas_internas else METRICAS_DETALLE_PRESENTACION
+
+    # Orden solicitado para la vista de detalle:
+    # pAlcanzado debe mostrarse antes del mínimo requerido.
+    orden = (
+        [c for c in columnas_base if c in df.columns]
+        + [c for c in metricas if c in df.columns]
+        + [c for c in [MINIMO_COL_NAME] if c in df.columns]
+    )
 
     if orden:
         return df[orden]
@@ -212,17 +402,95 @@ def _preparar_columnas_detalle(df):
     return df
 
 
+
+
+def preparar_detalle_no_competentes_presentacion(df):
+    """
+    Formatea específicamente la tabla de la sección:
+    "Detalle de estudiantes con sus respectivos módulos NO competentes.".
+
+    Resultado esperado en la vista final:
+    - Incluye el mínimo tomado de la hoja Reprobacion.
+    - Muestra el mínimo con el encabezado: Porcentaje mínimo para aprobar.
+    - Oculta pEspecifico.
+    - Oculta pRelativo.
+    - Mantiene pAlcanzado visible antes del mínimo requerido.
+
+    Esta función es solo de presentación; los cálculos internos siguen usando
+    cargar_reprobacion(), donde pEspecifico, pRelativo y MINIMO permanecen disponibles.
+    """
+    if df is None:
+        return df
+
+    d = normalizar_columna_minimo(df.copy())
+    d = ocultar_columnas_metricas_presentacion(d)
+
+    columnas_preferidas = [
+        "Plantel", "ESTUDIANTE", "matricula", "CARRERA",
+        "MODULO", "DOCENTE", "grado", "cvegrupo",
+        "pAlcanzado", MINIMO_COL_NAME,
+    ]
+
+    orden = [c for c in columnas_preferidas if c in d.columns]
+    resto = [c for c in d.columns if c not in orden]
+
+    if orden:
+        d = d[orden + resto]
+
+    return renombrar_minimo_presentacion(d)
+
+def _next_dataframe_widget_key(prefix="df_preview"):
+    """Genera llaves estables por rerun para evitar DuplicateWidgetID."""
+    counter_key = "_indicadores_dataframe_widget_counter"
+    current = int(st.session_state.get(counter_key, 0)) + 1
+    st.session_state[counter_key] = current
+    return f"{prefix}_{current}"
+
+
 def mostrar_dataframe_preview(df, max_rows=None, height=DEFAULT_TABLE_HEIGHT):
     """
-    Muestra el DataFrame completo.
+    Muestra una vista previa segura para rendimiento.
 
-    Antes se usaba df.head(MAX_PREVIEW_ROWS), lo que provocaba que si un plantel
-    tenía más de 500 registros solo se vieran los primeros 500. Se mantiene el
-    nombre de la función para no romper llamadas existentes, pero ya no recorta.
+    No elimina funcionalidad: si el usuario necesita ver todos los registros,
+    puede activar el checkbox de tabla completa. Por defecto se evita enviar
+    DataFrames muy grandes al navegador, que es una causa común de lentitud,
+    timeout o cierre de sesión en Streamlit.
     """
-    total = len(df) if df is not None else 0
-    st.caption(f"Mostrando {total:,} registro(s). La tabla no está recortada; usa el scroll para revisar todos los registros.")
-    st.dataframe(df, use_container_width=True, height=height)
+    if df is None:
+        st.info("No hay datos para mostrar.")
+        return
+
+    total = len(df)
+    max_rows = int(max_rows or MAX_RENDER_ROWS or MAX_PREVIEW_ROWS)
+
+    if total == 0:
+        st.caption("Mostrando 0 registro(s).")
+        st.dataframe(df, use_container_width=True, height=height)
+        return
+
+    show_full = ALLOW_FULL_TABLE_RENDER or total <= max_rows
+
+    if total > max_rows and SHOW_FULL_TABLE_CHECKBOX:
+        show_full = st.checkbox(
+            f"Mostrar los {total:,} registros en pantalla (puede tardar)",
+            value=ALLOW_FULL_TABLE_RENDER,
+            key=_next_dataframe_widget_key("mostrar_todo_dataframe"),
+            help=(
+                "Por rendimiento, el tablero muestra primero una vista previa. "
+                "Activa esta opción solo cuando realmente necesites ver todos los registros en pantalla."
+            ),
+        )
+
+    if show_full:
+        st.caption(f"Mostrando {total:,} de {total:,} registro(s).")
+        st.dataframe(df, use_container_width=True, height=height)
+    else:
+        df_preview = df.head(max_rows)
+        st.caption(
+            f"Mostrando vista previa de {len(df_preview):,} de {total:,} registro(s). "
+            "Esto mejora el tiempo de carga y evita saturar la sesión."
+        )
+        st.dataframe(df_preview, use_container_width=True, height=height)
 
 
 # =========================
@@ -231,6 +499,19 @@ def mostrar_dataframe_preview(df, max_rows=None, height=DEFAULT_TABLE_HEIGHT):
 @st.cache_data(show_spinner=False)
 def cargar_reprobacion():
     df = _read_fast_or_excel("reprobacion.parquet", "Reprobacion", usecols=None)
+
+    # Si existe un parquet anterior sin MINIMO, se intenta leer nuevamente desde
+    # Excel para traer la columna nueva desde la hoja Reprobacion.
+    col_minimo_actual = _find_col_like(df, ["MINIMO", "MÍNIMO", "Minimo", "Mínimo", "minimo"])
+    if not col_minimo_actual:
+        try:
+            df_excel = _read_excel("Reprobacion", usecols=None)
+            if _find_col_like(df_excel, ["MINIMO", "MÍNIMO", "Minimo", "Mínimo", "minimo"]):
+                df = df_excel
+        except Exception:
+            pass
+
+    df = normalizar_columna_minimo(df)
     return asegurar_metricas(df)
 
 
@@ -370,10 +651,17 @@ def obtener_detalle_no_competentes(plantel_sel):
 
 @st.cache_data(show_spinner=False)
 def obtener_sin_registro_calificaciones(plantel_sel):
-    df = obtener_detalle_no_competentes(plantel_sel)
+    # Se usa la carga completa porque pEspecifico ya no se muestra en el detalle,
+    # pero sigue siendo el criterio interno para detectar registros sin evaluación.
+    df = cargar_reprobacion()
+    if plantel_sel != "Todos":
+        df = df[df["Plantel"] == plantel_sel].copy()
+
     if "pEspecifico" not in df.columns:
-        return pd.DataFrame(columns=df.columns)
-    return df[df["pEspecifico"] == 0].copy()
+        return _preparar_columnas_detalle(df.iloc[0:0].copy())
+
+    df_sin = df[df["pEspecifico"] == 0].copy()
+    return _preparar_columnas_detalle(df_sin)
 
 
 # =========================
@@ -412,23 +700,20 @@ def _join_unique_values(series):
     return " | ".join(values)
 
 
-def agregar_conteo_modulos_no_competentes(df):
+def agregar_conteo_modulos_no_competentes(df, ordenar=True):
     """
     Agrega a cada registro académico dos columnas:
     - modulos_nc: cantidad de módulos/registros NO competentes del estudiante.
     - categoria_modulos_nc: 1, 2, 3... 10, 11 o más.
 
-    Se agrupa por Plantel + matrícula cuando ambas columnas existen. Esto permite
-    que el usuario identifique todos los datos completos de los estudiantes que
-    tienen 1, 2, 7, 11 o más módulos NO competentes, sin perder el detalle original.
+    Optimización: usa groupby().transform("size") para evitar crear un DataFrame
+    auxiliar y hacer merge. Esto reduce memoria y tiempo en detalles grandes.
     """
     if df is None or getattr(df, "empty", True):
         base_cols = list(df.columns) if df is not None else []
         return pd.DataFrame(columns=base_cols + ["modulos_nc", "categoria_modulos_nc"])
 
     d = df.copy()
-    # Si el DataFrame ya venía filtrado/con conteo previo, se recalcula para evitar
-    # columnas duplicadas con sufijos _x/_y al hacer merge.
     d = d.drop(columns=["modulos_nc", "categoria_modulos_nc"], errors="ignore")
 
     if "matricula" not in d.columns:
@@ -440,30 +725,33 @@ def agregar_conteo_modulos_no_competentes(df):
     if "Plantel" in d.columns:
         group_cols = ["Plantel", "matricula"]
 
-    conteo = (
-        d.groupby(group_cols, dropna=False)
-        .size()
-        .reset_index(name="modulos_nc")
+    d["modulos_nc"] = (
+        d.groupby(group_cols, dropna=False)["matricula"]
+        .transform("size")
+        .fillna(0)
+        .astype(int)
     )
-    conteo["modulos_nc"] = pd.to_numeric(conteo["modulos_nc"], errors="coerce").fillna(0).astype(int)
-    conteo["categoria_modulos_nc"] = conteo["modulos_nc"].apply(_categoria_modulos_nc)
+    d["categoria_modulos_nc"] = d["modulos_nc"].apply(_categoria_modulos_nc)
 
-    d = d.merge(conteo, on=group_cols, how="left")
-    d["modulos_nc"] = pd.to_numeric(d["modulos_nc"], errors="coerce").fillna(0).astype(int)
-    d["categoria_modulos_nc"] = d["categoria_modulos_nc"].fillna(d["modulos_nc"].apply(_categoria_modulos_nc))
-
-    sort_cols = [c for c in ["Plantel", "modulos_nc", "ESTUDIANTE", "matricula", "MODULO"] if c in d.columns]
-    if sort_cols:
-        ascending = [True] * len(sort_cols)
-        if "modulos_nc" in sort_cols:
-            ascending[sort_cols.index("modulos_nc")] = False
-        d = d.sort_values(sort_cols, ascending=ascending).reset_index(drop=True)
+    if ordenar:
+        sort_cols = [c for c in ["Plantel", "modulos_nc", "ESTUDIANTE", "matricula", "MODULO"] if c in d.columns]
+        if sort_cols:
+            ascending = [True] * len(sort_cols)
+            if "modulos_nc" in sort_cols:
+                ascending[sort_cols.index("modulos_nc")] = False
+            d = d.sort_values(sort_cols, ascending=ascending).reset_index(drop=True)
 
     return d
 
 
 def filtrar_detalle_por_categorias_modulos(df, categorias):
-    d = agregar_conteo_modulos_no_competentes(df)
+    if df is None or getattr(df, "empty", True):
+        d = agregar_conteo_modulos_no_competentes(df, ordenar=False)
+    elif {"modulos_nc", "categoria_modulos_nc"}.issubset(df.columns):
+        d = df.copy()
+    else:
+        d = agregar_conteo_modulos_no_competentes(df, ordenar=False)
+
     if d.empty or not categorias:
         return d.iloc[0:0].copy()
 
@@ -480,12 +768,16 @@ def construir_resumen_estudiantes_por_modulos(df_detalle):
     if df_detalle is None or getattr(df_detalle, "empty", True):
         return pd.DataFrame()
 
-    d = agregar_conteo_modulos_no_competentes(df_detalle)
+    if {"modulos_nc", "categoria_modulos_nc"}.issubset(df_detalle.columns):
+        d = df_detalle.copy()
+    else:
+        d = agregar_conteo_modulos_no_competentes(df_detalle, ordenar=False)
+
     if d.empty:
         return pd.DataFrame()
 
     if "matricula" not in d.columns:
-        return d.copy()
+        return ocultar_columnas_metricas_presentacion(d.copy())
 
     group_cols = ["matricula"]
     if "Plantel" in d.columns:
@@ -501,25 +793,19 @@ def construir_resumen_estudiantes_por_modulos(df_detalle):
     if "DOCENTE" in d.columns:
         agg["DOCENTE"] = _join_unique_values
 
-    for col in METRICAS_ORDEN:
-        if col in d.columns:
-            agg[col] = "min"
-
+    # Las métricas internas se conservan en la carga base para cálculos,
+    # pero no se agregan a la tabla resumida final solicitada.
     resumen = d.groupby(group_cols, dropna=False).agg(agg).reset_index()
 
     rename_map = {
         "MODULO": "MODULOS_NO_COMPETENTES",
         "DOCENTE": "DOCENTES_RELACIONADOS",
-        "pEspecifico": "pEspecifico_min",
-        "pAlcanzado": "pAlcanzado_min",
-        "pRelativo": "pRelativo_min",
     }
     resumen = resumen.rename(columns=rename_map)
 
     orden = [
         "Plantel", "ESTUDIANTE", "matricula", "CARRERA", "grado", "cvegrupo",
-        "modulos_nc", "categoria_modulos_nc", "MODULOS_NO_COMPETENTES", "DOCENTES_RELACIONADOS",
-        "pEspecifico_min", "pAlcanzado_min", "pRelativo_min"
+        "modulos_nc", "categoria_modulos_nc", "MODULOS_NO_COMPETENTES", "DOCENTES_RELACIONADOS"
     ]
     orden = [c for c in orden if c in resumen.columns]
     resto = [c for c in resumen.columns if c not in orden]
@@ -532,14 +818,18 @@ def construir_resumen_estudiantes_por_modulos(df_detalle):
             ascending[sort_cols.index("modulos_nc")] = False
         resumen = resumen.sort_values(sort_cols, ascending=ascending).reset_index(drop=True)
 
-    return resumen
+    return ocultar_columnas_metricas_presentacion(resumen)
 
 
 def construir_resumen_categorias_modulos(df_detalle):
     if df_detalle is None or getattr(df_detalle, "empty", True):
         return pd.DataFrame(columns=["Módulos NO competentes", "Estudiantes", "Registros académicos"])
 
-    d = agregar_conteo_modulos_no_competentes(df_detalle)
+    if {"modulos_nc", "categoria_modulos_nc"}.issubset(df_detalle.columns):
+        d = df_detalle.copy()
+    else:
+        d = agregar_conteo_modulos_no_competentes(df_detalle, ordenar=False)
+
     if d.empty or "categoria_modulos_nc" not in d.columns:
         return pd.DataFrame(columns=["Módulos NO competentes", "Estudiantes", "Registros académicos"])
 
@@ -573,1125 +863,117 @@ def _label_categorias_modulos(categorias):
     return ", ".join(cats)
 
 
-
-# =========================
-# Seguimiento académico de estudiantes NO competentes
-# =========================
-def _seguimiento_nc_columns():
-    return [
-        "seguimiento_id",
-        "corte",
-        "plantel",
-        "matricula",
-        "estudiante",
-        "carrera",
-        "grado",
-        "grupo",
-        "modulos_nc",
-        "categoria_modulos_nc",
-        "modulos_no_competentes",
-        "docentes_relacionados",
-        "causa_principal",
-        "causa_detalle",
-        "responsable_nombre",
-        "responsable_funcion",
-        "estado",
-        "fecha_inicio",
-        "fecha_cierre",
-        "observaciones",
-        "usuario_captura",
-        "usuario_actualizacion",
-        "created_at",
-        "updated_at",
-    ]
-
-
-def _asegurar_archivo_seguimiento_nc():
-    folder = os.path.dirname(SEGUIMIENTO_NC_PATH)
-    if folder:
-        os.makedirs(folder, exist_ok=True)
-
-    if not os.path.exists(SEGUIMIENTO_NC_PATH):
-        pd.DataFrame(columns=_seguimiento_nc_columns()).to_csv(
-            SEGUIMIENTO_NC_PATH,
-            index=False,
-            encoding="utf-8-sig",
-        )
-
-
-def cargar_seguimiento_no_competentes():
-    """
-    Lee el seguimiento capturado de estudiantes NO competentes.
-
-    Se usa CSV para facilitar la implementación inmediata en Streamlit.
-    En producción conviene migrarlo a una tabla de base de datos para manejo multiusuario.
-    """
-    _asegurar_archivo_seguimiento_nc()
+def _normalizar_valor_grado_filtro(value):
+    """Normaliza valores de grado para mostrarlos y compararlos en filtros."""
+    if value is None:
+        return ""
 
     try:
-        df = pd.read_csv(SEGUIMIENTO_NC_PATH, dtype=str, keep_default_na=False)
-    except Exception:
-        df = pd.DataFrame(columns=_seguimiento_nc_columns())
-
-    for col in _seguimiento_nc_columns():
-        if col not in df.columns:
-            df[col] = ""
-
-    return df[_seguimiento_nc_columns()].copy()
-
-
-def guardar_seguimiento_no_competentes(df):
-    _asegurar_archivo_seguimiento_nc()
-    out = df.copy()
-
-    for col in _seguimiento_nc_columns():
-        if col not in out.columns:
-            out[col] = ""
-
-    out = out[_seguimiento_nc_columns()].fillna("")
-    out.to_csv(SEGUIMIENTO_NC_PATH, index=False, encoding="utf-8-sig")
-
-
-def reiniciar_seguimiento_academico(crear_respaldo=True):
-    """
-    Limpia el archivo CSV de Seguimiento Académico sin tocar el Excel base.
-
-    Reglas:
-    - Solo borra registros capturados del seguimiento.
-    - Conserva la estructura/encabezados del CSV.
-    - Opcionalmente crea un respaldo antes de limpiar.
-    """
-    _asegurar_archivo_seguimiento_nc()
-
-    backup_path = None
-    if crear_respaldo and os.path.exists(SEGUIMIENTO_NC_PATH):
-        fecha = datetime.now().strftime("%Y%m%d_%H%M%S")
-        base_dir = os.path.dirname(SEGUIMIENTO_NC_PATH) or "."
-        backup_path = os.path.join(
-            base_dir,
-            f"seguimiento_no_competentes_backup_{fecha}.csv"
-        )
-
-        try:
-            df_actual = pd.read_csv(SEGUIMIENTO_NC_PATH, dtype=str, keep_default_na=False)
-        except Exception:
-            df_actual = pd.DataFrame(columns=_seguimiento_nc_columns())
-
-        for col in _seguimiento_nc_columns():
-            if col not in df_actual.columns:
-                df_actual[col] = ""
-
-        df_actual[_seguimiento_nc_columns()].fillna("").to_csv(
-            backup_path,
-            index=False,
-            encoding="utf-8-sig",
-        )
-
-    df_vacio = pd.DataFrame(columns=_seguimiento_nc_columns())
-    df_vacio.to_csv(SEGUIMIENTO_NC_PATH, index=False, encoding="utf-8-sig")
-
-    try:
-        st.cache_data.clear()
-    except Exception:
-        pass
-
-    return backup_path
-
-
-def render_admin_restablecer_seguimiento_academico():
-    """
-    Panel administrativo para limpiar los datos de prueba del Seguimiento Académico.
-    Debe mostrarse únicamente a usuarios administradores.
-    """
-    st.markdown("---")
-
-    with st.expander("⚙️ Administración del Seguimiento Académico", expanded=False):
-        st.warning(
-            "Esta opción limpia todos los registros capturados en el Seguimiento Académico. "
-            "No borra los datos académicos originales del archivo Excel; solo limpia el archivo CSV de seguimiento."
-        )
-
-        st.caption(f"Archivo que se limpiará: `{SEGUIMIENTO_NC_PATH}`")
-
-        try:
-            df_actual = cargar_seguimiento_no_competentes()
-            total_registros = len(df_actual)
-        except Exception:
-            total_registros = 0
-
-        st.info(f"Registros actuales en Seguimiento Académico: **{total_registros:,}**")
-
-        col_a, col_b = st.columns(2)
-        with col_a:
-            crear_respaldo = st.checkbox(
-                "Crear respaldo antes de limpiar",
-                value=True,
-                key="crear_respaldo_limpieza_seguimiento_academico",
-            )
-        with col_b:
-            confirmar_limpieza = st.checkbox(
-                "Confirmo que deseo limpiar el seguimiento",
-                value=False,
-                key="confirmar_limpieza_seguimiento_academico",
-            )
-
-        st.caption(
-            "Úsalo cuando termines pruebas y quieras dejar limpio el Seguimiento Académico para producción "
-            "o para una nueva ronda de captura."
-        )
-
-        if st.button(
-            "🧹 Restablecer Seguimiento Académico",
-            key="btn_restablecer_seguimiento_academico",
-            type="secondary",
-        ):
-            if not confirmar_limpieza:
-                st.error("Primero marca la casilla de confirmación para evitar borrados accidentales.")
-                return
-
-            backup_path = reiniciar_seguimiento_academico(crear_respaldo=crear_respaldo)
-
-            if backup_path:
-                st.success(
-                    "Seguimiento Académico restablecido correctamente. "
-                    f"Se creó un respaldo en: `{backup_path}`"
-                )
-            else:
-                st.success("Seguimiento Académico restablecido correctamente.")
-
-            st.rerun()
-
-
-def _obtener_corte_actual_indicadores():
-    """
-    Devuelve una etiqueta de corte para no sobrescribir seguimientos de cortes distintos.
-    Si existe hoja SEGUIMIENTO con semana detectable, usa la semana más reciente.
-    """
-    try:
-        etiqueta = obtener_etiqueta_semana_mas_reciente(cargar_seguimiento())
-        if etiqueta:
-            return str(etiqueta).strip()
-    except Exception:
-        pass
-    return "Corte actual"
-
-
-def _valor_seguro_fila(row, col, default=""):
-    try:
-        if col not in row.index:
-            return default
-        value = row.get(col, default)
         if pd.isna(value):
-            return default
-        text = str(value).strip()
-        if text.lower() in ("nan", "none", "null"):
-            return default
-        return text
-    except Exception:
-        return default
-
-
-def _to_int_safe(value, default=0):
-    try:
-        if value is None or pd.isna(value):
-            return default
-    except Exception:
-        pass
-    try:
-        return int(float(str(value).replace(",", "").strip()))
-    except Exception:
-        return default
-
-
-def normalizar_estado_seguimiento(valor):
-    """
-    Normaliza cualquier valor histórico o capturado al catálogo vigente:
-    - Sin seguimiento
-    - En proceso
-    - Recuperado
-    """
-    texto = str(valor or "").strip()
-    texto_norm = _norm_txt(texto)
-
-    if texto == "Recuperado" or ("recuperado" in texto_norm and "no recuperado" not in texto_norm):
-        return "Recuperado"
-
-    if texto in ("En proceso", "Canalizado", "En recuperación"):
-        return "En proceso"
-
-    # Estados históricos que significaban atención abierta o no cerrada como recuperada.
-    if texto in ("Finalizado no recuperado", "No localizado"):
-        return "En proceso"
-
-    return "Sin seguimiento"
-
-
-
-def normalizar_fecha_seguimiento(valor):
-    """
-    Normaliza cualquier valor de fecha capturado en el editor a formato YYYY-MM-DD.
-    Acepta strings, pandas Timestamp, datetime/date o celdas vacías.
-    """
-    if valor is None:
-        return ""
-
-    try:
-        if pd.isna(valor):
             return ""
     except Exception:
         pass
 
-    texto = str(valor).strip()
-    if not texto or texto.lower() in ("nan", "nat", "none", "null"):
-        return ""
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
 
-    try:
-        fecha = pd.to_datetime(texto, errors="coerce")
-        if pd.isna(fecha):
-            return ""
-        return fecha.strftime("%Y-%m-%d")
-    except Exception:
-        return ""
+    text = str(value).strip()
+    if re.fullmatch(r"\d+\.0", text):
+        return text[:-2]
+
+    return text
 
 
-def _fecha_para_editor(valor):
-    """
-    Convierte una fecha guardada como texto a objeto date para que st.data_editor
-    muestre un selector de fecha. Si está vacía, devuelve None.
-    """
-    fecha_txt = normalizar_fecha_seguimiento(valor)
-    if not fecha_txt:
-        return None
-    try:
-        return datetime.strptime(fecha_txt, "%Y-%m-%d").date()
-    except Exception:
-        return None
+def _orden_grado_filtro(value):
+    """Ordena grados activos en forma natural: 1, 2, 3... y después texto."""
+    text = _normalizar_valor_grado_filtro(value)
+    sem_key = _sem_key(text)
+    if sem_key is not None:
+        return (0, int(sem_key), text)
+
+    nums = re.findall(r"\d+", text)
+    if nums:
+        return (0, int(nums[0]), text)
+
+    return (1, 999, _norm_txt(text))
 
 
-def fecha_cierre_por_estado_seguimiento(estado, fecha_cierre_capturada="", hoy=None):
-    """
-    Regla de negocio:
-    - Si el estado es Recuperado, se permite capturar Fecha cierre.
-    - Si Estado es Recuperado y Fecha cierre viene vacía, se asigna la fecha actual.
-    - Si el estado es En proceso o Sin seguimiento, se limpia Fecha cierre.
-    """
-    hoy = hoy or datetime.now().strftime("%Y-%m-%d")
-    estado_norm = normalizar_estado_seguimiento(estado)
-    fecha_capturada = normalizar_fecha_seguimiento(fecha_cierre_capturada)
+def obtener_grados_activos_desde_detalle(df):
+    """Devuelve los grados presentes en el detalle, incluyendo solo valores activos/no vacíos."""
+    if df is None or getattr(df, "empty", True) or "grado" not in df.columns:
+        return []
 
-    if estado_norm == "Recuperado":
-        return fecha_capturada or hoy
+    grados = []
+    for value in df["grado"].dropna().tolist():
+        text = _normalizar_valor_grado_filtro(value)
+        if not text or text.lower() in ("nan", "none", "null"):
+            continue
+        grados.append(text)
 
-    return ""
+    grados = list(dict.fromkeys(grados))
+    return sorted(grados, key=_orden_grado_filtro)
 
 
-def _aplicar_cambios_data_editor_desde_session_state(df, editor_key):
-    """
-    Aplica manualmente los cambios guardados por st.data_editor en st.session_state.
-
-    Esto corrige el caso en el que el usuario cambia Estado a 'Recuperado'
-    y la sección de Fecha cierre no se actualiza inmediatamente en la misma corrida.
-    Streamlit guarda los cambios del editor en una estructura interna; esta función
-    los refleja sobre el DataFrame antes de calcular qué estudiantes deben mostrar
-    el selector de Fecha cierre.
-    """
+def filtrar_detalle_por_grado_activo(df, grado_sel):
+    """Filtra el detalle por grado activo. La opción Todos conserva el comportamiento original."""
     if df is None or getattr(df, "empty", True):
         return df
 
-    out = df.copy()
-    state = st.session_state.get(editor_key, {})
-    if not isinstance(state, dict):
-        return out
+    if not grado_sel or str(grado_sel).strip() == "Todos" or "grado" not in df.columns:
+        return df.copy()
 
-    # Formato actual de Streamlit: {'edited_rows': {row_index: {col: value}}}
-    edited_rows = state.get("edited_rows", {}) or {}
-    if isinstance(edited_rows, dict):
-        for row_idx, changes in edited_rows.items():
-            try:
-                idx = int(row_idx)
-            except Exception:
-                continue
-            if idx < 0 or idx >= len(out) or not isinstance(changes, dict):
-                continue
-            for col, value in changes.items():
-                if col in out.columns:
-                    out.iat[idx, out.columns.get_loc(col)] = value
+    objetivo = _normalizar_valor_grado_filtro(grado_sel)
+    d = df.copy()
+    valores_grado = d["grado"].apply(_normalizar_valor_grado_filtro)
+    return d[valores_grado == objetivo].copy()
 
-    # Formato usado por algunas versiones anteriores: {'edited_cells': {'0:Estado': 'Recuperado'}}
-    edited_cells = state.get("edited_cells", {}) or {}
-    if isinstance(edited_cells, dict):
-        for cell_key, value in edited_cells.items():
-            try:
-                row_part, col = str(cell_key).split(":", 1)
-                idx = int(row_part)
-            except Exception:
-                continue
-            if idx < 0 or idx >= len(out) or col not in out.columns:
-                continue
-            out.iat[idx, out.columns.get_loc(col)] = value
-
-    return out
-
-
-def _crear_id_seguimiento(plantel, matricula, corte):
-    base = f"{plantel}|{matricula}|{corte}"
-    base = unicodedata.normalize("NFKD", base)
-    base = "".join(ch for ch in base if not unicodedata.combining(ch))
-    base = re.sub(r"[^a-zA-Z0-9_-]+", "_", base).strip("_").lower()
-    return base or f"seguimiento_{datetime.now().strftime('%Y%m%d%H%M%S')}"
-
-
-def _prioridad_por_modulos(modulos_nc):
-    n = _to_int_safe(modulos_nc)
-    if n >= 11:
-        return "Alta prioridad"
-    if n >= 3:
-        return "Atención prioritaria"
-    if n in (1, 2):
-        return "Recuperación inmediata"
-    return "Sin prioridad"
-
-
-def _causa_sugerida_estudiante(row_estudiante, df_detalle_estudiante):
-    """
-    Sugiere causa con base en el indicador existente.
-    Si cualquier registro tiene pEspecifico = 0, se sugiere 'Sin evaluación registrada'.
-    """
-    if df_detalle_estudiante is not None and not df_detalle_estudiante.empty and "pEspecifico" in df_detalle_estudiante.columns:
-        valores = pd.to_numeric(df_detalle_estudiante["pEspecifico"], errors="coerce").fillna(-1)
-        if (valores == 0).any():
-            return "Académica"
-
-    for col in ("pEspecifico_min", "pEspecifico"):
-        if col in row_estudiante.index:
-            try:
-                if float(row_estudiante.get(col)) == 0:
-                    return "Académica"
-            except Exception:
-                pass
-
-    return ""
-
-
-def _filtrar_detalle_estudiante(df_detalle, plantel, matricula):
-    if df_detalle is None or getattr(df_detalle, "empty", True):
-        return pd.DataFrame()
-
-    d = df_detalle.copy()
-    if "matricula" in d.columns:
-        d = d[d["matricula"].astype(str).str.strip() == str(matricula).strip()].copy()
-    if "Plantel" in d.columns and plantel:
-        d = d[d["Plantel"].astype(str).str.strip() == str(plantel).strip()].copy()
-    return d
-
-
-def _obtener_registro_seguimiento(seguimiento_id):
-    df_seg = cargar_seguimiento_no_competentes()
-    if df_seg.empty or "seguimiento_id" not in df_seg.columns:
-        return None
-    match = df_seg[df_seg["seguimiento_id"].astype(str) == str(seguimiento_id)]
-    if match.empty:
-        return None
-    return match.iloc[-1]
-
-
-def construir_tabla_seguimiento_estudiantes(df_resumen_estudiantes, corte_actual):
-    """
-    Une el resumen por estudiante con el CSV de seguimiento para mostrar estado actual.
-    """
-    if df_resumen_estudiantes is None or getattr(df_resumen_estudiantes, "empty", True):
-        return pd.DataFrame()
-
-    base = df_resumen_estudiantes.copy()
-
-    for col in ["Plantel", "matricula", "ESTUDIANTE", "CARRERA", "grado", "cvegrupo", "modulos_nc", "categoria_modulos_nc"]:
-        if col not in base.columns:
-            base[col] = ""
-
-    base["seguimiento_id"] = base.apply(
-        lambda r: _crear_id_seguimiento(
-            _valor_seguro_fila(r, "Plantel"),
-            _valor_seguro_fila(r, "matricula"),
-            corte_actual,
-        ),
-        axis=1,
-    )
-
-    df_seg = cargar_seguimiento_no_competentes()
-    if not df_seg.empty:
-        cols_merge = [
-            "seguimiento_id", "causa_principal", "responsable_nombre",
-            "responsable_funcion", "estado", "fecha_inicio",
-            "fecha_cierre", "observaciones", "updated_at"
-        ]
-        df_seg_latest = df_seg.sort_values("updated_at").drop_duplicates("seguimiento_id", keep="last")
-        base = base.merge(df_seg_latest[cols_merge], on="seguimiento_id", how="left")
-    else:
-        for col in ["causa_principal", "responsable_nombre", "responsable_funcion", "estado", "fecha_inicio", "fecha_cierre", "observaciones", "updated_at"]:
-            base[col] = ""
-
-    base["estado"] = base["estado"].fillna("").apply(normalizar_estado_seguimiento)
-    base["prioridad"] = base["modulos_nc"].apply(_prioridad_por_modulos)
-
-    rename = {
-        "Plantel": "Plantel",
-        "ESTUDIANTE": "Estudiante",
-        "matricula": "Matrícula",
-        "CARRERA": "Carrera",
-        "grado": "Grado",
-        "cvegrupo": "Grupo",
-        "modulos_nc": "Módulos NC",
-        "categoria_modulos_nc": "Categoría",
-        "MODULOS_NO_COMPETENTES": "Módulos no competentes",
-        "DOCENTES_RELACIONADOS": "Docentes relacionados",
-        "causa_principal": "Causa",
-        "responsable_nombre": "Responsable",
-        "responsable_funcion": "Función",
-        "estado": "Estado",
-        "prioridad": "Prioridad",
-        "fecha_inicio": "Fecha inicio",
-        "fecha_cierre": "Fecha cierre",
-        "observaciones": "Observaciones",
-        "updated_at": "Última actualización",
-    }
-
-    base = base.rename(columns=rename)
-
-    ordered = [
-        "seguimiento_id",
-        "Plantel", "Estudiante", "Matrícula", "Carrera", "Grado", "Grupo",
-        "Módulos NC", "Categoría", "Prioridad", "Estado",
-        "Causa", "Responsable", "Función", "Fecha inicio", "Fecha cierre", "Observaciones",
-        "Módulos no competentes", "Docentes relacionados", "Última actualización"
-    ]
-    ordered = [c for c in ordered if c in base.columns]
-    rest = [c for c in base.columns if c not in ordered]
-    return base[ordered + rest]
-
-
-def guardar_registro_seguimiento_estudiante(row_estudiante, df_detalle_estudiante, datos_form, corte_actual):
-    ahora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    hoy = datetime.now().strftime("%Y-%m-%d")
-    usuario = _get_username_from_session() or "usuario_no_identificado"
-
-    plantel = _valor_seguro_fila(row_estudiante, "Plantel") or _valor_seguro_fila(row_estudiante, "Plantel_x")
-    matricula = _valor_seguro_fila(row_estudiante, "Matrícula") or _valor_seguro_fila(row_estudiante, "matricula")
-    estudiante = _valor_seguro_fila(row_estudiante, "Estudiante") or _valor_seguro_fila(row_estudiante, "ESTUDIANTE")
-    carrera = _valor_seguro_fila(row_estudiante, "Carrera") or _valor_seguro_fila(row_estudiante, "CARRERA")
-    grado = _valor_seguro_fila(row_estudiante, "Grado") or _valor_seguro_fila(row_estudiante, "grado")
-    grupo = _valor_seguro_fila(row_estudiante, "Grupo") or _valor_seguro_fila(row_estudiante, "cvegrupo")
-    modulos_nc = _valor_seguro_fila(row_estudiante, "Módulos NC") or _valor_seguro_fila(row_estudiante, "modulos_nc")
-    categoria = _valor_seguro_fila(row_estudiante, "Categoría") or _valor_seguro_fila(row_estudiante, "categoria_modulos_nc")
-    modulos = _valor_seguro_fila(row_estudiante, "Módulos no competentes") or _valor_seguro_fila(row_estudiante, "MODULOS_NO_COMPETENTES")
-    docentes = _valor_seguro_fila(row_estudiante, "Docentes relacionados") or _valor_seguro_fila(row_estudiante, "DOCENTES_RELACIONADOS")
-
-    seguimiento_id = _valor_seguro_fila(row_estudiante, "seguimiento_id") or _crear_id_seguimiento(plantel, matricula, corte_actual)
-
-    df_seg = cargar_seguimiento_no_competentes()
-    previo = _obtener_registro_seguimiento(seguimiento_id)
-
-    estado = normalizar_estado_seguimiento(datos_form.get("estado", "Sin seguimiento"))
-    fecha_cierre = fecha_cierre_por_estado_seguimiento(estado, datos_form.get("fecha_cierre", ""), hoy)
-
-    nuevo = {
-        "seguimiento_id": seguimiento_id,
-        "corte": corte_actual,
-        "plantel": plantel,
-        "matricula": matricula,
-        "estudiante": estudiante,
-        "carrera": carrera,
-        "grado": grado,
-        "grupo": grupo,
-        "modulos_nc": str(modulos_nc),
-        "categoria_modulos_nc": str(categoria),
-        "modulos_no_competentes": str(modulos),
-        "docentes_relacionados": str(docentes),
-        "causa_principal": datos_form.get("causa_principal", ""),
-        "causa_detalle": datos_form.get("causa_detalle", ""),
-        "responsable_nombre": datos_form.get("responsable_nombre", ""),
-        "responsable_funcion": datos_form.get("responsable_funcion", ""),
-        "estado": estado,
-        "fecha_inicio": datos_form.get("fecha_inicio", hoy) or hoy,
-        "fecha_cierre": fecha_cierre,
-        "observaciones": datos_form.get("observaciones", ""),
-        "usuario_captura": _valor_seguro_fila(previo, "usuario_captura", usuario) if previo is not None else usuario,
-        "usuario_actualizacion": usuario,
-        "created_at": _valor_seguro_fila(previo, "created_at", ahora) if previo is not None else ahora,
-        "updated_at": ahora,
-    }
-
-    df_seg = df_seg[df_seg["seguimiento_id"].astype(str) != str(seguimiento_id)].copy()
-    df_seg = pd.concat([df_seg, pd.DataFrame([nuevo])], ignore_index=True)
-    guardar_seguimiento_no_competentes(df_seg)
-
-
-def _validar_formulario_seguimiento(causa, causa_detalle, responsable, funcion, estado, observaciones):
-    errores = []
-    if not causa:
-        errores.append("Selecciona la causa principal de no competencia.")
-    if causa == "Otro" and not causa_detalle.strip():
-        errores.append("Cuando la causa es 'Otro', debes escribir el detalle de la causa.")
-    if not responsable.strip():
-        errores.append("Escribe el nombre de la persona responsable del seguimiento.")
-    if not funcion:
-        errores.append("Selecciona el puesto o función de la persona responsable.")
-    if not estado:
-        errores.append("Selecciona el estado del seguimiento.")
-    if estado == "Finalizado no recuperado" and not observaciones.strip():
-        errores.append("Si finaliza como no recuperado, captura observaciones para explicar el motivo.")
-    return errores
-
-
-def render_formulario_seguimiento_estudiante(row_estudiante, df_detalle_estudiante, corte_actual, key_prefix):
-    seguimiento_id = _valor_seguro_fila(row_estudiante, "seguimiento_id")
-    previo = _obtener_registro_seguimiento(seguimiento_id)
-    hoy = datetime.now().strftime("%Y-%m-%d")
-
-    estudiante = _valor_seguro_fila(row_estudiante, "Estudiante")
-    matricula = _valor_seguro_fila(row_estudiante, "Matrícula")
-    plantel = _valor_seguro_fila(row_estudiante, "Plantel")
-    modulos_nc = _valor_seguro_fila(row_estudiante, "Módulos NC")
-    modulos = _valor_seguro_fila(row_estudiante, "Módulos no competentes")
-    docentes = _valor_seguro_fila(row_estudiante, "Docentes relacionados")
-
-    causa_sugerida = _causa_sugerida_estudiante(row_estudiante, df_detalle_estudiante)
-
-    def _prev(col, default=""):
-        if previo is None:
-            return default
-        return _valor_seguro_fila(previo, col, default)
-
-    causa_default = _prev("causa_principal", causa_sugerida)
-    if causa_default not in CAUSAS_NO_COMPETENCIA:
-        causa_default = causa_sugerida if causa_sugerida in CAUSAS_NO_COMPETENCIA else CAUSAS_NO_COMPETENCIA[0]
-
-    funcion_default = _prev("responsable_funcion", FUNCIONES_SEGUIMIENTO[0])
-    if funcion_default not in FUNCIONES_SEGUIMIENTO:
-        funcion_default = FUNCIONES_SEGUIMIENTO[0]
-
-    estado_default = _prev("estado", "En proceso")
-    if estado_default not in ESTADOS_SEGUIMIENTO:
-        estado_default = "En proceso"
-
-    st.markdown(f"**Estudiante:** {estudiante}")
-    st.caption(
-        f"Matrícula: **{matricula}** | Plantel: **{plantel}** | "
-        f"Corte: **{corte_actual}** | Módulos NO competentes: **{modulos_nc}**"
-    )
-
-    with st.expander("Ver módulos y docentes relacionados", expanded=False):
-        st.write("**Módulos:**", modulos or "Sin dato")
-        st.write("**Docentes:**", docentes or "Sin dato")
-        if df_detalle_estudiante is not None and not df_detalle_estudiante.empty:
-            cols = [c for c in ["MODULO", "DOCENTE", "pEspecifico", "pAlcanzado", "pRelativo"] if c in df_detalle_estudiante.columns]
-            if cols:
-                st.dataframe(df_detalle_estudiante[cols], use_container_width=True, height=220)
-
-    with st.form(f"{key_prefix}_form_seguimiento_{seguimiento_id}"):
-        causa = st.selectbox(
-            "Causa principal de no competencia",
-            CAUSAS_NO_COMPETENCIA,
-            index=CAUSAS_NO_COMPETENCIA.index(causa_default),
-            key=f"{key_prefix}_{seguimiento_id}_causa",
-        )
-        causa_detalle = st.text_input(
-            "Detalle de causa / subcausa",
-            value=_prev("causa_detalle", ""),
-            placeholder="Ejemplo: faltas recurrentes, no entregó proyecto final, cambio de grupo, etc.",
-            key=f"{key_prefix}_{seguimiento_id}_causa_detalle",
-        )
-
-        col_resp, col_func = st.columns(2)
-        with col_resp:
-            responsable = st.text_input(
-                "Persona responsable del seguimiento",
-                value=_prev("responsable_nombre", ""),
-                placeholder="Nombre de quien atiende o dará seguimiento",
-                key=f"{key_prefix}_{seguimiento_id}_responsable",
-            )
-        with col_func:
-            funcion = st.selectbox(
-                "Puesto o función",
-                FUNCIONES_SEGUIMIENTO,
-                index=FUNCIONES_SEGUIMIENTO.index(funcion_default),
-                key=f"{key_prefix}_{seguimiento_id}_funcion",
-            )
-
-        estado = st.selectbox(
-            "Estado del seguimiento",
-            ESTADOS_SEGUIMIENTO,
-            index=ESTADOS_SEGUIMIENTO.index(estado_default),
-            key=f"{key_prefix}_{seguimiento_id}_estado",
-        )
-
-        col_ini, col_cierre = st.columns(2)
-        with col_ini:
-            fecha_inicio = st.text_input(
-                "Fecha de inicio",
-                value=_prev("fecha_inicio", hoy) or hoy,
-                help="Formato recomendado: AAAA-MM-DD",
-                key=f"{key_prefix}_{seguimiento_id}_fecha_inicio",
-            )
-        with col_cierre:
-            fecha_cierre = st.text_input(
-                "Fecha de cierre",
-                value=_prev("fecha_cierre", ""),
-                help="Se puede dejar vacío si aún no finaliza.",
-                key=f"{key_prefix}_{seguimiento_id}_fecha_cierre",
-            )
-
-        observaciones = st.text_area(
-            "Observaciones / acciones realizadas",
-            value=_prev("observaciones", ""),
-            placeholder="Describe qué acción se tomó, acuerdos, pendientes, contacto con estudiante, tutorías, etc.",
-            height=130,
-            key=f"{key_prefix}_{seguimiento_id}_observaciones",
-        )
-
-        col_save, col_cancel = st.columns(2)
-        guardar = col_save.form_submit_button("💾 Guardar seguimiento", type="primary")
-        cancelar = col_cancel.form_submit_button("Cancelar")
-
-    if cancelar:
-        st.session_state[f"{key_prefix}_seguimiento_open"] = False
-        st.rerun()
-
-    if guardar:
-        errores = _validar_formulario_seguimiento(
-            causa, causa_detalle, responsable, funcion, estado, observaciones
-        )
-        if errores:
-            for error in errores:
-                st.error(error)
-            return
-
-        guardar_registro_seguimiento_estudiante(
-            row_estudiante=row_estudiante,
-            df_detalle_estudiante=df_detalle_estudiante,
-            datos_form={
-                "causa_principal": causa,
-                "causa_detalle": causa_detalle,
-                "responsable_nombre": responsable,
-                "responsable_funcion": funcion,
-                "estado": estado,
-                "fecha_inicio": fecha_inicio,
-                "fecha_cierre": fecha_cierre,
-                "observaciones": observaciones,
-            },
-            corte_actual=corte_actual,
-        )
-        st.success("Seguimiento guardado correctamente.")
-        st.session_state[f"{key_prefix}_seguimiento_open"] = False
-        st.rerun()
-
-
-def render_reporte_seguimiento_no_competentes(df_tabla_seguimiento, corte_actual, key_prefix):
-    st.markdown("#### 📊 Reporte de seguimiento")
-
-    if df_tabla_seguimiento is None or df_tabla_seguimiento.empty:
-        st.info("No hay estudiantes para generar reporte.")
-        return
-
-    total = len(df_tabla_seguimiento)
-    sin_seg = int((df_tabla_seguimiento["Estado"].astype(str) == "Sin seguimiento").sum()) if "Estado" in df_tabla_seguimiento.columns else 0
-    en_proceso = int(df_tabla_seguimiento["Estado"].astype(str).isin(["En proceso", "Canalizado", "En recuperación"]).sum()) if "Estado" in df_tabla_seguimiento.columns else 0
-    finalizados = int((df_tabla_seguimiento["Estado"].astype(str) == "Recuperado").sum()) if "Estado" in df_tabla_seguimiento.columns else 0
-
-    cols = st.columns(4)
-    cols[0].metric("Estudiantes filtrados", f"{total:,}")
-    cols[1].metric("Sin seguimiento", f"{sin_seg:,}")
-    cols[2].metric("En atención", f"{en_proceso:,}")
-    cols[3].metric("Recuperados", f"{finalizados:,}")
-
-    tab_estado, tab_causa, tab_responsable, tab_observaciones = st.tabs(["Por estado", "Por causa", "Por responsable", "Con observaciones"])
-
-    with tab_estado:
-        if "Estado" in df_tabla_seguimiento.columns:
-            rep = df_tabla_seguimiento.groupby("Estado", dropna=False).size().reset_index(name="Estudiantes")
-            st.dataframe(rep, use_container_width=True, hide_index=True)
-
-    with tab_causa:
-        if "Causa" in df_tabla_seguimiento.columns:
-            tmp = df_tabla_seguimiento.copy()
-            tmp["Causa"] = tmp["Causa"].fillna("").replace("", "Sin capturar")
-            rep = tmp.groupby("Causa", dropna=False).size().reset_index(name="Estudiantes")
-            st.dataframe(rep.sort_values("Estudiantes", ascending=False), use_container_width=True, hide_index=True)
-
-    with tab_responsable:
-        if "Responsable" in df_tabla_seguimiento.columns:
-            tmp = df_tabla_seguimiento.copy()
-            tmp["Responsable"] = tmp["Responsable"].fillna("").replace("", "Sin asignar")
-            rep = tmp.groupby("Responsable", dropna=False).size().reset_index(name="Estudiantes")
-            st.dataframe(rep.sort_values("Estudiantes", ascending=False), use_container_width=True, hide_index=True)
-
-    with tab_observaciones:
-        if "Observaciones" in df_tabla_seguimiento.columns:
-            tmp = df_tabla_seguimiento.copy()
-            tmp["Tiene observaciones"] = tmp["Observaciones"].fillna("").astype(str).str.strip().ne("").map({True: "Con observaciones", False: "Sin observaciones"})
-            rep = tmp.groupby("Tiene observaciones", dropna=False).size().reset_index(name="Estudiantes")
-            st.dataframe(rep, use_container_width=True, hide_index=True)
-
-    csv = df_tabla_seguimiento.drop(columns=["seguimiento_id"], errors="ignore").to_csv(index=False).encode("utf-8-sig")
-    st.download_button(
-        "⬇️ Descargar reporte de seguimiento CSV",
-        data=csv,
-        file_name=f"reporte_seguimiento_no_competentes_{_safe_download_name(corte_actual)}.csv",
-        mime="text/csv",
-        key=f"{key_prefix}_download_reporte_seguimiento",
-    )
-
-
-def render_tab_seguimiento_no_competentes(df_resumen_estudiantes, df_detalle_filtrado, plantel_sel, categorias_label, key_prefix):
-    st.caption(
-        "Edita directamente las columnas **Causa**, **Responsable**, **Estado** y **Observaciones**. "
-        "La **Fecha cierre** queda bloqueada en la tabla principal y solo se habilita abajo para estudiantes con **Estado = Recuperado**. "
-        "La **Última actualización** se registra automáticamente al guardar y no se puede modificar manualmente."
-    )
-
-    corte_actual = _obtener_corte_actual_indicadores()
-    df_tabla = construir_tabla_seguimiento_estudiantes(df_resumen_estudiantes, corte_actual)
-
-    if df_tabla.empty:
-        st.info("No hay estudiantes para seguimiento con los filtros actuales.")
-        return
-
-    st.markdown(
-        f"**Corte:** {corte_actual} | **Plantel:** {plantel_sel} | "
-        f"**Categoría(s):** {categorias_label}"
-    )
-
-    def _normalizar_causa_editor(valor):
-        texto = str(valor or "").strip()
-        return texto if texto in CAUSAS_NO_COMPETENCIA else ""
-
-    def _normalizar_responsable_editor(valor):
-        texto = str(valor or "").strip().upper()
-        return texto if texto in RESPONSABLES_SEGUIMIENTO else ""
-
-    def _normalizar_estado_editor(valor):
-        return normalizar_estado_seguimiento(valor)
-
-    cols_editor = [
-        "seguimiento_id",
-        "Plantel", "Estudiante", "Matrícula", "Carrera", "Grado", "Grupo",
-        "Módulos NC", "Categoría", "Prioridad",
-        "Causa", "Responsable", "Estado",
-        "Fecha cierre", "Observaciones", "Última actualización",
-    ]
-    cols_editor = [c for c in cols_editor if c in df_tabla.columns]
-    df_editor = df_tabla[cols_editor].copy()
-
-    for col in ["Causa", "Responsable", "Estado", "Fecha cierre", "Observaciones", "Última actualización"]:
-        if col not in df_editor.columns:
-            df_editor[col] = ""
-
-    df_editor["Causa"] = df_editor["Causa"].apply(_normalizar_causa_editor)
-    df_editor["Responsable"] = df_editor["Responsable"].apply(_normalizar_responsable_editor)
-    df_editor["Estado"] = df_editor["Estado"].apply(_normalizar_estado_editor)
-    df_editor["Fecha cierre"] = df_editor["Fecha cierre"].apply(_fecha_para_editor)
-
-    # Regla de negocio solicitada:
-    # Fecha cierre NO se edita en la tabla principal. Solo se habilita en una tabla secundaria
-    # cuando el Estado del estudiante sea Recuperado.
-    disabled_cols = [
-        c for c in df_editor.columns
-        if c not in ["Causa", "Responsable", "Estado", "Observaciones"]
-    ]
-
-    editor_key_principal = f"{key_prefix}_editor_seguimiento_directo"
-
-    def _marcar_cambio_editor_seguimiento():
-        # Forzar que Streamlit registre el cambio y vuelva a calcular la sección de Fecha cierre.
-        st.session_state[f"{editor_key_principal}_changed_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
-
-    edited_df = st.data_editor(
-        df_editor,
-        use_container_width=True,
-        height=500,
-        hide_index=True,
-        num_rows="fixed",
-        disabled=disabled_cols,
-        key=editor_key_principal,
-        on_change=_marcar_cambio_editor_seguimiento,
-        column_config={
-            "seguimiento_id": None,
-            "Causa": st.column_config.SelectboxColumn(
-                "Causa",
-                help="Selecciona la causa principal de no competencia.",
-                options=CAUSAS_NO_COMPETENCIA,
-                required=False,
-            ),
-            "Responsable": st.column_config.SelectboxColumn(
-                "Responsable",
-                help="Selecciona quién dará seguimiento: JPFT, FPSE, TTA, OE o TB.",
-                options=RESPONSABLES_SEGUIMIENTO,
-                required=False,
-            ),
-            "Estado": st.column_config.SelectboxColumn(
-                "Estado",
-                help="Estado actual del seguimiento del estudiante.",
-                options=ESTADOS_SEGUIMIENTO,
-                required=True,
-            ),
-            "Fecha cierre": st.column_config.DateColumn(
-                "Fecha cierre",
-                help="Campo bloqueado aquí. Solo se captura abajo cuando el Estado sea Recuperado.",
-                format="YYYY-MM-DD",
-                required=False,
-            ),
-            "Observaciones": st.column_config.TextColumn(
-                "Observaciones",
-                help="Captura comentarios, acuerdos, acciones realizadas o pendientes del seguimiento.",
-                max_chars=500,
-                required=False,
-            ),
-            "Módulos NC": st.column_config.NumberColumn("Módulos NC", format="%d"),
-        },
-    )
-
-    # Corrección: aplicar cambios vivos del editor antes de calcular la sección de Fecha cierre.
-    # Así, al cambiar Estado a Recuperado, el selector de Fecha cierre aparece inmediatamente abajo.
-    edited_df = _aplicar_cambios_data_editor_desde_session_state(edited_df, editor_key_principal)
-
-    st.caption(
-        "Para capturar: haz clic en la celda de **Causa**, **Responsable**, **Estado** u **Observaciones**. "
-        "La **Fecha cierre** se habilita únicamente en la sección inferior cuando el Estado sea **Recuperado**. "
-        "La columna **Última actualización** se coloca automáticamente al guardar los cambios."
-    )
-
-    # Normalización del resultado del editor principal.
-    edited_df = edited_df.copy()
-    edited_df["Causa"] = edited_df["Causa"].apply(_normalizar_causa_editor)
-    edited_df["Responsable"] = edited_df["Responsable"].apply(_normalizar_responsable_editor)
-    edited_df["Estado"] = edited_df["Estado"].apply(_normalizar_estado_editor)
-    if "Observaciones" in edited_df.columns:
-        edited_df["Observaciones"] = edited_df["Observaciones"].fillna("").astype(str)
-
-    # Editor secundario: solo estudiantes recuperados pueden capturar Fecha cierre.
-    st.markdown("##### 📅 Fecha de cierre")
-    st.caption(
-        "Este apartado solo muestra estudiantes con **Estado = Recuperado**. "
-        "Mientras un estudiante esté en **En proceso** o **Sin seguimiento**, no se permite capturar Fecha cierre."
-    )
-
-    fecha_cierre_map = {}
-    df_recuperados = edited_df[edited_df["Estado"].astype(str) == "Recuperado"].copy()
-
-    if df_recuperados.empty:
-        st.info(
-            "No hay estudiantes con Estado Recuperado. Cambia el Estado a **Recuperado** en la tabla principal "
-            "y la captura de Fecha cierre se habilitará automáticamente aquí abajo."
-        )
-    else:
-        cols_fecha = [
-            "seguimiento_id", "Estudiante", "Matrícula", "Estado", "Fecha cierre"
-        ]
-        cols_fecha = [c for c in cols_fecha if c in df_recuperados.columns]
-        df_fechas = df_recuperados[cols_fecha].copy()
-
-        if "Fecha cierre" not in df_fechas.columns:
-            df_fechas["Fecha cierre"] = None
-        df_fechas["Fecha cierre"] = df_fechas["Fecha cierre"].apply(_fecha_para_editor)
-
-        disabled_fecha_cols = [c for c in df_fechas.columns if c != "Fecha cierre"]
-
-        edited_fechas = st.data_editor(
-            df_fechas,
-            use_container_width=True,
-            height=min(260, 90 + (len(df_fechas) * 38)),
-            hide_index=True,
-            num_rows="fixed",
-            disabled=disabled_fecha_cols,
-            key=f"{key_prefix}_editor_fechas_cierre_recuperados",
-            column_config={
-                "seguimiento_id": None,
-                "Fecha cierre": st.column_config.DateColumn(
-                    "Fecha cierre",
-                    help="Selecciona la fecha de cierre únicamente para estudiantes recuperados. Si la dejas vacía, al guardar se asignará la fecha actual.",
-                    format="YYYY-MM-DD",
-                    required=False,
-                ),
-            },
-        )
-
-        for _, row_fecha in edited_fechas.iterrows():
-            sid = _valor_seguro_fila(row_fecha, "seguimiento_id")
-            if sid:
-                fecha_cierre_map[sid] = normalizar_fecha_seguimiento(row_fecha.get("Fecha cierre", ""))
-
-    col_guardar, col_info = st.columns([1, 2])
-    with col_guardar:
-        guardar_cambios = st.button(
-            "💾 Guardar cambios de seguimiento",
-            type="primary",
-            key=f"{key_prefix}_guardar_cambios_editor",
-        )
-    with col_info:
-        st.info(
-            "Regla activa: **Fecha cierre solo se captura si Estado = Recuperado**. "
-            "Si el Estado es **En proceso** o **Sin seguimiento**, el sistema limpia la Fecha cierre aunque exista un valor previo. "
-            "Si el Estado es **Recuperado** y no capturas Fecha cierre, se asigna la fecha actual al guardar. "
-            "La Última actualización siempre la coloca el sistema."
-        )
-
-    if guardar_cambios:
-        df_previos = cargar_seguimiento_no_competentes()
-        ids_previos = set(df_previos["seguimiento_id"].astype(str).tolist()) if not df_previos.empty else set()
-        guardados = 0
-        hoy = datetime.now().strftime("%Y-%m-%d")
-
-        for _, row in edited_df.iterrows():
-            seguimiento_id = _valor_seguro_fila(row, "seguimiento_id")
-            if not seguimiento_id:
-                continue
-
-            causa = _normalizar_causa_editor(row.get("Causa", ""))
-            responsable = _normalizar_responsable_editor(row.get("Responsable", ""))
-            estado = _normalizar_estado_editor(row.get("Estado", "Sin seguimiento"))
-            observaciones = str(row.get("Observaciones", "") or "").strip()
-
-            fecha_cierre_capturada = ""
-            if estado == "Recuperado":
-                fecha_cierre_capturada = fecha_cierre_map.get(
-                    seguimiento_id,
-                    normalizar_fecha_seguimiento(row.get("Fecha cierre", "")),
-                )
-
-            tiene_captura = bool(
-                causa
-                or responsable
-                or estado != "Sin seguimiento"
-                or observaciones
-                or fecha_cierre_capturada
-            )
-            existe_previo = seguimiento_id in ids_previos
-
-            # Evita crear miles de registros vacíos cuando no se ha capturado nada.
-            # Si el registro ya existía, sí se guarda para permitir regresar a "Sin seguimiento".
-            if not tiene_captura and not existe_previo:
-                continue
-
-            previo = _obtener_registro_seguimiento(seguimiento_id)
-            fecha_inicio_previa = _valor_seguro_fila(previo, "fecha_inicio", "") if previo is not None else ""
-            causa_detalle_previa = _valor_seguro_fila(previo, "causa_detalle", "") if previo is not None else ""
-
-            fecha_inicio = fecha_inicio_previa or (hoy if tiene_captura else "")
-            fecha_cierre = fecha_cierre_por_estado_seguimiento(estado, fecha_cierre_capturada, hoy)
-
-            guardar_registro_seguimiento_estudiante(
-                row_estudiante=row,
-                df_detalle_estudiante=pd.DataFrame(),
-                datos_form={
-                    "causa_principal": causa,
-                    "causa_detalle": causa_detalle_previa,
-                    "responsable_nombre": responsable,
-                    "responsable_funcion": responsable,
-                    "estado": estado,
-                    "fecha_inicio": fecha_inicio,
-                    "fecha_cierre": fecha_cierre,
-                    "observaciones": observaciones,
-                },
-                corte_actual=corte_actual,
-            )
-            guardados += 1
-
-        st.success(f"Seguimiento guardado correctamente. Registros actualizados: {guardados:,}.")
-        st.rerun()
-
-    # Reporte con la información visible/actual del editor.
-    df_reporte = edited_df.copy()
-    df_reporte["Causa"] = df_reporte["Causa"].apply(_normalizar_causa_editor)
-    df_reporte["Responsable"] = df_reporte["Responsable"].apply(_normalizar_responsable_editor)
-    df_reporte["Estado"] = df_reporte["Estado"].apply(_normalizar_estado_editor)
-    if "Fecha cierre" in df_reporte.columns:
-        df_reporte["Fecha cierre"] = df_reporte.apply(
-            lambda r: fecha_cierre_por_estado_seguimiento(
-                r.get("Estado", ""),
-                fecha_cierre_map.get(
-                    _valor_seguro_fila(r, "seguimiento_id"),
-                    normalizar_fecha_seguimiento(r.get("Fecha cierre", "")),
-                ),
-            ),
-            axis=1,
-        )
-    if "Observaciones" in df_reporte.columns:
-        df_reporte["Observaciones"] = df_reporte["Observaciones"].fillna("").astype(str)
-
-    render_reporte_seguimiento_no_competentes(df_reporte, corte_actual, key_prefix)
 
 def render_seccion_impresion_por_modulos(plantel_sel, key_prefix="modulos_nc"):
     """
     Sección reutilizable para administradores y planteles.
-    Permite filtrar e imprimir estudiantes por:
-    - Grado: Todos, 2, 4, 6 o los grados que existan en el momento.
-    - Cantidad de módulos NO competentes: 1, 2, 3... 10 y 11 o más.
+    Permite filtrar e imprimir estudiantes por cantidad de módulos NO competentes:
+    1, 2, 3... 10 y 11 o más.
 
-    El filtro de cantidad de módulos puede inhabilitarse para mostrar todos los
-    estudiantes del grado seleccionado sin perder resumen, detalle ni seguimiento.
+    Actualización:
+    - Agrega filtro de grado activo con opción Todos.
+    - El filtro de grado se aplica antes del conteo por módulos para que la
+      clasificación corresponda exactamente al grado seleccionado.
     """
     df_base = obtener_detalle_no_competentes(plantel_sel)
 
     st.markdown("---")
     st.subheader("Selecciona e imprime la relación de estudiantes clasificados según el número de módulos en los que no resultaron competentes.")
     st.caption(
-        "Primero selecciona el grado que deseas revisar. Después puedes habilitar el filtro por "
-        "cantidad de módulos NO competentes o inhabilitarlo para mostrar todos los estudiantes "
-        "del grado seleccionado."
+        "Selecciona el grado activo y una o varias categorías. Ejemplo: si quieres atender a los estudiantes "
+        "con 7 módulos no competentes, selecciona únicamente **7**. La tabla mostrará exactamente el filtro seleccionado."
     )
 
     if df_base is None or df_base.empty:
         st.info(f"ℹ️ No hay registros de NO competentes para **{plantel_sel}**.")
         return
 
-    plantel_key = _safe_download_name(plantel_sel)
+    grados_disponibles = obtener_grados_activos_desde_detalle(df_base)
+    opciones_grado = ["Todos"] + grados_disponibles
 
-    # =========================
-    # 1) Filtro por grado
-    # =========================
-    # Se busca la columna de grado de forma flexible para no romper si el archivo
-    # viene con "grado", "Grado", "SEMESTRE" o "Semestre".
-    grado_col = _find_col_like(df_base, ["grado", "Grado", "SEMESTRE", "Semestre"])
-
-    if grado_col and grado_col in df_base.columns:
-        grados_existentes = []
-        for value in df_base[grado_col].dropna().tolist():
-            grado_key = _sem_key(value)
-            if grado_key is None:
-                continue
-            grados_existentes.append(int(grado_key))
-
-        # Se muestran únicamente los grados que realmente existan en la información actual.
-        # Si existen 2, 4 y 6, las opciones quedan: Todos, 2, 4, 6.
-        grados_existentes = sorted(set(grados_existentes))
-        opciones_grado = ["Todos"] + [str(g) for g in grados_existentes]
+    if grados_disponibles:
+        grado_sel = st.selectbox(
+            "Grado activo",
+            options=opciones_grado,
+            index=0,
+            key=f"{key_prefix}_{_safe_download_name(plantel_sel)}_grado_activo",
+            help="Selecciona un grado específico o deja Todos para conservar la vista completa."
+        )
     else:
-        grados_existentes = []
-        opciones_grado = ["Todos"]
+        grado_sel = "Todos"
+        st.info("ℹ️ No se detectó la columna o valores de grado; se muestra la información completa.")
 
-    grado_sel = st.selectbox(
-        "Grado a identificar/imprimir",
-        options=opciones_grado,
-        index=0,
-        key=f"{key_prefix}_{plantel_key}_grado",
-        help="Este filtro toma los grados existentes en los datos actuales. Normalmente: Todos, 2, 4 y 6."
-    )
+    df_base_filtrado = filtrar_detalle_por_grado_activo(df_base, grado_sel)
 
-    df_base_grado = df_base.copy()
-
-    if grado_sel != "Todos" and grado_col and grado_col in df_base_grado.columns:
-        grado_objetivo = int(grado_sel)
-        df_base_grado = df_base_grado[
-            df_base_grado[grado_col].apply(_sem_key) == grado_objetivo
-        ].copy()
-
-    if df_base_grado.empty:
-        st.info(f"No hay estudiantes NO competentes para el grado **{grado_sel}** en **{plantel_sel}**.")
+    if df_base_filtrado is None or df_base_filtrado.empty:
+        st.info(f"ℹ️ No hay registros de NO competentes para el grado activo **{grado_sel}**.")
         return
 
-    # El conteo de módulos se calcula después del filtro de grado.
-    # Así, si el usuario selecciona grado 2, la categoría 1, 2, 3... se calcula
-    # solo con los módulos NO competentes de ese grado.
-    df_con_conteo = agregar_conteo_modulos_no_competentes(df_base_grado)
+    df_con_conteo = agregar_conteo_modulos_no_competentes(df_base_filtrado, ordenar=False)
     resumen_categorias = construir_resumen_categorias_modulos(df_con_conteo)
 
     categorias_disponibles = sorted(
@@ -1699,50 +981,19 @@ def render_seccion_impresion_por_modulos(plantel_sel, key_prefix="modulos_nc"):
         key=_orden_categoria_modulos_nc
     )
 
-    if not categorias_disponibles:
-        st.info(f"No se detectaron categorías de módulos NO competentes para el grado **{grado_sel}**.")
-        return
-
-    # =========================
-    # 2) Filtro por cantidad de módulos NO competentes
-    # =========================
-    aplicar_filtro_modulos = st.checkbox(
-        "Habilitar filtro por cantidad de módulos NO competentes",
-        value=True,
-        key=f"{key_prefix}_{plantel_key}_habilitar_filtro_modulos",
-        help=(
-            "Si está activado, puedes seleccionar una o varias cantidades de módulos. "
-            "Si lo desactivas, se mostrarán todas las cantidades del grado seleccionado."
-        ),
-    )
-
     seleccion = st.multiselect(
         "Cantidad de módulos NO competentes a identificar/imprimir",
         options=categorias_disponibles,
         default=categorias_disponibles,
-        key=f"{key_prefix}_{plantel_key}_grado_{_safe_download_name(grado_sel)}_categorias",
-        disabled=not aplicar_filtro_modulos,
-        help=(
-            "Puedes seleccionar 1, 2, 3... 10 o 11 o más. "
-            "También puedes combinar varias categorías. "
-            "Desactiva la casilla anterior para inhabilitar este filtro."
-        )
+        key=f"{key_prefix}_{_safe_download_name(plantel_sel)}_{_safe_download_name(grado_sel)}_categorias",
+        help="Puedes seleccionar 1, 2, 3... 10 o 11 o más. También puedes combinar varias categorías."
     )
 
-    if aplicar_filtro_modulos:
-        if not seleccion:
-            st.info("Selecciona al menos una categoría o inhabilita el filtro por cantidad de módulos NO competentes.")
-            return
+    if not seleccion:
+        st.info("Selecciona al menos una categoría para mostrar e imprimir estudiantes.")
+        return
 
-        categorias_norm = {str(c).strip() for c in seleccion}
-        df_detalle_filtrado = df_con_conteo[
-            df_con_conteo["categoria_modulos_nc"].astype(str).isin(categorias_norm)
-        ].copy()
-        categorias_label = _label_categorias_modulos(seleccion)
-    else:
-        df_detalle_filtrado = df_con_conteo.copy()
-        categorias_label = "Todas (filtro por cantidad inhabilitado)"
-
+    df_detalle_filtrado = filtrar_detalle_por_categorias_modulos(df_con_conteo, seleccion)
     df_resumen_estudiantes = construir_resumen_estudiantes_por_modulos(df_detalle_filtrado)
 
     estudiantes_unicos = (
@@ -1751,59 +1002,30 @@ def render_seccion_impresion_por_modulos(plantel_sel, key_prefix="modulos_nc"):
         else len(df_resumen_estudiantes)
     )
     registros = len(df_detalle_filtrado)
+    categorias_label = _label_categorias_modulos(seleccion)
+    grado_label = str(grado_sel or "Todos")
 
     st.markdown(
         f"#### Resultado filtrado: **{estudiantes_unicos:,} estudiante(s)** | "
-        f"**{registros:,} registro(s) académico(s)** | "
-        f"Grado: **{grado_sel}** | Categoría(s): **{categorias_label}**"
+        f"**{registros:,} registro(s) académico(s)** | Grado activo: **{grado_label}** | "
+        f"Categoría(s): **{categorias_label}**"
     )
 
     if df_detalle_filtrado.empty:
-        st.info("No hay estudiantes para los filtros seleccionados.")
+        st.info("No hay estudiantes para el grado y categoría seleccionados.")
         return
 
-    with st.expander("Ver resumen por cantidad de módulos NO competentes", expanded=False):
-        st.dataframe(resumen_categorias, use_container_width=True, hide_index=True)
-
-    tab_resumen, tab_detalle, tab_seguimiento = st.tabs([
-        "👤 Resumen por estudiante",
-        "📚 Detalle por módulo",
-        "📝 Seguimiento académico"
-    ])
-
-    with tab_resumen:
-        st.caption(
-            "Vista recomendada para impresión de atención: una fila por estudiante con sus módulos y docentes relacionados."
-        )
-        mostrar_dataframe_preview(df_resumen_estudiantes, height=430)
-        render_botones_descarga_detalle(
-            df_resumen_estudiantes,
-            plantel_sel,
-            tipo="resumen_por_modulos_no_competentes",
-            key_prefix=f"{key_prefix}_resumen_{_safe_download_name(grado_sel)}_{_safe_download_name(categorias_label)}"
-        )
-
-    with tab_detalle:
-        st.caption(
-            "Vista completa: conserva cada registro/módulo académico original y agrega la cantidad total de módulos NO competentes del estudiante."
-        )
-        mostrar_dataframe_preview(df_detalle_filtrado, height=520)
-        render_botones_descarga_detalle(
-            df_detalle_filtrado,
-            plantel_sel,
-            tipo="detalle_por_modulos_no_competentes",
-            key_prefix=f"{key_prefix}_detalle_{_safe_download_name(grado_sel)}_{_safe_download_name(categorias_label)}"
-        )
-
-    with tab_seguimiento:
-        render_tab_seguimiento_no_competentes(
-            df_resumen_estudiantes=df_resumen_estudiantes,
-            df_detalle_filtrado=df_detalle_filtrado,
-            plantel_sel=plantel_sel,
-            categorias_label=f"Grado {grado_sel} | {categorias_label}",
-            key_prefix=f"{key_prefix}_seguimiento_{_safe_download_name(grado_sel)}_{_safe_download_name(categorias_label)}"
-        )
-
+    st.caption(
+        "Tabla final para impresión de atención: una fila por estudiante con sus módulos y docentes relacionados."
+    )
+    df_resumen_estudiantes = ocultar_columnas_metricas_presentacion(df_resumen_estudiantes)
+    mostrar_dataframe_preview(df_resumen_estudiantes, height=430)
+    render_botones_descarga_detalle(
+        df_resumen_estudiantes,
+        plantel_sel,
+        tipo="resumen_por_modulos_no_competentes",
+        key_prefix=f"{key_prefix}_resumen_{_safe_download_name(grado_label)}_{_safe_download_name(categorias_label)}"
+    )
 
 
 def _mapear_columnas_seguimiento(df):
@@ -1903,6 +1125,51 @@ def _obtener_matricula_total_plantel(plantel_usuario):
     return float(pd.to_numeric(dfp[col_matricula], errors="coerce").fillna(0).sum())
 
 
+def _normalizar_porcentaje_seguimiento_con_matricula(df_semana, matricula=0.0):
+    """
+    Normaliza una serie de porcentajes usando una matrícula conocida.
+
+    Se usa para el comportamiento estatal porque la matrícula debe leerse desde
+    la misma fila de la hoja Seguimiento, no desde la hoja Matricula por plantel.
+    """
+    if df_semana is None or getattr(df_semana, "empty", True) or "Porcentaje" not in df_semana.columns:
+        return df_semana
+
+    out = df_semana.copy()
+    valores = pd.to_numeric(out["Porcentaje"], errors="coerce")
+
+    max_abs = valores.abs().max(skipna=True)
+    if pd.isna(max_abs):
+        out["Porcentaje"] = 0.0
+        return out
+
+    try:
+        matricula = float(matricula or 0)
+    except Exception:
+        matricula = 0.0
+
+    if matricula > 0 and "Cantidad" in out.columns:
+        cantidades = pd.to_numeric(out["Cantidad"], errors="coerce")
+        pct_calculado = (cantidades / matricula) * 100.0
+        validos = valores.notna() & pct_calculado.notna()
+
+        if max_abs == 0 and pct_calculado.fillna(0).abs().max() > 0:
+            valores = pct_calculado
+        elif max_abs <= 1 and validos.any():
+            diferencia_directa = (valores[validos] - pct_calculado[validos]).abs().median()
+            diferencia_escalada = ((valores[validos] * 100.0) - pct_calculado[validos]).abs().median()
+
+            if diferencia_escalada < diferencia_directa:
+                valores = valores * 100.0
+        elif max_abs <= 1:
+            valores = valores * 100.0
+    elif max_abs <= 1:
+        valores = valores * 100.0
+
+    out["Porcentaje"] = valores.replace([float("inf"), -float("inf")], 0).fillna(0).round(2)
+    return out
+
+
 def _normalizar_porcentaje_seguimiento(df_semana, plantel_usuario=None):
     """
     Corrige el porcentaje del seguimiento semanal sin alterar las cantidades.
@@ -1998,11 +1265,128 @@ def obtener_seguimiento_plantel(plantel_usuario):
 
     df_semana = df_semana.sort_values("Semana_num").reset_index(drop=True)
     df_semana = _normalizar_porcentaje_seguimiento(df_semana, plantel_usuario)
-    df_semana["Etiqueta"] = df_semana.apply(
-        lambda r: f"{int(r['Cantidad'])} - {float(r['Porcentaje']):.2f}%",
-        axis=1
-    )
+    cantidades_label = pd.to_numeric(df_semana["Cantidad"], errors="coerce").fillna(0).round().astype(int).astype(str)
+    porcentajes_label = pd.to_numeric(df_semana["Porcentaje"], errors="coerce").fillna(0).map(lambda v: f"{float(v):.2f}%")
+    df_semana["Etiqueta"] = cantidades_label + " - " + porcentajes_label
     return df_semana
+
+
+def _filtrar_fila_estatal_seguimiento(df_seguimiento):
+    """Localiza la fila CONALEP Estado de México dentro de la hoja Seguimiento."""
+    if df_seguimiento is None or getattr(df_seguimiento, "empty", True):
+        return pd.DataFrame()
+
+    objetivo_norm = _norm_txt(SEGUIMIENTO_ESTATAL_NOMBRE)
+    columnas_preferidas = [
+        _find_col_like(df_seguimiento, ["Plantel"]),
+        _find_col_like(df_seguimiento, ["Nombre", "Institución", "Institucion", "Entidad"]),
+    ]
+    columnas_preferidas = [c for c in columnas_preferidas if c is not None]
+
+    columnas_busqueda = columnas_preferidas or list(df_seguimiento.columns)
+
+    for col in columnas_busqueda:
+        try:
+            valores_norm = df_seguimiento[col].apply(_norm_txt)
+            exact = df_seguimiento[valores_norm == objetivo_norm].copy()
+            if not exact.empty:
+                return exact
+
+            contiene = df_seguimiento[
+                valores_norm.apply(lambda v: bool(v) and (objetivo_norm in v or v in objetivo_norm))
+            ].copy()
+            if not contiene.empty:
+                return contiene
+        except Exception:
+            continue
+
+    return pd.DataFrame()
+
+
+def _obtener_matricula_fila_seguimiento(df_fila):
+    """Extrae la matrícula desde la fila estatal de Seguimiento."""
+    if df_fila is None or getattr(df_fila, "empty", True):
+        return 0.0
+
+    col_matricula = _find_col_like(
+        df_fila,
+        [
+            "matriculaTotal", "matrícula total", "matricula total",
+            "Matrícula", "Matricula", "matricula", "MATRICULA",
+        ],
+    )
+
+    if not col_matricula or col_matricula not in df_fila.columns:
+        return 0.0
+
+    valores = pd.to_numeric(df_fila[col_matricula], errors="coerce").fillna(0)
+    if valores.empty:
+        return 0.0
+
+    # Normalmente existe una sola fila estatal; si hubiera más de una, se toma
+    # el total acumulado para no perder información.
+    return float(valores.sum())
+
+
+@st.cache_data(show_spinner=False)
+def obtener_seguimiento_estatal():
+    """
+    Devuelve el comportamiento estatal desde la hoja Seguimiento.
+
+    La fuente es exclusivamente la fila que dice CONALEP Estado de México.
+    De esa misma fila se toman:
+    - matrícula,
+    - columnas Sem X,
+    - columnas Sem X %.
+    """
+    columnas_default = ["Semana", "Cantidad", "Porcentaje", "Etiqueta", "Semana_num"]
+
+    df_seguimiento = cargar_seguimiento()
+    if df_seguimiento is None or getattr(df_seguimiento, "empty", True):
+        return pd.DataFrame(columns=columnas_default), 0.0
+
+    df_estado = _filtrar_fila_estatal_seguimiento(df_seguimiento)
+    if df_estado is None or df_estado.empty:
+        return pd.DataFrame(columns=columnas_default), 0.0
+
+    matricula_estatal = _obtener_matricula_fila_seguimiento(df_estado)
+    mapping = _mapear_columnas_seguimiento(df_estado)
+    if not mapping:
+        return pd.DataFrame(columns=columnas_default), matricula_estatal
+
+    rows = []
+    for semana, meta in mapping.items():
+        col_cantidad = meta.get("cantidad")
+        col_porcentaje = meta.get("porcentaje")
+
+        cantidad = 0
+        porcentaje = 0.0
+
+        if col_cantidad is not None and col_cantidad in df_estado.columns:
+            cantidad = pd.to_numeric(df_estado[col_cantidad], errors="coerce").fillna(0).sum()
+
+        if col_porcentaje is not None and col_porcentaje in df_estado.columns:
+            porcentaje = pd.to_numeric(df_estado[col_porcentaje], errors="coerce").fillna(0).mean()
+
+        rows.append({
+            "Semana": semana,
+            "Cantidad": int(round(float(cantidad))) if pd.notna(cantidad) else 0,
+            "Porcentaje": float(porcentaje) if pd.notna(porcentaje) else 0.0,
+            "Semana_num": meta.get("week_num") or 0,
+        })
+
+    df_semana = pd.DataFrame(rows)
+    if df_semana.empty:
+        return pd.DataFrame(columns=columnas_default), matricula_estatal
+
+    df_semana = df_semana.sort_values("Semana_num").reset_index(drop=True)
+    df_semana = _normalizar_porcentaje_seguimiento_con_matricula(df_semana, matricula_estatal)
+
+    cantidades_label = pd.to_numeric(df_semana["Cantidad"], errors="coerce").fillna(0).round().astype(int).astype(str)
+    porcentajes_label = pd.to_numeric(df_semana["Porcentaje"], errors="coerce").fillna(0).map(lambda v: f"{float(v):.2f}%")
+    df_semana["Etiqueta"] = cantidades_label + " - " + porcentajes_label
+
+    return df_semana, matricula_estatal
 
 
 def _datos_tendencia_seguimiento(df):
@@ -2197,6 +1581,127 @@ def mostrar_grafica_seguimiento_plantel(plantel_objetivo, show_title=True, show_
     st.plotly_chart(fig, use_container_width=True)
 
     resumen = _resumen_tendencia_seguimiento(seguimiento_plantel)
+    if show_footer and resumen:
+        st.caption(resumen)
+
+    return True
+
+
+def construir_figura_seguimiento_estatal(show_title=True):
+    seguimiento_estatal, matricula_estatal = obtener_seguimiento_estatal()
+
+    if seguimiento_estatal is None or seguimiento_estatal.empty:
+        return None, seguimiento_estatal, matricula_estatal
+
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    fig.add_trace(
+        go.Bar(
+            x=seguimiento_estatal["Semana"],
+            y=seguimiento_estatal["Cantidad"],
+            name="Cantidad",
+            text=seguimiento_estatal["Etiqueta"],
+            textposition="outside",
+            textangle=-90,
+            marker_color="#FFC107",
+            cliponaxis=False,
+            outsidetextfont=dict(size=LABEL_FONT_SIZE_ADMIN + 2, color="#2b2b2b"),
+            hoverinfo="skip",
+            hovertemplate="",
+            customdata=seguimiento_estatal["Porcentaje"],
+        ),
+        secondary_y=False,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=seguimiento_estatal["Semana"],
+            y=seguimiento_estatal["Porcentaje"],
+            name="% NO competencia estatal",
+            mode="lines+markers",
+            line=dict(color="#1f77b4", width=3),
+            marker=dict(size=9),
+            hoverinfo="skip",
+            hovertemplate="",
+        ),
+        secondary_y=True,
+    )
+
+    max_cantidad = float(seguimiento_estatal["Cantidad"].max()) if not seguimiento_estatal.empty else 0
+    max_porcentaje = float(seguimiento_estatal["Porcentaje"].max()) if not seguimiento_estatal.empty else 0
+
+    fig.update_layout(
+        title_text=f"Comportamiento estatal — {SEGUIMIENTO_ESTATAL_NOMBRE}" if show_title else "",
+        height=560,
+        hovermode=False,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        uniformtext=dict(minsize=LABEL_FONT_SIZE_ADMIN + 2, mode="show"),
+        margin=dict(t=90 if show_title else 40, b=40),
+    )
+    fig.update_xaxes(
+        title_text="",
+        showticklabels=True,
+        ticks="",
+        showgrid=False,
+        tickangle=0,
+        tickfont=dict(size=12),
+    )
+    fig.update_yaxes(
+        title_text="",
+        showticklabels=False,
+        ticks="",
+        showgrid=False,
+        zeroline=False,
+        range=[0, max_cantidad * Y_AXIS_PADDING_MULT if max_cantidad else 1],
+        secondary_y=False,
+    )
+    fig.update_yaxes(
+        title_text="",
+        showticklabels=False,
+        ticks="",
+        showgrid=False,
+        zeroline=False,
+        range=[0, max_porcentaje * Y_AXIS_PADDING_MULT if max_porcentaje else 1],
+        secondary_y=True,
+    )
+
+    return fig, seguimiento_estatal, matricula_estatal
+
+
+def mostrar_grafica_seguimiento_estatal(show_title=True, show_footer=True):
+    fig, seguimiento_estatal, matricula_estatal = construir_figura_seguimiento_estatal(show_title=show_title)
+
+    if fig is None or seguimiento_estatal is None or seguimiento_estatal.empty:
+        return False
+
+    ultimo = seguimiento_estatal.iloc[-1]
+    tendencia = _datos_tendencia_seguimiento(seguimiento_estatal)
+    matricula_val = int(round(float(matricula_estatal or 0)))
+
+    _render_cards_resumen([
+        {
+            "titulo": "Matrícula estatal",
+            "valor": f"{matricula_val:,}",
+            "detalle": f"Tomada de la fila {SEGUIMIENTO_ESTATAL_NOMBRE} en la hoja Seguimiento.",
+        },
+        {
+            "titulo": "Último total estatal NO competente",
+            "valor": f"{int(ultimo['Cantidad']):,}",
+            "detalle": f"Dato de {ultimo['Semana']}.",
+        },
+        {
+            "titulo": "Último porcentaje estatal",
+            "valor": f"{float(ultimo['Porcentaje']):.2f}%",
+            "detalle": f"Dato de {ultimo['Semana']}.",
+        },
+        {
+            "titulo": "Tendencia estatal vs semana previa",
+            "valor": tendencia["valor_card"],
+            "detalle": tendencia["detalle_card"],
+        },
+    ])
+
+    st.plotly_chart(fig, use_container_width=True)
+
+    resumen = _resumen_tendencia_seguimiento(seguimiento_estatal)
     if show_footer and resumen:
         st.caption(resumen)
 
@@ -3387,16 +2892,16 @@ def enviar_borradores(borradores):
 # =========================
 @st.cache_data(show_spinner=False)
 def generar_excel_no_competentes(plantel_sel):
-    df = obtener_detalle_no_competentes(plantel_sel)
+    df = preparar_detalle_no_competentes_presentacion(obtener_detalle_no_competentes(plantel_sel))
     return exportar_excel(df).getvalue()
 
 
 @st.cache_data(show_spinner=False)
 def generar_html_no_competentes(plantel_sel):
-    df = obtener_detalle_no_competentes(plantel_sel)
+    df = preparar_detalle_no_competentes_presentacion(obtener_detalle_no_competentes(plantel_sel))
     return exportar_html_imprimible(
         df,
-        titulo="Estudiantes NO competentes",
+        titulo="Detalle de estudiantes con sus respectivos módulos NO competentes",
         subtitulo=f"Plantel: {plantel_sel}",
     ).getvalue()
 
@@ -3418,7 +2923,7 @@ def generar_html_tabla_agrupada():
     tabla_con_total = agregar_fila_total(cargar_resumen())
     return exportar_html_imprimible(
         tabla_con_total,
-        titulo="Estudiantes agrupados por módulos NO competentes",
+        titulo="Estudiantes agrupados por el número de módulos NO competentes",
         subtitulo="(Vista agrupada con TOTAL)",
         filename="agrupados_no_competentes.html",
     ).getvalue()
@@ -3428,7 +2933,8 @@ def generar_html_tabla_agrupada():
 # Función principal
 # =========================
 def mostrar_indicadores_academicos():
-    st.title("📊 Indicadores Académicos")
+    st.title(construir_titulo_indicadores())
+    st.session_state["_indicadores_dataframe_widget_counter"] = 0
 
     tabla = cargar_resumen()
     df_matricula = cargar_matricula()
@@ -3448,14 +2954,42 @@ def mostrar_indicadores_academicos():
         if "indicadores_admin_filtros_aplicados" not in st.session_state:
             st.session_state.indicadores_admin_filtros_aplicados = False
 
+        vista = st.radio(
+            "Visualización de la gráfica:",
+            ["% NO competencia", "Total NO competentes", VISTA_COMPORTAMIENTO_ESTATAL],
+            horizontal=True,
+            key="indicadores_admin_vista_grafica",
+        )
+        es_vista_estatal = vista == VISTA_COMPORTAMIENTO_ESTATAL
+
         with st.form("filtros_indicadores_admin"):
-            vista = st.radio(
-                "Visualización de la gráfica:",
-                ["% NO competencia", "Total NO competentes"],
-                horizontal=True
-            )
-            plantel_sel = st.selectbox("Selecciona un plantel", opciones_plantel)
-            filtros_aplicados = st.form_submit_button("Aplicar filtros")
+            if es_vista_estatal:
+                st.selectbox(
+                    "Selecciona un plantel",
+                    ["No aplica para comportamiento estatal"],
+                    index=0,
+                    disabled=True,
+                    key="indicadores_admin_plantel_estatal_bloqueado",
+                    help="En comportamiento estatal se toma exclusivamente la fila CONALEP Estado de México de la hoja Seguimiento.",
+                )
+                filtros_aplicados = st.form_submit_button("Aplicar filtros", disabled=True)
+                plantel_sel = "Todos"
+            else:
+                plantel_sel = st.selectbox(
+                    "Selecciona un plantel",
+                    opciones_plantel,
+                    key="indicadores_admin_plantel_sel",
+                )
+                filtros_aplicados = st.form_submit_button("Aplicar filtros")
+
+        if es_vista_estatal:
+            st.markdown(f"### 📈 Comportamiento estatal — {SEGUIMIENTO_ESTATAL_NOMBRE}")
+            if not mostrar_grafica_seguimiento_estatal(show_title=False, show_footer=True):
+                st.info(
+                    f"ℹ️ No hay datos estatales para **{SEGUIMIENTO_ESTATAL_NOMBRE}** en la hoja Seguimiento. "
+                    "Verifica que exista una fila con ese nombre y columnas tipo Sem X y Sem X %."
+                )
+            return
 
         if filtros_aplicados:
             st.session_state.indicadores_admin_filtros_aplicados = True
@@ -3474,10 +3008,15 @@ def mostrar_indicadores_academicos():
                 else "% Estudiantes no competentes"
             )
             tabla_ordenada = tabla_vista.sort_values(by=sort_col, ascending=False).copy()
-            tabla_ordenada["etiqueta"] = tabla_ordenada.apply(
-                lambda r: f"{int(r['Total estudiantes no competentes'])} - {float(r['% Estudiantes no competentes']):.2f}%",
-                axis=1
-            )
+            total_label = pd.to_numeric(
+                tabla_ordenada["Total estudiantes no competentes"],
+                errors="coerce"
+            ).fillna(0).round().astype(int).astype(str)
+            pct_label = pd.to_numeric(
+                tabla_ordenada["% Estudiantes no competentes"],
+                errors="coerce"
+            ).fillna(0).map(lambda v: f"{float(v):.2f}%")
+            tabla_ordenada["etiqueta"] = total_label + " - " + pct_label
 
             if vista == "% NO competencia":
                 y_col = "% Estudiantes no competentes"
@@ -3526,7 +3065,7 @@ def mostrar_indicadores_academicos():
                 if not mostrar_grafica_seguimiento_plantel(plantel_sel, show_title=False, show_footer=True):
                     st.info(f"ℹ️ No hay datos de seguimiento semanal para **{plantel_sel}** en la hoja SEGUIMIENTO.")
 
-            st.subheader("📋 Estudiantes agrupados por módulos NO competentes")
+            st.subheader("📋 Estudiantes agrupados por el número de módulos NO competentes")
             tabla_con_total = agregar_fila_total(tabla_vista)
             st.dataframe(tabla_con_total, use_container_width=True)
             render_botones_descarga_detalle(
@@ -3546,11 +3085,11 @@ def mostrar_indicadores_academicos():
 
         if plantel_sel == "Todos":
             if not st.session_state.get("indicadores_admin_filtros_aplicados", False):
-                st.markdown("### ⚠️ Estudiantes NO competentes (Detalle) — Todos")
+                st.markdown("### ⚠️ Detalle de estudiantes con sus respectivos módulos NO competentes. – Todos")
                 st.info("Presiona **Aplicar filtros** para cargar el detalle general de todos los planteles.")
             else:
                 with st.spinner("Cargando detalle general de estudiantes NO competentes..."):
-                    df_print = obtener_detalle_no_competentes("Todos")
+                    df_print = preparar_detalle_no_competentes_presentacion(obtener_detalle_no_competentes("Todos"))
 
                 total_nc_admin = (
                     df_print["matricula"].nunique()
@@ -3558,7 +3097,8 @@ def mostrar_indicadores_academicos():
                     else len(df_print)
                 )
 
-                st.markdown(f"### ⚠️ Estudiantes NO competentes {total_nc_admin} (Detalle) — Todos")
+                st.markdown("### ⚠️ Detalle de estudiantes con sus respectivos módulos NO competentes. – Todos")
+                st.caption(f"Total de estudiantes NO competentes: {total_nc_admin:,}")
                 if df_print.empty:
                     st.info("ℹ️ No hay registros de NO competentes para **Todos**.")
                 else:
@@ -3585,7 +3125,7 @@ def mostrar_indicadores_academicos():
 
                 st.markdown(f"### 🚨 Estudiantes sin registro de Calificaciones {total_sin_registro} (Detalle) — Todos")
                 if df_sin_registro.empty:
-                    st.info("ℹ️ No hay registros con pEspecifico = 0 para **Todos**.")
+                    st.info("ℹ️ No hay registros sin evaluación para **Todos**.")
                 else:
                     mostrar_dataframe_preview(df_sin_registro)
                     render_botones_descarga_detalle(
@@ -3600,7 +3140,7 @@ def mostrar_indicadores_academicos():
                     key_prefix="admin_todos_modulos"
                 )
         else:
-            df_print = obtener_detalle_no_competentes(plantel_sel)
+            df_print = preparar_detalle_no_competentes_presentacion(obtener_detalle_no_competentes(plantel_sel))
 
             fila_sel = tabla[tabla["Plantel"] == plantel_sel]
             if not fila_sel.empty and "Total estudiantes no competentes" in fila_sel.columns:
@@ -3608,7 +3148,8 @@ def mostrar_indicadores_academicos():
             else:
                 total_nc_admin = df_print["matricula"].nunique() if "matricula" in df_print.columns else len(df_print)
 
-            st.markdown(f"### ⚠️ Estudiantes NO competentes {total_nc_admin} (Detalle) — {plantel_sel}")
+            st.markdown(f"### ⚠️ Detalle de estudiantes con sus respectivos módulos NO competentes. – {plantel_sel}")
+            st.caption(f"Total de estudiantes NO competentes: {total_nc_admin:,}")
             if df_print.empty:
                 st.info(f"ℹ️ No hay registros de NO competentes para **{plantel_sel}**.")
             else:
@@ -3632,7 +3173,7 @@ def mostrar_indicadores_academicos():
 
             st.markdown(f"### 🚨 Estudiantes sin registro de Calificaciones {total_sin_registro} (Detalle) — {plantel_sel}")
             if df_sin_registro.empty:
-                st.info(f"ℹ️ No hay registros con pEspecifico = 0 para **{plantel_sel}**.")
+                st.info(f"ℹ️ No hay registros sin evaluación para **{plantel_sel}**.")
             else:
                 mostrar_dataframe_preview(df_sin_registro)
                 render_botones_descarga_detalle(
@@ -3751,10 +3292,6 @@ def mostrar_indicadores_academicos():
         else:
             st.info("ℹ️ Tu usuario no tiene permiso para enviar correos desde este módulo.")
 
-        # Panel disponible solo en la vista de administrador para limpiar datos de prueba.
-        if is_admin:
-            render_admin_restablecer_seguimiento_academico()
-
     else:
         if not plantel_usuario:
             st.error("No se detectó el plantel del usuario en la sesión (plantel_usuario).")
@@ -3806,12 +3343,13 @@ def mostrar_indicadores_academicos():
             },
         ])
 
-        st.subheader(f"📋 Estudiantes del plantel: {plantel_usuario}")
+        st.subheader(f"📋 Estudiantes agrupados por el número de módulos NO competentes – {plantel_usuario}")
         st.dataframe(tabla_filtrada, use_container_width=True)
 
-        df_exportar = obtener_detalle_no_competentes(plantel_usuario)
+        df_exportar = preparar_detalle_no_competentes_presentacion(obtener_detalle_no_competentes(plantel_usuario))
 
-        st.subheader(f"⚠️ Estudiantes NO competentes {total_nc} (Detalle)")
+        st.subheader(f"⚠️ Detalle de estudiantes con sus respectivos módulos NO competentes. – {plantel_usuario}")
+        st.caption(f"Total de estudiantes NO competentes: {total_nc:,}")
         if df_exportar.empty:
             st.info("ℹ️ No hay registros de NO competentes para este plantel.")
         else:
@@ -3848,7 +3386,7 @@ def mostrar_indicadores_academicos():
         st.subheader(f"🚨 Estudiantes sin registro de Calificaciones {total_sin_registro_plantel} (Detalle)")
 
         if df_sin_registro_plantel.empty:
-            st.info("ℹ️ No hay registros con pEspecifico = 0 para este plantel.")
+            st.info("ℹ️ No hay registros sin evaluación para este plantel.")
         else:
             estudiantes_unicos_sr = (
                 df_sin_registro_plantel["matricula"].nunique()
