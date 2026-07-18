@@ -80,6 +80,34 @@ CATEGORIAS_MODULOS_NC = [str(i) for i in range(1, 11)] + ["11 o más"]
 SEGUIMIENTO_ESTATAL_NOMBRE = "CONALEP Estado de México"
 VISTA_COMPORTAMIENTO_ESTATAL = "Comportamiento estatal"
 
+# Reglas normativas para regularización y permanencia académica.
+UMBRAL_ASESORIA_INTERSEMESTRAL = 56.0
+MAX_MODULOS_ASESORIA_INTERSEMESTRAL = 3
+MAX_MODULOS_BAJA_PARCIAL = 6
+
+# Opciones de consulta del reporte normativo.
+# Se separan de forma explícita los dos grupos solicitados:
+# - Grupo 1: estudiantes que adeudan de 1 a 3 módulos.
+# - Grupo 2: estudiantes que adeudan de 4 a 6 módulos.
+OPCIONES_REPORTE_NORMATIVO = [
+    "Todos los estudiantes",
+    "GRUPO 1 — Adeudan de 1 a 3 módulos",
+    "GRUPO 1 — Pueden presentar al menos una intersemestral",
+    "GRUPO 1 — Todos sus módulos son intersemestrales",
+    "GRUPO 1 — Necesitan asesorías combinadas",
+    "GRUPO 1 — Necesitan asesorías semestrales",
+    "GRUPO 1 — Información académica por validar",
+    "GRUPO 2 — Adeudan de 4 a 6 módulos",
+    "GRUPO 2 — Pueden presentar al menos una intersemestral",
+    "GRUPO 2 — Pueden quedar con 3 módulos",
+    "GRUPO 2 — Solo pueden reducir parcialmente el adeudo",
+    "GRUPO 2 — Necesitan otra ruta de regularización",
+    "GRUPO 2 — Información académica por validar",
+    "7 o más — Deben regularizarse antes de reinscribirse",
+]
+
+
+
 
 # =========================
 # Helpers base
@@ -700,6 +728,48 @@ def _join_unique_values(series):
     return " | ".join(values)
 
 
+def _join_percentage_values(series):
+    """
+    Concatena los valores de pAlcanzado respetando el orden de los registros.
+
+    No elimina valores repetidos, porque cada porcentaje debe conservar su
+    correspondencia posicional con el módulo mostrado en
+    MODULOS_NO_COMPETENTES.
+
+    Ejemplo:
+        MODULOS_NO_COMPETENTES: Módulo A | Módulo B
+        PORCENTAJES_ALCANZADOS: 56.25% | 58%
+    """
+    values = []
+
+    for value in series.tolist():
+        if value is None:
+            continue
+
+        try:
+            if pd.isna(value):
+                continue
+        except Exception:
+            pass
+
+        numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+
+        if pd.notna(numeric):
+            # Se muestran hasta dos decimales sin ceros innecesarios.
+            text = f"{float(numeric):.2f}".rstrip("0").rstrip(".")
+            values.append(f"{text}%")
+            continue
+
+        text = str(value).strip()
+        if not text or text.lower() in ("nan", "none", "null"):
+            continue
+
+        # Respaldo para valores de texto que ya incluyan o no el símbolo %.
+        values.append(text if text.endswith("%") else f"{text}%")
+
+    return " | ".join(values)
+
+
 def agregar_conteo_modulos_no_competentes(df, ordenar=True):
     """
     Agrega a cada registro académico dos columnas:
@@ -761,9 +831,19 @@ def filtrar_detalle_por_categorias_modulos(df, categorias):
 
 def construir_resumen_estudiantes_por_modulos(df_detalle):
     """
-    Convierte el detalle académico a una vista de 1 fila por estudiante para impresión.
-    Incluye módulos y docentes concatenados para que el usuario pueda identificar
-    claramente a quién debe dar atención según la cantidad de módulos NO competentes.
+    Convierte el detalle académico a una vista de una fila por estudiante para
+    identificación o impresión.
+
+    La tabla incluye:
+    - módulos NO competentes,
+    - porcentaje alcanzado en cada módulo, y
+    - docentes relacionados.
+
+    Los módulos y sus porcentajes se concatenan con el separador | y conservan
+    el mismo orden. Por ejemplo:
+
+        MODULOS_NO_COMPETENTES: Módulo A | Módulo B
+        PORCENTAJES_ALCANZADOS: 56.25% | 58%
     """
     if df_detalle is None or getattr(df_detalle, "empty", True):
         return pd.DataFrame()
@@ -783,29 +863,51 @@ def construir_resumen_estudiantes_por_modulos(df_detalle):
     if "Plantel" in d.columns:
         group_cols = ["Plantel", "matricula"]
 
+    # Se ordenan conjuntamente los registros antes de agrupar para asegurar que
+    # cada porcentaje conserve la misma posición que su módulo correspondiente.
+    sort_detail_cols = group_cols.copy()
+    for col in ["MODULO", "DOCENTE"]:
+        if col in d.columns and col not in sort_detail_cols:
+            sort_detail_cols.append(col)
+
+    if sort_detail_cols:
+        d = d.sort_values(sort_detail_cols, kind="stable").reset_index(drop=True)
+
     agg = {}
     for col in ["ESTUDIANTE", "CARRERA", "grado", "cvegrupo", "modulos_nc", "categoria_modulos_nc"]:
         if col in d.columns:
             agg[col] = "first"
 
     if "MODULO" in d.columns:
-        agg["MODULO"] = _join_unique_values
+        # No se eliminan duplicados para conservar la relación 1 a 1 con
+        # PORCENTAJES_ALCANZADOS.
+        agg["MODULO"] = lambda serie: " | ".join(
+            str(value).strip()
+            for value in serie.tolist()
+            if pd.notna(value)
+            and str(value).strip()
+            and str(value).strip().lower() not in ("nan", "none", "null")
+        )
+
+    if "pAlcanzado" in d.columns:
+        agg["pAlcanzado"] = _join_percentage_values
+
     if "DOCENTE" in d.columns:
         agg["DOCENTE"] = _join_unique_values
 
-    # Las métricas internas se conservan en la carga base para cálculos,
-    # pero no se agregan a la tabla resumida final solicitada.
-    resumen = d.groupby(group_cols, dropna=False).agg(agg).reset_index()
+    resumen = d.groupby(group_cols, dropna=False, sort=False).agg(agg).reset_index()
 
     rename_map = {
         "MODULO": "MODULOS_NO_COMPETENTES",
+        "pAlcanzado": "PORCENTAJES_ALCANZADOS",
         "DOCENTE": "DOCENTES_RELACIONADOS",
     }
     resumen = resumen.rename(columns=rename_map)
 
     orden = [
         "Plantel", "ESTUDIANTE", "matricula", "CARRERA", "grado", "cvegrupo",
-        "modulos_nc", "categoria_modulos_nc", "MODULOS_NO_COMPETENTES", "DOCENTES_RELACIONADOS"
+        "modulos_nc", "categoria_modulos_nc", "MODULOS_NO_COMPETENTES",
+        "PORCENTAJES_ALCANZADOS", "DOCENTES_RELACIONADOS"
     ]
     orden = [c for c in orden if c in resumen.columns]
     resto = [c for c in resumen.columns if c not in orden]
@@ -820,6 +922,863 @@ def construir_resumen_estudiantes_por_modulos(df_detalle):
 
     return ocultar_columnas_metricas_presentacion(resumen)
 
+
+
+
+def _clasificar_situacion_normativa(
+    modulos_nc,
+    modulos_intersemestrales,
+    modulos_semestrales,
+    modulos_sin_porcentaje=0,
+):
+    """
+    Clasifica a cada estudiante separando dos decisiones:
+
+    1. Si cumple el límite académico relacionado con la reinscripción.
+    2. Qué tipo de regularización necesita para sus módulos pendientes.
+
+    Los porcentajes faltantes se colocan en una categoría propia. Esto evita
+    presentar como definitiva una ruta que todavía depende de validar datos.
+    """
+    def _entero(valor):
+        try:
+            return int(valor or 0)
+        except Exception:
+            return 0
+
+    total = _entero(modulos_nc)
+    inter = _entero(modulos_intersemestrales)
+    sin_pct = _entero(modulos_sin_porcentaje)
+
+    if total <= 0:
+        return "Sin clasificación"
+
+    # GRUPO 1: cumple el límite académico de hasta tres módulos.
+    if total <= MAX_MODULOS_ASESORIA_INTERSEMESTRAL:
+        if sin_pct > 0:
+            return "Irregular - requiere validación de porcentaje"
+        if inter == total:
+            return "Intersemestral completo"
+        if inter > 0:
+            return "Irregular - ruta mixta"
+        return "Irregular - asesoría semestral"
+
+    # GRUPO 2: baja parcial. Primero se verifica si ya existen suficientes
+    # módulos elegibles conocidos para poder quedar con un máximo de tres.
+    if total <= MAX_MODULOS_BAJA_PARCIAL:
+        necesarios_para_reducir_a_tres = max(
+            total - MAX_MODULOS_ASESORIA_INTERSEMESTRAL,
+            0,
+        )
+        intersemestrales_programables = min(
+            inter,
+            MAX_MODULOS_ASESORIA_INTERSEMESTRAL,
+        )
+
+        if intersemestrales_programables >= necesarios_para_reducir_a_tres:
+            return "Baja parcial - rescate intersemestral posible"
+        if sin_pct > 0:
+            return "Baja parcial - requiere validación de porcentaje"
+        if intersemestrales_programables > 0:
+            return "Baja parcial - avance intersemestral parcial"
+        return "Baja parcial - sin oportunidad intersemestral inmediata"
+
+    return "No candidato a reinscripción"
+
+def _descripcion_ruta_normativa(
+    clasificacion,
+    modulos_nc=0,
+    modulos_intersemestrales=0,
+    modulos_semestrales=0,
+    modulos_sin_porcentaje=0,
+    modulos_necesarios_rescate=0,
+    modulos_intersemestrales_programables=0,
+):
+    """Construye una explicación personalizada y comprensible de la ruta."""
+    def _entero(valor):
+        try:
+            return int(valor or 0)
+        except Exception:
+            return 0
+
+    total = _entero(modulos_nc)
+    inter = _entero(modulos_intersemestrales)
+    sem = _entero(modulos_semestrales)
+    sin_pct = _entero(modulos_sin_porcentaje)
+    necesarios = _entero(modulos_necesarios_rescate)
+    programables = _entero(modulos_intersemestrales_programables)
+    clasificacion = str(clasificacion)
+
+    if clasificacion == "Intersemestral completo":
+        return (
+            f"Adeuda {total} módulo(s). Todos alcanzan al menos {UMBRAL_ASESORIA_INTERSEMESTRAL:.0f}%, "
+            "por lo que puede solicitar asesorías intersemestrales para todos, sujeto a programación, "
+            "disponibilidad y acreditación. Por adeudar como máximo 3 módulos, cumple el límite académico "
+            "ordinario para reinscripción."
+        )
+
+    if clasificacion == "Irregular - ruta mixta":
+        return (
+            f"Adeuda {total} módulo(s): {inter} puede(n) atenderse mediante asesoría intersemestral y "
+            f"{sem + sin_pct} requiere(n) ruta semestral o validación. Cumple el límite académico ordinario "
+            "para reinscripción porque adeuda como máximo 3 módulos."
+        )
+
+    if clasificacion == "Irregular - asesoría semestral":
+        return (
+            f"Adeuda {total} módulo(s) y ninguno alcanza {UMBRAL_ASESORIA_INTERSEMESTRAL:.0f}%. "
+            "Puede solicitar reinscripción por encontrarse dentro del máximo de 3 adeudos y regularizar "
+            "los módulos mediante asesorías semestrales, recursamiento u otro medio autorizado."
+        )
+
+    if clasificacion == "Irregular - requiere validación de porcentaje":
+        return (
+            f"Adeuda {total} módulo(s) y existen {sin_pct} registro(s) sin porcentaje alcanzado. "
+            "Cumple el límite académico ordinario para reinscripción, pero antes de definir la asesoría "
+            "debe validarse o capturarse el porcentaje faltante."
+        )
+
+    if clasificacion == "Baja parcial - rescate intersemestral posible":
+        return (
+            f"Adeuda {total} módulos y necesita acreditar al menos {necesarios} para quedar con 3. "
+            f"Tiene {inter} módulo(s) elegible(s) y puede programar hasta {programables}. Si acredita al menos "
+            f"{necesarios}, podría recuperar el límite académico ordinario para solicitar reinscripción. "
+            "La clasificación señala una oportunidad de rescate, no una acreditación garantizada."
+        )
+
+    if clasificacion == "Baja parcial - avance intersemestral parcial":
+        restantes = max(total - programables, 0)
+        return (
+            f"Adeuda {total} módulos y necesita acreditar {necesarios} para quedar con 3, pero solo puede "
+            f"programar {programables} intersemestral(es). Aun acreditándolos conservaría aproximadamente "
+            f"{restantes} módulo(s); requiere una ruta complementaria y, en su caso, valoración del Comité "
+            "Técnico Escolar."
+        )
+
+    if clasificacion == "Baja parcial - requiere validación de porcentaje":
+        return (
+            f"Adeuda {total} módulos y se encuentra en baja parcial. Hay {sin_pct} módulo(s) sin porcentaje "
+            "alcanzado; no debe descartarse al estudiante hasta validar esos datos, porque podrían modificar "
+            "su oportunidad de rescate intersemestral."
+        )
+
+    if clasificacion == "Baja parcial - sin oportunidad intersemestral inmediata":
+        return (
+            f"Adeuda {total} módulos y ninguno alcanza {UMBRAL_ASESORIA_INTERSEMESTRAL:.0f}%. "
+            "La intervención debe concentrarse en asesorías semestrales, recursamiento, ASCA u otro medio "
+            "autorizado. No cumple todavía el límite académico ordinario de reinscripción."
+        )
+
+    if clasificacion == "No candidato a reinscripción":
+        return (
+            f"Adeuda {total} módulos. No es candidato a reinscripción ordinaria hasta reducir el adeudo "
+            "a un máximo de 3. Puede continuar la regularización por los medios autorizados; esta condición "
+            "no equivale automáticamente a baja definitiva."
+        )
+
+    return "No fue posible determinar una situación normativa."
+
+
+
+def _construir_decision_academica(
+    clasificacion,
+    total,
+    inter,
+    sem,
+    sin_pct,
+    programables,
+    necesarios,
+):
+    """Devuelve textos breves para las tablas y los concentrados."""
+    if total <= 3:
+        grupo = "GRUPO 1 — 1 a 3 módulos"
+        cumple_limite = "Sí"
+        condicion = (
+            "Sí cumple el límite académico de hasta 3 módulos para solicitar reinscripción. "
+            "Todavía debe cumplir los demás requisitos administrativos del plantel."
+        )
+
+        if clasificacion == "Intersemestral completo":
+            oportunidad = "Intersemestral completo"
+            resultado = "Todos sus módulos pendientes pueden presentarse en intersemestral."
+            accion = "Solicitar reinscripción y programar sus asesorías intersemestrales."
+            prioridad = "1 - Oportunidad inmediata"
+        elif clasificacion == "Irregular - ruta mixta":
+            oportunidad = "Asesorías combinadas"
+            resultado = (
+                f"Puede presentar {inter} módulo(s) en intersemestral y atender "
+                f"{sem} módulo(s) mediante asesorías semestrales."
+            )
+            accion = "Solicitar reinscripción y programar asesorías intersemestrales y semestrales."
+            prioridad = "2 - Seguimiento combinado"
+        elif clasificacion == "Irregular - requiere validación de porcentaje":
+            oportunidad = "Información académica por validar"
+            resultado = f"Falta validar el porcentaje de {sin_pct} módulo(s) antes de definir la ruta."
+            accion = "Validar los porcentajes faltantes y después asignar la asesoría correspondiente."
+            prioridad = "1 - Validación urgente"
+        else:
+            oportunidad = "Asesorías semestrales"
+            resultado = "Sus módulos pendientes deben atenderse mediante asesorías semestrales."
+            accion = "Solicitar reinscripción y programar sus asesorías semestrales."
+            prioridad = "2 - Atención semestral"
+
+    elif total <= 6:
+        grupo = "GRUPO 2 — 4 a 6 módulos"
+        cumple_limite = "No"
+        condicion = (
+            "No cumple todavía el límite académico de reinscripción porque adeuda más de 3 módulos. "
+            "Debe reducir el adeudo o seguir la ruta institucional autorizada."
+        )
+
+        if clasificacion == "Baja parcial - rescate intersemestral posible":
+            oportunidad = "Puede quedar con 3 módulos"
+            resultado = (
+                f"Si acredita al menos {necesarios} de sus módulos intersemestrales, "
+                "podría quedar dentro del límite académico de reinscripción."
+            )
+            accion = "Priorizar las intersemestrales y verificar el resultado antes de la reinscripción."
+            prioridad = "1 - Rescate prioritario"
+        elif clasificacion == "Baja parcial - requiere validación de porcentaje":
+            oportunidad = "Información académica por validar"
+            resultado = (
+                f"Falta validar el porcentaje de {sin_pct} módulo(s); esos datos podrían cambiar "
+                "su oportunidad de recuperación."
+            )
+            accion = "Validar los porcentajes antes de definir la estrategia de regularización."
+            prioridad = "1 - Validación urgente"
+        elif clasificacion == "Baja parcial - avance intersemestral parcial":
+            oportunidad = "Reducción parcial del adeudo"
+            resultado = (
+                f"Puede presentar {programables} intersemestral(es), pero aun acreditándolas "
+                "continuaría con más de 3 módulos pendientes."
+            )
+            accion = "Programar las intersemestrales y completar un plan semestral o valoración del CTE."
+            prioridad = "2 - Plan complementario"
+        else:
+            oportunidad = "Otra ruta de regularización"
+            resultado = "No tiene módulos elegibles para intersemestral con la información disponible."
+            accion = "Definir asesorías semestrales, recursamiento, ASCA o la alternativa autorizada."
+            prioridad = "3 - Atención prioritaria"
+
+    else:
+        grupo = "GRUPO 3 — 7 o más módulos"
+        cumple_limite = "No"
+        condicion = "No puede solicitar reinscripción ordinaria hasta reducir el adeudo a un máximo de 3 módulos."
+        oportunidad = "Regularización previa a reinscripción"
+        resultado = "Debe reducir primero el número total de módulos pendientes."
+        accion = "Construir un plan integral de regularización y seguimiento individual."
+        prioridad = "4 - Restricción de reinscripción"
+
+    return {
+        "GRUPO_ANALISIS": grupo,
+        "CUMPLE_LIMITE_ACADEMICO_REINSCRIPCION": cumple_limite,
+        "PUEDE_PRESENTAR_INTERSEMESTRAL": "Sí" if inter > 0 else "No",
+        "PUEDE_TOMAR_ASESORIA_SEMESTRAL": (
+            "Sí" if sem > 0 else ("Por definir" if sin_pct > 0 else "No")
+        ),
+        "CONDICION_REINSCRIPCION": condicion,
+        "OPORTUNIDAD_REGULARIZACION": oportunidad,
+        "RESULTADO_PROYECTADO": resultado,
+        "ACCION_RECOMENDADA": accion,
+        "PRIORIDAD_ATENCION": prioridad,
+    }
+
+def _join_all_text_values(series):
+    """Concatena todos los valores no vacíos, conservando orden y duplicados."""
+    values = []
+    for value in series.tolist():
+        if value is None:
+            continue
+        try:
+            if pd.isna(value):
+                continue
+        except Exception:
+            pass
+        text = str(value).strip()
+        if not text or text.lower() in ("nan", "none", "null"):
+            continue
+        values.append(text)
+    return " | ".join(values)
+
+
+
+def _join_detalle_modulo_normativo(grupo):
+    """Construye Módulo (porcentaje - tipo de asesoría) en una sola celda."""
+    partes = []
+    for _, row in grupo.iterrows():
+        modulo = str(row.get("MODULO", "")).strip()
+        pct = pd.to_numeric(pd.Series([row.get("pAlcanzado")]), errors="coerce").iloc[0]
+        if pd.isna(pct):
+            pct_text = "Sin dato"
+        else:
+            pct_text = f"{float(pct):.2f}".rstrip("0").rstrip(".") + "%"
+        tipo = str(row.get("TIPO_ASESORIA_MODULO", "")).strip()
+        if modulo:
+            partes.append(f"{modulo} ({pct_text} - {tipo})")
+    return " | ".join(partes)
+
+def construir_reporte_normativo_estudiantes(df_detalle):
+    """
+    Construye una fila por estudiante con la información necesaria para decidir:
+
+    - A qué grupo pertenece: 1 a 3, 4 a 6 o 7 o más módulos.
+    - Si cumple el límite académico ordinario para reinscripción.
+    - Cuántos módulos puede presentar en asesoría intersemestral.
+    - Cuántos módulos requieren asesoría semestral.
+    - Si un estudiante de 4 a 6 puede reducir su adeudo a 3 mediante
+      intersemestrales o únicamente lograr un avance parcial.
+
+    Los porcentajes vacíos no se consideran automáticamente semestrales; se
+    identifican por separado para que el plantel valide la información.
+    """
+    columnas_salida = [
+        "Plantel", "ESTUDIANTE", "matricula", "CARRERA", "grado", "cvegrupo",
+        "GRUPO_ANALISIS", "modulos_nc", "modulos_intersemestrales",
+        "modulos_semestrales", "modulos_sin_porcentaje",
+        "modulos_intersemestrales_programables",
+        "modulos_necesarios_para_reducir_a_3",
+        "modulos_restantes_si_acredita_intersemestrales",
+        "CUMPLE_LIMITE_ACADEMICO_REINSCRIPCION",
+        "PUEDE_PRESENTAR_INTERSEMESTRAL",
+        "PUEDE_TOMAR_ASESORIA_SEMESTRAL",
+        "CONDICION_REINSCRIPCION",
+        "OPORTUNIDAD_REGULARIZACION",
+        "RESULTADO_PROYECTADO",
+        "ACCION_RECOMENDADA",
+        "PRIORIDAD_ATENCION",
+        "CLASIFICACION_NORMATIVA", "RUTA_NORMATIVA",
+        "MODULOS_INTERSEMESTRALES", "MODULOS_SEMESTRALES",
+        "MODULOS_SIN_PORCENTAJE",
+        "MODULOS_NO_COMPETENTES", "PORCENTAJES_ALCANZADOS",
+        "TIPO_ASESORIA_POR_MODULO", "DOCENTES_RELACIONADOS", "DETALLE_NORMATIVO"
+    ]
+
+    if df_detalle is None or getattr(df_detalle, "empty", True):
+        return pd.DataFrame(columns=columnas_salida)
+
+    d = agregar_conteo_modulos_no_competentes(df_detalle, ordenar=False)
+    if d.empty or "matricula" not in d.columns:
+        return pd.DataFrame(columns=columnas_salida)
+
+    if "pAlcanzado" not in d.columns:
+        d["pAlcanzado"] = pd.NA
+
+    d["__pAlcanzado_num__"] = pd.to_numeric(d["pAlcanzado"], errors="coerce")
+    d["__sin_porcentaje__"] = d["__pAlcanzado_num__"].isna()
+    d["__es_intersemestral__"] = d["__pAlcanzado_num__"].ge(UMBRAL_ASESORIA_INTERSEMESTRAL)
+    d["__es_semestral__"] = (
+        d["__pAlcanzado_num__"].notna()
+        & d["__pAlcanzado_num__"].lt(UMBRAL_ASESORIA_INTERSEMESTRAL)
+    )
+
+    d["TIPO_ASESORIA_MODULO"] = "Sin porcentaje - validar"
+    d.loc[d["__es_intersemestral__"], "TIPO_ASESORIA_MODULO"] = "Intersemestral"
+    d.loc[d["__es_semestral__"], "TIPO_ASESORIA_MODULO"] = "Semestral"
+
+    group_cols = ["matricula"]
+    if "Plantel" in d.columns:
+        group_cols = ["Plantel", "matricula"]
+
+    sort_cols = [c for c in group_cols + ["MODULO", "DOCENTE"] if c in d.columns]
+    if sort_cols:
+        d = d.sort_values(sort_cols, kind="stable").reset_index(drop=True)
+
+    rows = []
+    for keys, grupo in d.groupby(group_cols, dropna=False, sort=False):
+        if not isinstance(keys, tuple):
+            keys = (keys,)
+
+        row = dict(zip(group_cols, keys))
+        first = grupo.iloc[0]
+
+        for col in ["ESTUDIANTE", "CARRERA", "grado", "cvegrupo"]:
+            if col in grupo.columns:
+                row[col] = first.get(col)
+
+        total = int(pd.to_numeric(grupo["modulos_nc"], errors="coerce").fillna(0).iloc[0])
+        inter = int(grupo["__es_intersemestral__"].sum())
+        sem = int(grupo["__es_semestral__"].sum())
+        sin_pct = int(grupo["__sin_porcentaje__"].sum())
+        programables = min(inter, MAX_MODULOS_ASESORIA_INTERSEMESTRAL)
+        necesarios = max(total - MAX_MODULOS_ASESORIA_INTERSEMESTRAL, 0) if 4 <= total <= 6 else 0
+        restantes = max(total - programables, 0)
+
+        clasificacion = _clasificar_situacion_normativa(
+            total,
+            inter,
+            sem,
+            modulos_sin_porcentaje=sin_pct,
+        )
+
+        row["modulos_nc"] = total
+        row["modulos_intersemestrales"] = inter
+        row["modulos_semestrales"] = sem
+        row["modulos_sin_porcentaje"] = sin_pct
+        row["modulos_intersemestrales_programables"] = programables
+        row["modulos_necesarios_para_reducir_a_3"] = necesarios
+        row["modulos_restantes_si_acredita_intersemestrales"] = restantes
+        row["CLASIFICACION_NORMATIVA"] = clasificacion
+
+        decision = _construir_decision_academica(
+            clasificacion=clasificacion,
+            total=total,
+            inter=inter,
+            sem=sem,
+            sin_pct=sin_pct,
+            programables=programables,
+            necesarios=necesarios,
+        )
+        row.update(decision)
+
+        row["RUTA_NORMATIVA"] = _descripcion_ruta_normativa(
+            clasificacion,
+            modulos_nc=total,
+            modulos_intersemestrales=inter,
+            modulos_semestrales=sem,
+            modulos_sin_porcentaje=sin_pct,
+            modulos_necesarios_rescate=necesarios,
+            modulos_intersemestrales_programables=programables,
+        )
+
+        if "MODULO" in grupo.columns:
+            row["MODULOS_NO_COMPETENTES"] = _join_all_text_values(grupo["MODULO"])
+            row["MODULOS_INTERSEMESTRALES"] = _join_all_text_values(
+                grupo.loc[grupo["__es_intersemestral__"], "MODULO"]
+            )
+            row["MODULOS_SEMESTRALES"] = _join_all_text_values(
+                grupo.loc[grupo["__es_semestral__"], "MODULO"]
+            )
+            row["MODULOS_SIN_PORCENTAJE"] = _join_all_text_values(
+                grupo.loc[grupo["__sin_porcentaje__"], "MODULO"]
+            )
+        else:
+            row["MODULOS_NO_COMPETENTES"] = ""
+            row["MODULOS_INTERSEMESTRALES"] = ""
+            row["MODULOS_SEMESTRALES"] = ""
+            row["MODULOS_SIN_PORCENTAJE"] = ""
+
+        row["PORCENTAJES_ALCANZADOS"] = _join_percentage_values(grupo["pAlcanzado"])
+        row["TIPO_ASESORIA_POR_MODULO"] = _join_all_text_values(grupo["TIPO_ASESORIA_MODULO"])
+
+        if "DOCENTE" in grupo.columns:
+            row["DOCENTES_RELACIONADOS"] = _join_unique_values(grupo["DOCENTE"])
+        else:
+            row["DOCENTES_RELACIONADOS"] = ""
+
+        row["DETALLE_NORMATIVO"] = _join_detalle_modulo_normativo(grupo)
+        rows.append(row)
+
+    resumen = pd.DataFrame(rows)
+    for col in columnas_salida:
+        if col not in resumen.columns:
+            resumen[col] = pd.NA
+
+    resumen = resumen[columnas_salida]
+    sort_cols = [c for c in ["Plantel", "PRIORIDAD_ATENCION", "modulos_nc", "ESTUDIANTE", "matricula"] if c in resumen.columns]
+    if sort_cols:
+        ascending = [True] * len(sort_cols)
+        if "modulos_nc" in sort_cols:
+            ascending[sort_cols.index("modulos_nc")] = False
+        resumen = resumen.sort_values(sort_cols, ascending=ascending, kind="stable").reset_index(drop=True)
+
+    return resumen
+
+
+def construir_resumen_normativo(df_estudiantes):
+    """Devuelve los valores utilizados por las tarjetas y el concentrado."""
+    empty = {
+        "total_nc": 0,
+        "uno_a_tres": 0,
+        "uno_a_tres_reinscripcion_ordinaria": 0,
+        "uno_a_tres_con_intersemestral": 0,
+        "intersemestral_completo": 0,
+        "irregular_mixta": 0,
+        "irregular_semestral": 0,
+        "validar_porcentaje_1a3": 0,
+        "cuatro_a_seis": 0,
+        "cuatro_a_seis_con_intersemestral": 0,
+        "baja_parcial": 0,
+        "rescate_intersemestral_posible": 0,
+        "avance_intersemestral_parcial": 0,
+        "sin_oportunidad_intersemestral": 0,
+        "validar_porcentaje_4a6": 0,
+        "no_reinscripcion": 0,
+        "irregulares_1a3": 0,
+    }
+    if df_estudiantes is None or getattr(df_estudiantes, "empty", True):
+        return empty
+
+    clas = df_estudiantes["CLASIFICACION_NORMATIVA"].astype(str)
+    total_modulos = pd.to_numeric(df_estudiantes["modulos_nc"], errors="coerce").fillna(0)
+    inter_modulos = pd.to_numeric(
+        df_estudiantes.get("modulos_intersemestrales", 0),
+        errors="coerce",
+    ).fillna(0)
+
+    mask_1a3 = total_modulos.between(1, MAX_MODULOS_ASESORIA_INTERSEMESTRAL)
+    mask_4a6 = total_modulos.between(4, MAX_MODULOS_BAJA_PARCIAL)
+
+    inter_completo = int((clas == "Intersemestral completo").sum())
+    combinadas = int((clas == "Irregular - ruta mixta").sum())
+    semestrales = int((clas == "Irregular - asesoría semestral").sum())
+    validar_1a3 = int((clas == "Irregular - requiere validación de porcentaje").sum())
+
+    rescate = int((clas == "Baja parcial - rescate intersemestral posible").sum())
+    parcial = int((clas == "Baja parcial - avance intersemestral parcial").sum())
+    otra_ruta = int((clas == "Baja parcial - sin oportunidad intersemestral inmediata").sum())
+    validar_4a6 = int((clas == "Baja parcial - requiere validación de porcentaje").sum())
+    no_reins = int((clas == "No candidato a reinscripción").sum())
+
+    return {
+        "total_nc": int(len(df_estudiantes)),
+        "uno_a_tres": int(mask_1a3.sum()),
+        "uno_a_tres_reinscripcion_ordinaria": int(mask_1a3.sum()),
+        "uno_a_tres_con_intersemestral": int((mask_1a3 & inter_modulos.gt(0)).sum()),
+        "intersemestral_completo": inter_completo,
+        "irregular_mixta": combinadas,
+        "irregular_semestral": semestrales,
+        "validar_porcentaje_1a3": validar_1a3,
+        "cuatro_a_seis": int(mask_4a6.sum()),
+        "cuatro_a_seis_con_intersemestral": int((mask_4a6 & inter_modulos.gt(0)).sum()),
+        "baja_parcial": int(mask_4a6.sum()),
+        "rescate_intersemestral_posible": rescate,
+        "avance_intersemestral_parcial": parcial,
+        "sin_oportunidad_intersemestral": otra_ruta,
+        "validar_porcentaje_4a6": validar_4a6,
+        "no_reinscripcion": no_reins,
+        "irregulares_1a3": combinadas + semestrales + validar_1a3,
+    }
+
+
+def filtrar_reporte_normativo(df_estudiantes, opcion):
+    """Filtra la relación de estudiantes con nombres comprensibles para el usuario."""
+    if df_estudiantes is None or getattr(df_estudiantes, "empty", True):
+        return df_estudiantes.copy() if df_estudiantes is not None else pd.DataFrame()
+
+    d = df_estudiantes.copy()
+    clas = d["CLASIFICACION_NORMATIVA"].astype(str)
+    total = pd.to_numeric(d["modulos_nc"], errors="coerce").fillna(0)
+    inter = pd.to_numeric(d.get("modulos_intersemestrales", 0), errors="coerce").fillna(0)
+
+    if opcion in ("Todos los estudiantes", "Reporte completo"):
+        return d
+
+    if opcion in (
+        "GRUPO 1 — Adeudan de 1 a 3 módulos",
+        "GRUPO 1 — Estudiantes con 1 a 3 módulos",
+        "Estudiantes irregulares (1 a 3 módulos)",
+    ):
+        return d[total.between(1, 3)].copy()
+
+    if opcion == "GRUPO 1 — Pueden presentar al menos una intersemestral":
+        return d[total.between(1, 3) & inter.gt(0)].copy()
+
+    if opcion in (
+        "GRUPO 1 — Todos sus módulos son intersemestrales",
+        "GRUPO 1 — Todos sus módulos pueden ir a intersemestral",
+    ):
+        return d[clas == "Intersemestral completo"].copy()
+
+    if opcion in (
+        "GRUPO 1 — Necesitan asesorías combinadas",
+        "GRUPO 1 — Reinscripción ordinaria con ruta mixta",
+    ):
+        return d[clas == "Irregular - ruta mixta"].copy()
+
+    if opcion in (
+        "GRUPO 1 — Necesitan asesorías semestrales",
+        "GRUPO 1 — Reinscripción ordinaria con ruta semestral",
+    ):
+        return d[clas == "Irregular - asesoría semestral"].copy()
+
+    if opcion in (
+        "GRUPO 1 — Información académica por validar",
+        "GRUPO 1 — Requieren validar porcentajes",
+    ):
+        return d[clas == "Irregular - requiere validación de porcentaje"].copy()
+
+    if opcion in (
+        "GRUPO 2 — Adeudan de 4 a 6 módulos",
+        "GRUPO 2 — Estudiantes con 4 a 6 módulos",
+        "Baja parcial (4 a 6 módulos)",
+    ):
+        return d[total.between(4, 6)].copy()
+
+    if opcion == "GRUPO 2 — Pueden presentar al menos una intersemestral":
+        return d[total.between(4, 6) & inter.gt(0)].copy()
+
+    if opcion in (
+        "GRUPO 2 — Pueden quedar con 3 módulos",
+        "GRUPO 2 — Rescate intersemestral posible",
+        "Rescate intersemestral posible (4 a 6 módulos)",
+    ):
+        return d[clas == "Baja parcial - rescate intersemestral posible"].copy()
+
+    if opcion in (
+        "GRUPO 2 — Solo pueden reducir parcialmente el adeudo",
+        "GRUPO 2 — Avance intersemestral parcial",
+        "Avance intersemestral parcial (4 a 6 módulos)",
+    ):
+        return d[clas == "Baja parcial - avance intersemestral parcial"].copy()
+
+    if opcion in (
+        "GRUPO 2 — Necesitan otra ruta de regularización",
+        "GRUPO 2 — Sin oportunidad intersemestral inmediata",
+        "Sin oportunidad intersemestral inmediata (4 a 6 módulos)",
+    ):
+        return d[clas == "Baja parcial - sin oportunidad intersemestral inmediata"].copy()
+
+    if opcion in (
+        "GRUPO 2 — Información académica por validar",
+        "GRUPO 2 — Requieren validar porcentajes",
+    ):
+        return d[clas == "Baja parcial - requiere validación de porcentaje"].copy()
+
+    if opcion in (
+        "7 o más — Deben regularizarse antes de reinscribirse",
+        "7 o más — No candidatos a reinscripción ordinaria",
+        "No candidatos a reinscripción (7 o más módulos)",
+    ):
+        return d[clas == "No candidato a reinscripción"].copy()
+
+    if opcion == "Asesorías intersemestrales":
+        return d[inter.gt(0)].copy()
+
+    return d
+
+def obtener_reporte_normativo_plantel(plantel_sel):
+    """Obtiene el reporte normativo del plantel o el consolidado estatal."""
+    detalle = obtener_detalle_no_competentes(plantel_sel)
+    return construir_reporte_normativo_estudiantes(detalle)
+
+
+
+def _columnas_reporte_normativo_presentacion(df):
+    """Ordena y renombra todas las columnas técnicas para consulta avanzada."""
+    if df is None:
+        return pd.DataFrame()
+
+    d = df.copy()
+    rename_map = {
+        "Plantel": "Plantel",
+        "ESTUDIANTE": "Estudiante",
+        "matricula": "Matrícula",
+        "CARRERA": "Carrera",
+        "grado": "Grado",
+        "cvegrupo": "Grupo",
+        "GRUPO_ANALISIS": "Grupo de análisis",
+        "modulos_nc": "Módulos no competentes",
+        "modulos_intersemestrales": "Módulos elegibles para intersemestral",
+        "modulos_semestrales": "Módulos con ruta semestral",
+        "modulos_sin_porcentaje": "Módulos sin porcentaje",
+        "modulos_intersemestrales_programables": "Intersemestrales programables (máx. 3)",
+        "modulos_necesarios_para_reducir_a_3": "Módulos que necesita acreditar para quedar con 3",
+        "modulos_restantes_si_acredita_intersemestrales": "Módulos restantes si acredita los programables",
+        "CUMPLE_LIMITE_ACADEMICO_REINSCRIPCION": "Cumple límite académico para reinscripción",
+        "PUEDE_PRESENTAR_INTERSEMESTRAL": "Puede presentar intersemestral",
+        "PUEDE_TOMAR_ASESORIA_SEMESTRAL": "Puede tomar asesoría semestral",
+        "CONDICION_REINSCRIPCION": "Condición de reinscripción",
+        "OPORTUNIDAD_REGULARIZACION": "Oportunidad de regularización",
+        "RESULTADO_PROYECTADO": "Resultado proyectado",
+        "ACCION_RECOMENDADA": "Acción recomendada",
+        "PRIORIDAD_ATENCION": "Prioridad de atención",
+        "CLASIFICACION_NORMATIVA": "Clasificación técnica",
+        "RUTA_NORMATIVA": "Explicación técnica de la ruta",
+        "MODULOS_INTERSEMESTRALES": "Módulos para intersemestral",
+        "MODULOS_SEMESTRALES": "Módulos para semestral",
+        "MODULOS_SIN_PORCENTAJE": "Módulos pendientes de validar",
+        "MODULOS_NO_COMPETENTES": "Módulos no competentes (detalle)",
+        "PORCENTAJES_ALCANZADOS": "Porcentajes alcanzados",
+        "TIPO_ASESORIA_POR_MODULO": "Tipo de asesoría por módulo",
+        "DOCENTES_RELACIONADOS": "Docentes relacionados",
+        "DETALLE_NORMATIVO": "Detalle por módulo",
+    }
+    d = d.rename(columns=rename_map)
+    orden = [c for c in rename_map.values() if c in d.columns]
+    resto = [c for c in d.columns if c not in orden]
+    return d[orden + resto]
+
+
+
+def _columnas_reporte_sencillo(df, mostrar_plantel=True):
+    """
+    Presenta una relación compacta para lectura inmediata.
+
+    La información técnica completa se conserva en el apartado desplegable, por
+    lo que esta vista puede concentrarse en las decisiones que debe tomar el
+    plantel sin perder datos ni cálculos.
+    """
+    columnas_vacias = [
+        "Plantel", "Estudiante", "Matrícula", "Carrera", "Grado / Grupo",
+        "Módulos pendientes", "Reinscripción", "Situación actual",
+        "Asesorías identificadas", "Meta inmediata", "Qué debe hacer ahora",
+        "Módulos y porcentajes",
+    ]
+    if df is None or getattr(df, "empty", True):
+        columnas = columnas_vacias if mostrar_plantel else columnas_vacias[1:]
+        return pd.DataFrame(columns=columnas)
+
+    d = df.copy()
+
+    def _num(row, col):
+        try:
+            value = pd.to_numeric(pd.Series([row.get(col)]), errors="coerce").iloc[0]
+            return int(value) if pd.notna(value) else 0
+        except Exception:
+            return 0
+
+    def _texto_cantidad(cantidad, singular, plural):
+        cantidad = int(cantidad or 0)
+        return f"{cantidad} {singular if cantidad == 1 else plural}"
+
+    def _reinscripcion(row):
+        total = _num(row, "modulos_nc")
+        clas = str(row.get("CLASIFICACION_NORMATIVA", ""))
+        if 1 <= total <= 3:
+            return "Sí: cumple el límite académico"
+        if 4 <= total <= 6 and clas == "Baja parcial - rescate intersemestral posible":
+            return "Después de acreditar lo necesario y quedar con 3"
+        return "No todavía"
+
+    def _situacion(row):
+        clas = str(row.get("CLASIFICACION_NORMATIVA", ""))
+        textos = {
+            "Intersemestral completo": "Todos sus módulos pueden presentarse en intersemestral",
+            "Irregular - ruta mixta": "Necesita combinar asesorías intersemestrales y semestrales",
+            "Irregular - asesoría semestral": "Sus módulos deben atenderse mediante asesorías semestrales",
+            "Irregular - requiere validación de porcentaje": "Faltan porcentajes para definir correctamente las asesorías",
+            "Baja parcial - rescate intersemestral posible": "Puede reducir el adeudo hasta quedar con 3 módulos",
+            "Baja parcial - avance intersemestral parcial": "Puede reducir el adeudo, pero todavía quedaría con más de 3 módulos",
+            "Baja parcial - sin oportunidad intersemestral inmediata": "Necesita una ruta diferente a la intersemestral",
+            "Baja parcial - requiere validación de porcentaje": "Faltan porcentajes para confirmar su oportunidad de recuperación",
+            "No candidato a reinscripción": "Debe reducir el adeudo antes de solicitar reinscripción",
+        }
+        return textos.get(clas, str(row.get("OPORTUNIDAD_REGULARIZACION", "Por revisar")))
+
+    def _asesorias(row):
+        inter = _num(row, "modulos_intersemestrales")
+        sem = _num(row, "modulos_semestrales")
+        sin_pct = _num(row, "modulos_sin_porcentaje")
+        partes = []
+        if inter > 0:
+            partes.append(_texto_cantidad(inter, "intersemestral", "intersemestrales"))
+        if sem > 0:
+            partes.append(_texto_cantidad(sem, "semestral", "semestrales"))
+        if sin_pct > 0:
+            partes.append(_texto_cantidad(sin_pct, "porcentaje por validar", "porcentajes por validar"))
+        return " | ".join(partes) if partes else "Sin asesoría definida"
+
+    def _meta(row):
+        total = _num(row, "modulos_nc")
+        necesarios = _num(row, "modulos_necesarios_para_reducir_a_3")
+        sin_pct = _num(row, "modulos_sin_porcentaje")
+        clas = str(row.get("CLASIFICACION_NORMATIVA", ""))
+
+        if sin_pct > 0 and "validación" in clas:
+            return _texto_cantidad(sin_pct, "porcentaje faltante por validar", "porcentajes faltantes por validar")
+        if total <= 3:
+            return "Regularizar los módulos pendientes"
+        if 4 <= total <= 6:
+            return _texto_cantidad(necesarios, "módulo por acreditar para quedar con 3", "módulos por acreditar para quedar con 3")
+        return "Reducir el adeudo a un máximo de 3 módulos"
+
+    def _grado_grupo(row):
+        grado = row.get("grado", "")
+        grupo = row.get("cvegrupo", "")
+        grado = "" if pd.isna(grado) else str(grado).strip()
+        grupo = "" if pd.isna(grupo) else str(grupo).strip()
+        if grado and grupo:
+            return f"{grado} / {grupo}"
+        return grado or grupo
+
+    d["Plantel_s"] = d.get("Plantel", "")
+    d["Estudiante_s"] = d.get("ESTUDIANTE", "")
+    d["Matrícula_s"] = d.get("matricula", "")
+    d["Carrera_s"] = d.get("CARRERA", "")
+    d["Grado / Grupo_s"] = d.apply(_grado_grupo, axis=1)
+    d["Módulos pendientes_s"] = pd.to_numeric(d.get("modulos_nc", 0), errors="coerce").fillna(0).astype(int)
+    d["Reinscripción_s"] = d.apply(_reinscripcion, axis=1)
+    d["Situación actual_s"] = d.apply(_situacion, axis=1)
+    d["Asesorías identificadas_s"] = d.apply(_asesorias, axis=1)
+    d["Meta inmediata_s"] = d.apply(_meta, axis=1)
+    d["Qué debe hacer ahora_s"] = d.get("ACCION_RECOMENDADA", "")
+    d["Módulos y porcentajes_s"] = d.get("DETALLE_NORMATIVO", "")
+
+    rename = {
+        "Plantel_s": "Plantel",
+        "Estudiante_s": "Estudiante",
+        "Matrícula_s": "Matrícula",
+        "Carrera_s": "Carrera",
+        "Grado / Grupo_s": "Grado / Grupo",
+        "Módulos pendientes_s": "Módulos pendientes",
+        "Reinscripción_s": "Reinscripción",
+        "Situación actual_s": "Situación actual",
+        "Asesorías identificadas_s": "Asesorías identificadas",
+        "Meta inmediata_s": "Meta inmediata",
+        "Qué debe hacer ahora_s": "Qué debe hacer ahora",
+        "Módulos y porcentajes_s": "Módulos y porcentajes",
+    }
+    salida = d[list(rename.keys())].rename(columns=rename)
+    if not mostrar_plantel:
+        salida = salida.drop(columns=["Plantel"], errors="ignore")
+    return salida
+
+
+def _columnas_concentrado_imprimible(df):
+    """Devuelve una relación compacta y comprensible para impresión y seguimiento."""
+    d = _columnas_reporte_sencillo(df, mostrar_plantel=True)
+    columnas = [
+        "Plantel", "Estudiante", "Matrícula", "Carrera", "Grado / Grupo",
+        "Módulos pendientes", "Reinscripción", "Situación actual",
+        "Asesorías identificadas", "Meta inmediata", "Qué debe hacer ahora",
+        "Módulos y porcentajes",
+    ]
+    return d[[c for c in columnas if c in d.columns]].copy()
+
+def construir_concentrado_por_plantel(df_estudiantes):
+    """Construye un resumen por plantel con categorías que no se traslapan."""
+    columnas = [
+        "Plantel", "Total no competentes",
+        "Grupo 1: 1 a 3", "G1: intersemestral completo",
+        "G1: asesorías combinadas", "G1: asesorías semestrales",
+        "Grupo 2: 4 a 6", "G2: pueden quedar con 3",
+        "G2: reducción parcial", "G2: otra ruta",
+        "Información por validar", "7 o más",
+    ]
+    if df_estudiantes is None or getattr(df_estudiantes, "empty", True):
+        return pd.DataFrame(columns=columnas)
+
+    d = df_estudiantes.copy()
+    if "Plantel" not in d.columns:
+        d["Plantel"] = "Ámbito seleccionado"
+
+    rows = []
+    for plantel, grupo in d.groupby("Plantel", dropna=False, sort=True):
+        r = construir_resumen_normativo(grupo)
+        rows.append({
+            "Plantel": plantel,
+            "Total no competentes": r["total_nc"],
+            "Grupo 1: 1 a 3": r["uno_a_tres"],
+            "G1: intersemestral completo": r["intersemestral_completo"],
+            "G1: asesorías combinadas": r["irregular_mixta"],
+            "G1: asesorías semestrales": r["irregular_semestral"],
+            "Grupo 2: 4 a 6": r["cuatro_a_seis"],
+            "G2: pueden quedar con 3": r["rescate_intersemestral_posible"],
+            "G2: reducción parcial": r["avance_intersemestral_parcial"],
+            "G2: otra ruta": r["sin_oportunidad_intersemestral"],
+            "Información por validar": r["validar_porcentaje_1a3"] + r["validar_porcentaje_4a6"],
+            "7 o más": r["no_reinscripcion"],
+        })
+
+    concentrado = pd.DataFrame(rows, columns=columnas)
+    if len(concentrado) > 1:
+        total = {col: "" for col in concentrado.columns}
+        total["Plantel"] = "TOTAL ESTATAL"
+        for col in concentrado.columns:
+            if col != "Plantel":
+                total[col] = int(pd.to_numeric(concentrado[col], errors="coerce").fillna(0).sum())
+        concentrado = pd.concat([concentrado, pd.DataFrame([total])], ignore_index=True)
+    return concentrado
 
 def construir_resumen_categorias_modulos(df_detalle):
     if df_detalle is None or getattr(df_detalle, "empty", True):
@@ -1016,7 +1975,9 @@ def render_seccion_impresion_por_modulos(plantel_sel, key_prefix="modulos_nc"):
         return
 
     st.caption(
-        "Tabla final para impresión de atención: una fila por estudiante con sus módulos y docentes relacionados."
+        "Tabla final para identificación o impresión: una fila por estudiante con sus módulos, "
+        "porcentajes alcanzados y docentes relacionados. Los módulos y porcentajes aparecen en el "
+        "mismo orden y se separan con el símbolo |."
     )
     df_resumen_estudiantes = ocultar_columnas_metricas_presentacion(df_resumen_estudiantes)
     mostrar_dataframe_preview(df_resumen_estudiantes, height=430)
@@ -1459,7 +2420,77 @@ def _pie_semanas_seguimiento(df):
 
 
 
+def _obtener_estilo_tarjeta_semaforo(nivel):
+    """
+    Devuelve la paleta visual de una tarjeta.
+
+    Los colores son únicamente una ayuda visual para facilitar la lectura:
+    - verde: ruta de regularización intersemestral disponible;
+    - amarillo: requiere atención, seguimiento o regularización;
+    - rojo: restricción académica o situación prioritaria;
+    - azul: dato informativo, sin interpretación normativa adicional.
+    """
+    paletas = {
+        "verde": {
+            "fondo": "#ECFDF3",
+            "borde": "#12B76A",
+            "texto": "#067647",
+            "punto": "#12B76A",
+            "sombra": "rgba(18,183,106,0.22)",
+            "etiqueta": "Ruta intersemestral",
+        },
+        "amarillo": {
+            "fondo": "#FFFAEB",
+            "borde": "#F79009",
+            "texto": "#B54708",
+            "punto": "#F79009",
+            "sombra": "rgba(247,144,9,0.22)",
+            "etiqueta": "Atención y seguimiento",
+        },
+        "rojo": {
+            "fondo": "#FEF3F2",
+            "borde": "#F04438",
+            "texto": "#B42318",
+            "punto": "#F04438",
+            "sombra": "rgba(240,68,56,0.24)",
+            "etiqueta": "Situación prioritaria",
+        },
+        "rojo_critico": {
+            "fondo": "#FFF1F3",
+            "borde": "#D92D20",
+            "texto": "#912018",
+            "punto": "#D92D20",
+            "sombra": "rgba(217,45,32,0.30)",
+            "etiqueta": "Restricción de reinscripción",
+        },
+        "azul": {
+            "fondo": "#EFF8FF",
+            "borde": "#2E90FA",
+            "texto": "#175CD3",
+            "punto": "#2E90FA",
+            "sombra": "rgba(46,144,250,0.20)",
+            "etiqueta": "Dato informativo",
+        },
+        "neutral": {
+            "fondo": "#FFFFFF",
+            "borde": "#D0D5DD",
+            "texto": "#475467",
+            "punto": "#98A2B3",
+            "sombra": "rgba(16,24,40,0.08)",
+            "etiqueta": "Información",
+        },
+    }
+    return paletas.get(str(nivel or "neutral").strip().lower(), paletas["neutral"])
+
+
 def _render_cards_resumen(items):
+    """
+    Renderiza tarjetas informativas.
+
+    Conserva el comportamiento anterior y admite, de forma opcional, el campo
+    ``semaforo`` con los valores verde, amarillo, rojo, rojo_critico, azul o
+    neutral. Las tarjetas que no indiquen ese campo mantienen el estilo neutro.
+    """
     if not items:
         return
 
@@ -1468,19 +2499,469 @@ def _render_cards_resumen(items):
         titulo = str(item.get("titulo", "")).strip()
         valor = str(item.get("valor", "")).strip()
         detalle = str(item.get("detalle", "")).strip()
+        fundamento = str(item.get("fundamento", "")).strip()
+        nivel = str(item.get("semaforo", "neutral")).strip().lower()
+        estilo = _obtener_estilo_tarjeta_semaforo(nivel)
+        etiqueta_semaforo = str(
+            item.get("etiqueta_semaforo") or estilo.get("etiqueta", "Información")
+        ).strip()
 
-        with col:
-            st.markdown(
-                f"""
-                <div style="border:1px solid #D0D5DD;border-radius:14px;padding:16px 14px;background:#FFFFFF;min-height:120px;box-shadow:0 1px 2px rgba(16,24,40,0.05);">
-                    <div style="font-size:13px;color:#667085;margin-bottom:8px;font-weight:600;">{titulo}</div>
-                    <div style="font-size:24px;color:#101828;font-weight:800;line-height:1.15;">{valor}</div>
-                    <div style="font-size:12px;color:#667085;margin-top:10px;line-height:1.35;">{detalle}</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
+        fundamento_html = ""
+        if fundamento:
+            fundamento_html = (
+                "<div style='font-size:11px;color:#184C3B;margin-top:10px;line-height:1.35;"
+                "font-weight:700;border-top:1px solid rgba(16,24,40,0.12);padding-top:8px;'>"
+                f"{escape(fundamento)}</div>"
             )
 
+        indicador_html = ""
+        if nivel != "neutral":
+            indicador_html = (
+                "<div style='display:flex;align-items:center;gap:7px;margin-bottom:10px;'>"
+                f"<span style='width:11px;height:11px;border-radius:50%;background:{estilo['punto']};"
+                f"box-shadow:0 0 0 4px {estilo['sombra']};display:inline-block;'></span>"
+                f"<span style='font-size:10px;letter-spacing:.25px;text-transform:uppercase;"
+                f"font-weight:800;color:{estilo['texto']};'>{escape(etiqueta_semaforo)}</span>"
+                "</div>"
+            )
+
+        with col:
+            if nivel == "neutral":
+                # Se conserva exactamente el estilo previo para las tarjetas generales
+                # del tablero que no forman parte del semáforo normativo.
+                st.markdown(
+                    f"""
+                    <div style="border:1px solid #D0D5DD;border-radius:14px;padding:16px 14px;
+                                background:#FFFFFF;min-height:148px;
+                                box-shadow:0 1px 2px rgba(16,24,40,0.05);">
+                        <div style="font-size:13px;color:#667085;margin-bottom:8px;font-weight:600;">{escape(titulo)}</div>
+                        <div style="font-size:24px;color:#101828;font-weight:800;line-height:1.15;">{escape(valor)}</div>
+                        <div style="font-size:12px;color:#667085;margin-top:10px;line-height:1.35;">{escape(detalle)}</div>
+                        {fundamento_html}
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    f"""
+                    <div style="border:2px solid {estilo['borde']};border-radius:16px;padding:16px 14px;
+                                background:{estilo['fondo']};min-height:178px;
+                                box-shadow:0 5px 16px {estilo['sombra']};position:relative;overflow:hidden;">
+                        <div style="position:absolute;left:0;top:0;bottom:0;width:7px;background:{estilo['borde']};"></div>
+                        <div style="padding-left:5px;">
+                            {indicador_html}
+                            <div style="font-size:13px;color:{estilo['texto']};margin-bottom:8px;font-weight:750;line-height:1.25;">
+                                {escape(titulo)}
+                            </div>
+                            <div style="font-size:28px;color:#101828;font-weight:850;line-height:1.05;">{escape(valor)}</div>
+                            <div style="font-size:12px;color:#475467;margin-top:10px;line-height:1.4;">{escape(detalle)}</div>
+                            {fundamento_html}
+                        </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+
+
+
+def render_tarjetas_normativas(resumen):
+    """Muestra primero el total y después categorías claras que no deben sumarse dos veces."""
+    st.markdown("#### 1. Panorama general")
+    st.caption(
+        "Primero se identifica cuántos módulos adeuda cada estudiante. Después se determina cómo puede regularizarlos."
+    )
+    _render_cards_resumen([
+        {
+            "titulo": "Total de estudiantes con módulos pendientes",
+            "valor": f"{resumen.get('total_nc', 0):,}",
+            "detalle": "Tienen al menos un módulo no acreditado.",
+            "fundamento": "Seguimiento académico: artículos 100 a 103.",
+            "semaforo": "azul",
+            "etiqueta_semaforo": "Panorama general",
+        },
+        {
+            "titulo": "Adeudan de 1 a 3 módulos",
+            "valor": f"{resumen.get('uno_a_tres', 0):,}",
+            "detalle": "Cumplen el límite académico de módulos para solicitar reinscripción.",
+            "fundamento": "Artículo 68, fracción III.",
+            "semaforo": "azul",
+            "etiqueta_semaforo": "Grupo 1",
+        },
+        {
+            "titulo": "Adeudan de 4 a 6 módulos",
+            "valor": f"{resumen.get('cuatro_a_seis', 0):,}",
+            "detalle": "Deben reducir el adeudo o seguir la ruta institucional autorizada.",
+            "fundamento": "Artículos 73 y 75.",
+            "semaforo": "amarillo",
+            "etiqueta_semaforo": "Grupo 2",
+        },
+        {
+            "titulo": "Adeudan 7 o más módulos",
+            "valor": f"{resumen.get('no_reinscripcion', 0):,}",
+            "detalle": "Deben regularizarse antes de solicitar reinscripción ordinaria.",
+            "fundamento": "Artículo 75.",
+            "semaforo": "rojo_critico",
+            "etiqueta_semaforo": "Restricción de reinscripción",
+        },
+    ])
+
+    # -------------------------
+    # GRUPO 1
+    # -------------------------
+    total_g1 = int(resumen.get("uno_a_tres", 0) or 0)
+    con_inter_g1 = int(resumen.get("uno_a_tres_con_intersemestral", 0) or 0)
+    completo_g1 = int(resumen.get("intersemestral_completo", 0) or 0)
+    combinadas_g1 = int(resumen.get("irregular_mixta", 0) or 0)
+    semestrales_g1 = int(resumen.get("irregular_semestral", 0) or 0)
+    validar_g1 = int(resumen.get("validar_porcentaje_1a3", 0) or 0)
+
+    st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
+    st.markdown("#### 2. Grupo 1 — Estudiantes que adeudan de 1 a 3 módulos")
+    st.caption(
+        "Todos cumplen el límite académico de módulos para solicitar reinscripción. "
+        "Las tarjetas siguientes muestran únicamente cómo deben regularizarse."
+    )
+
+    _render_cards_resumen([
+        {
+            "titulo": "Pueden solicitar reinscripción",
+            "valor": f"{total_g1:,}",
+            "detalle": (
+                "Adeudan como máximo 3 módulos. También deben cumplir los demás requisitos "
+                "administrativos del plantel."
+            ),
+            "fundamento": "Artículo 68, fracción III.",
+            "semaforo": "azul",
+            "etiqueta_semaforo": "Total del Grupo 1",
+        }
+    ])
+
+    st.info(
+        f"**{con_inter_g1:,} de {total_g1:,} estudiantes pueden presentar al menos un módulo en intersemestral.** "
+        f"Este subtotal incluye a **{completo_g1:,}** con todos sus módulos intersemestrales y a "
+        f"**{combinadas_g1:,}** que necesitan combinar asesorías. No debe sumarse nuevamente al total del grupo."
+    )
+
+    rutas_g1 = [
+        {
+            "titulo": "Intersemestral completo",
+            "valor": f"{completo_g1:,}",
+            "detalle": "Todos sus módulos pendientes pueden presentarse en el periodo intersemestral.",
+            "fundamento": "Artículos 96, 97 y 98.",
+            "semaforo": "verde",
+            "etiqueta_semaforo": "Todos los módulos elegibles",
+        },
+        {
+            "titulo": "Asesorías combinadas",
+            "valor": f"{combinadas_g1:,}",
+            "detalle": "Unos módulos van a intersemestral y otros deben atenderse durante el semestre.",
+            "fundamento": "Artículos 96, 97, 98 y 99.",
+            "semaforo": "amarillo",
+            "etiqueta_semaforo": "Dos tipos de asesoría",
+        },
+        {
+            "titulo": "Asesorías semestrales",
+            "valor": f"{semestrales_g1:,}",
+            "detalle": "Ninguno de sus módulos alcanza el porcentaje requerido para intersemestral.",
+            "fundamento": "Artículos 96, 97 y 99.",
+            "semaforo": "amarillo",
+            "etiqueta_semaforo": "Atención durante el semestre",
+        },
+    ]
+    if validar_g1 > 0:
+        rutas_g1.append({
+            "titulo": "Información pendiente de revisar",
+            "valor": f"{validar_g1:,}",
+            "detalle": "Faltan porcentajes y todavía no puede determinarse la asesoría correcta.",
+            "fundamento": "Validar la información antes de canalizar.",
+            "semaforo": "rojo",
+            "etiqueta_semaforo": "Validación urgente",
+        })
+    _render_cards_resumen(rutas_g1)
+
+    suma_g1 = completo_g1 + combinadas_g1 + semestrales_g1 + validar_g1
+    st.caption(
+        f"Distribución del Grupo 1: {completo_g1:,} + {combinadas_g1:,} + "
+        f"{semestrales_g1:,} + {validar_g1:,} por validar = **{suma_g1:,} estudiantes**."
+    )
+
+    # -------------------------
+    # GRUPO 2
+    # -------------------------
+    total_g2 = int(resumen.get("cuatro_a_seis", 0) or 0)
+    con_inter_g2 = int(resumen.get("cuatro_a_seis_con_intersemestral", 0) or 0)
+    rescate_g2 = int(resumen.get("rescate_intersemestral_posible", 0) or 0)
+    parcial_g2 = int(resumen.get("avance_intersemestral_parcial", 0) or 0)
+    otra_ruta_g2 = int(resumen.get("sin_oportunidad_intersemestral", 0) or 0)
+    validar_g2 = int(resumen.get("validar_porcentaje_4a6", 0) or 0)
+
+    st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
+    st.markdown("#### 3. Grupo 2 — Estudiantes que adeudan de 4 a 6 módulos")
+    st.caption(
+        "Estos estudiantes no cumplen todavía el límite académico de reinscripción. "
+        "El objetivo es saber quién puede quedar con 3 módulos y quién necesita otra estrategia."
+    )
+
+    _render_cards_resumen([
+        {
+            "titulo": "Necesitan regularizarse antes de reinscribirse",
+            "valor": f"{total_g2:,}",
+            "detalle": "Adeudan de 4 a 6 módulos y requieren seguimiento individual.",
+            "fundamento": "Artículos 73 y 75.",
+            "semaforo": "amarillo",
+            "etiqueta_semaforo": "Total del Grupo 2",
+        }
+    ])
+
+    st.info(
+        f"**{con_inter_g2:,} de {total_g2:,} estudiantes pueden presentar al menos un módulo en intersemestral.** "
+        "El resultado depende de cuántos módulos necesitan acreditar para quedar con un máximo de 3."
+    )
+
+    rutas_g2 = [
+        {
+            "titulo": "Pueden quedar con 3 módulos",
+            "valor": f"{rescate_g2:,}",
+            "detalle": "Tienen suficientes módulos intersemestrales; si acreditan los necesarios, podrían solicitar reinscripción.",
+            "fundamento": "Artículos 73, 75, 96, 97 y 98.",
+            "semaforo": "verde",
+            "etiqueta_semaforo": "Oportunidad prioritaria",
+        },
+        {
+            "titulo": "Solo pueden reducir parcialmente el adeudo",
+            "valor": f"{parcial_g2:,}",
+            "detalle": "Pueden acreditar algunos módulos, pero todavía quedarían con más de 3.",
+            "fundamento": "Requieren un plan complementario.",
+            "semaforo": "amarillo",
+            "etiqueta_semaforo": "Avance parcial",
+        },
+        {
+            "titulo": "Necesitan otra ruta de regularización",
+            "valor": f"{otra_ruta_g2:,}",
+            "detalle": "No tienen módulos elegibles para intersemestral con la información disponible.",
+            "fundamento": "Artículos 75, 96, 97 y 99.",
+            "semaforo": "rojo",
+            "etiqueta_semaforo": "Atención prioritaria",
+        },
+    ]
+    if validar_g2 > 0:
+        rutas_g2.append({
+            "titulo": "Información pendiente de revisar",
+            "valor": f"{validar_g2:,}",
+            "detalle": "Faltan porcentajes que podrían cambiar la oportunidad de recuperación.",
+            "fundamento": "Validar antes de descartar la ruta intersemestral.",
+            "semaforo": "rojo",
+            "etiqueta_semaforo": "Validación urgente",
+        })
+    _render_cards_resumen(rutas_g2)
+
+    suma_g2 = rescate_g2 + parcial_g2 + otra_ruta_g2 + validar_g2
+    st.caption(
+        f"Distribución del Grupo 2: {rescate_g2:,} + {parcial_g2:,} + "
+        f"{otra_ruta_g2:,} + {validar_g2:,} por validar = **{suma_g2:,} estudiantes**."
+    )
+
+def render_fundamento_normativo():
+    """Explica la norma y la regla operativa de rescate utilizada por el tablero."""
+    st.markdown("#### Fundamento normativo aplicado")
+    st.markdown(
+        """
+- **Artículo 4:** define como estudiante irregular a quien, al concluir el periodo semestral, adeuda uno o más módulos.
+- **Artículo 68, fracción III:** para la reinscripción ordinaria, la persona estudiante no debe adeudar más de tres módulos.
+- **Artículos 96 y 97:** distinguen la regularización intersemestral para módulos con al menos 56% en el Modelo Académico 2023 y la regularización semestral para módulos con menos de 56%.
+- **Artículo 98:** permite tomar Asesorías Complementarias Intersemestrales hasta por tres módulos.
+- **Artículo 99:** permite tomar Asesorías Complementarias Semestrales hasta por tres módulos durante un periodo semestral.
+- **Artículo 73:** reconoce tres tipos de baja: temporal, parcial y definitiva.
+- **Artículo 75:** establece la baja parcial cuando se acumulan más de tres y hasta seis módulos no acreditados; también dispone que la persona puede regularizarse mediante asesorías complementarias y/o certificación CONALEP ASCA. Con más de seis módulos no es candidata a reinscripción hasta reducir el adeudo a un máximo de tres.
+- **Artículos 100 a 103:** fundamentan el seguimiento permanente a estudiantes en riesgo de reprobación o abandono escolar.
+        """
+    )
+
+    st.markdown("#### Regla operativa de rescate para 4 a 6 módulos")
+    st.code(
+        """módulos necesarios para quedar con 3 = módulos no competentes - 3
+módulos intersemestrales programables = mínimo(módulos con pAlcanzado >= 56, 3)
+
+Si programables >= necesarios:
+    Rescate intersemestral posible
+Si programables > 0 pero programables < necesarios:
+    Avance intersemestral parcial
+Si programables == 0:
+    Sin oportunidad intersemestral inmediata""",
+        language="text",
+    )
+    st.info(
+        "Las etiquetas **Rescate intersemestral posible** y **Avance intersemestral parcial** son clasificaciones "
+        "operativas para apoyar la toma de decisiones. No significan que el estudiante ya acreditó ni sustituyen la "
+        "programación del plantel, la disponibilidad, la evaluación docente o las resoluciones del Comité Técnico Escolar."
+    )
+    st.warning(
+        "La condición de 7 o más módulos se muestra como **No candidato a reinscripción**, no como baja definitiva automática. "
+        "La baja definitiva se regula por causas diferentes."
+    )
+
+
+
+def render_seccion_normativa_plantel(plantel_sel, key_prefix="normativa"):
+    """
+    Renderiza la situación normativa sin alterar las demás funciones del tablero.
+
+    La relación de estudiantes presenta una vista sencilla por defecto. La
+    información técnica completa se conserva en un apartado desplegable.
+    """
+    if not plantel_sel:
+        st.info("Selecciona un plantel o la opción Todos para consultar la clasificación normativa.")
+        return
+
+    ambito_original = str(plantel_sel).strip()
+    es_estatal = ambito_original.lower() == "todos"
+    ambito_consulta = "Todos" if es_estatal else ambito_original
+    titulo_ambito = "ESTATAL" if es_estatal else ambito_original
+
+    mensaje_carga = (
+        "Calculando tarjetas normativas estatales..."
+        if es_estatal
+        else f"Calculando tarjetas normativas de {ambito_original}..."
+    )
+    with st.spinner(mensaje_carga):
+        df_estudiantes = obtener_reporte_normativo_plantel(ambito_consulta)
+
+    if df_estudiantes is None or df_estudiantes.empty:
+        st.info(
+            "No hay registros estatales de estudiantes no competentes."
+            if es_estatal
+            else f"No hay registros de estudiantes no competentes para **{ambito_original}**."
+        )
+        return
+
+    resumen = construir_resumen_normativo(df_estudiantes)
+
+    st.markdown("---")
+    st.subheader(f"📚 Situación normativa y rutas de regularización — {titulo_ambito}")
+    st.caption(
+        "El Grupo 1 reúne a quienes adeudan de 1 a 3 módulos. El Grupo 2 reúne a quienes adeudan de 4 a 6. "
+        "El porcentaje de cada módulo determina si corresponde asesoría intersemestral, semestral o validación."
+    )
+
+    tab_resumen, tab_relacion, tab_concentrado, tab_fundamento = st.tabs([
+        "1. Resumen normativo",
+        "2. Relación de estudiantes",
+        "3. Concentrado para imprimir",
+        "4. Fundamento normativo",
+    ])
+
+    with tab_resumen:
+        render_tarjetas_normativas(resumen)
+
+    with tab_relacion:
+        st.markdown("#### Consulta rápida de estudiantes")
+        st.caption(
+            "La tabla sencilla muestra únicamente los datos necesarios para ubicar al estudiante, conocer su "
+            "condición de reinscripción, identificar sus asesorías y definir la acción inmediata."
+        )
+        st.info(
+            "En la columna **Reinscripción**, la palabra “Sí” significa únicamente que cumple el límite académico "
+            "de adeudar como máximo 3 módulos. No sustituye los demás requisitos administrativos."
+        )
+
+        opcion = st.selectbox(
+            "¿Qué estudiantes deseas consultar?",
+            options=OPCIONES_REPORTE_NORMATIVO,
+            index=0,
+            key=f"{key_prefix}_{_safe_download_name(ambito_consulta)}_opcion_reporte",
+            help="Selecciona el grupo o la situación que deseas revisar.",
+        )
+
+        df_filtrado = filtrar_reporte_normativo(df_estudiantes, opcion)
+        df_sencillo = _columnas_reporte_sencillo(
+            df_filtrado,
+            mostrar_plantel=es_estatal,
+        )
+
+        etiqueta_relacion = "estatal" if es_estatal else f"del plantel {ambito_original}"
+        st.markdown(f"##### {opcion}: **{len(df_filtrado):,} estudiante(s)** — ámbito {etiqueta_relacion}")
+
+        if df_sencillo.empty:
+            st.info("No hay estudiantes para esta selección.")
+        else:
+            mostrar_dataframe_preview(df_sencillo, height=520)
+
+            with st.expander("🔎 Ver información técnica completa", expanded=False):
+                st.caption(
+                    "Este detalle conserva todos los campos de cálculo, clasificación normativa, módulos programables, "
+                    "resultado proyectado, docentes y explicación técnica."
+                )
+                df_tecnico = _columnas_reporte_normativo_presentacion(df_filtrado)
+                mostrar_dataframe_preview(df_tecnico, height=520)
+
+    with tab_concentrado:
+        st.markdown("#### Concentrado ejecutivo")
+        st.caption(
+            "Este apartado está preparado para seguimiento e impresión. Las categorías principales no se traslapan, "
+            "por lo que pueden sumarse y compararse sin duplicar estudiantes."
+        )
+
+        concentrado_plantel = construir_concentrado_por_plantel(df_estudiantes)
+        if not concentrado_plantel.empty:
+            st.markdown("##### Resumen por plantel")
+            st.dataframe(concentrado_plantel, use_container_width=True, height=330)
+
+        opcion_impresion = st.selectbox(
+            "¿Qué relación deseas incluir en el concentrado?",
+            options=OPCIONES_REPORTE_NORMATIVO,
+            index=0,
+            key=f"{key_prefix}_{_safe_download_name(ambito_consulta)}_opcion_impresion",
+        )
+        df_impresion = filtrar_reporte_normativo(df_estudiantes, opcion_impresion)
+        df_impresion_presentacion = _columnas_concentrado_imprimible(df_impresion)
+
+        st.markdown(f"##### Relación para seguimiento: **{len(df_impresion):,} estudiante(s)**")
+        if df_impresion_presentacion.empty:
+            st.info("No hay estudiantes para la relación seleccionada.")
+        else:
+            mostrar_dataframe_preview(df_impresion_presentacion, height=520)
+
+        nombre_ambito = _safe_download_name(ambito_consulta)
+        nombre_opcion = _safe_download_name(opcion_impresion)
+        excel_bytes = exportar_excel_reporte_normativo(
+            df_estudiantes,
+            ambito_consulta,
+            opcion_impresion,
+        )
+        html_bytes = exportar_html_reporte_normativo(
+            df_estudiantes,
+            ambito_consulta,
+            opcion_impresion,
+        )
+
+        col_excel, col_html = st.columns(2)
+        with col_excel:
+            st.download_button(
+                "⬇️ Descargar concentrado Excel",
+                data=excel_bytes,
+                file_name=f"concentrado_regularizacion_{nombre_ambito}_{nombre_opcion}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key=f"{key_prefix}_{nombre_ambito}_{nombre_opcion}_excel_normativo",
+                use_container_width=True,
+            )
+        with col_html:
+            st.download_button(
+                "🖨️ Descargar versión imprimible",
+                data=html_bytes,
+                file_name=f"concentrado_regularizacion_{nombre_ambito}_{nombre_opcion}.html",
+                mime="text/html",
+                key=f"{key_prefix}_{nombre_ambito}_{nombre_opcion}_html_normativo",
+                use_container_width=True,
+            )
+
+        st.caption(
+            "Abre el archivo HTML en un navegador y utiliza Ctrl+P para imprimirlo o guardarlo como PDF."
+        )
+
+    with tab_fundamento:
+        render_fundamento_normativo()
 
 def construir_figura_seguimiento_plantel(plantel_objetivo, show_title=True):
     seguimiento_plantel = obtener_seguimiento_plantel(plantel_objetivo)
@@ -2159,6 +3640,229 @@ def top_docentes_porcentaje_no_competencia(df_datos, plantel, top_n=5):
 # =========================
 # Exportadores
 # =========================
+
+
+def _resumen_normativo_dataframe(resumen):
+    return pd.DataFrame([
+        {"Indicador": "Total de estudiantes con módulos pendientes", "Cantidad": resumen.get("total_nc", 0)},
+        {"Indicador": "GRUPO 1: adeudan de 1 a 3 módulos", "Cantidad": resumen.get("uno_a_tres", 0)},
+        {"Indicador": "GRUPO 1: pueden solicitar reinscripción por número de módulos", "Cantidad": resumen.get("uno_a_tres_reinscripcion_ordinaria", 0)},
+        {"Indicador": "GRUPO 1: pueden presentar al menos una intersemestral", "Cantidad": resumen.get("uno_a_tres_con_intersemestral", 0)},
+        {"Indicador": "GRUPO 1: intersemestral completo", "Cantidad": resumen.get("intersemestral_completo", 0)},
+        {"Indicador": "GRUPO 1: asesorías combinadas", "Cantidad": resumen.get("irregular_mixta", 0)},
+        {"Indicador": "GRUPO 1: asesorías semestrales", "Cantidad": resumen.get("irregular_semestral", 0)},
+        {"Indicador": "GRUPO 1: información por validar", "Cantidad": resumen.get("validar_porcentaje_1a3", 0)},
+        {"Indicador": "GRUPO 2: adeudan de 4 a 6 módulos", "Cantidad": resumen.get("cuatro_a_seis", 0)},
+        {"Indicador": "GRUPO 2: pueden presentar al menos una intersemestral", "Cantidad": resumen.get("cuatro_a_seis_con_intersemestral", 0)},
+        {"Indicador": "GRUPO 2: pueden quedar con 3 módulos", "Cantidad": resumen.get("rescate_intersemestral_posible", 0)},
+        {"Indicador": "GRUPO 2: reducción parcial del adeudo", "Cantidad": resumen.get("avance_intersemestral_parcial", 0)},
+        {"Indicador": "GRUPO 2: necesitan otra ruta de regularización", "Cantidad": resumen.get("sin_oportunidad_intersemestral", 0)},
+        {"Indicador": "GRUPO 2: información por validar", "Cantidad": resumen.get("validar_porcentaje_4a6", 0)},
+        {"Indicador": "7 o más: deben regularizarse antes de reinscribirse", "Cantidad": resumen.get("no_reinscripcion", 0)},
+    ])
+
+def _ajustar_hoja_excel_normativa(writer, sheet_name, df, formato_titulo, formato_texto):
+    """Aplica formato legible y listo para impresión a una hoja del concentrado."""
+    worksheet = writer.sheets[sheet_name]
+    if df is None:
+        return
+
+    for idx, col in enumerate(df.columns):
+        try:
+            longitudes = df[col].astype(str).str.len()
+            max_len = max(len(str(col)), int(longitudes.quantile(0.90))) + 3 if len(longitudes) else len(str(col)) + 3
+        except Exception:
+            max_len = 20
+        width = min(max(max_len, 12), 55)
+        worksheet.set_column(idx, idx, width, formato_texto)
+
+    worksheet.set_row(0, 34, formato_titulo)
+    worksheet.freeze_panes(1, 0)
+    if len(df.columns) > 0:
+        worksheet.autofilter(0, 0, max(len(df), 1), len(df.columns) - 1)
+        worksheet.set_landscape()
+        worksheet.fit_to_pages(1, 0)
+        worksheet.repeat_rows(0)
+        worksheet.set_margins(left=0.25, right=0.25, top=0.5, bottom=0.5)
+
+
+
+def exportar_excel_reporte_normativo(df_estudiantes, plantel_sel, opcion):
+    """Genera un libro completo con relaciones sencillas y una hoja de criterios."""
+    resumen = construir_resumen_normativo(df_estudiantes)
+    df_resumen = _resumen_normativo_dataframe(resumen)
+    df_concentrado = construir_concentrado_por_plantel(df_estudiantes)
+
+    vistas = {
+        "RELACION_SELECCIONADA": filtrar_reporte_normativo(df_estudiantes, opcion),
+        "GRUPO_1_1_A_3": filtrar_reporte_normativo(df_estudiantes, "GRUPO 1 — Adeudan de 1 a 3 módulos"),
+        "G1_CON_INTERSEM": filtrar_reporte_normativo(df_estudiantes, "GRUPO 1 — Pueden presentar al menos una intersemestral"),
+        "G1_INTERSEM_TOTAL": filtrar_reporte_normativo(df_estudiantes, "GRUPO 1 — Todos sus módulos son intersemestrales"),
+        "G1_ASES_COMBINADAS": filtrar_reporte_normativo(df_estudiantes, "GRUPO 1 — Necesitan asesorías combinadas"),
+        "G1_ASES_SEMESTRALES": filtrar_reporte_normativo(df_estudiantes, "GRUPO 1 — Necesitan asesorías semestrales"),
+        "GRUPO_2_4_A_6": filtrar_reporte_normativo(df_estudiantes, "GRUPO 2 — Adeudan de 4 a 6 módulos"),
+        "G2_CON_INTERSEM": filtrar_reporte_normativo(df_estudiantes, "GRUPO 2 — Pueden presentar al menos una intersemestral"),
+        "G2_PUEDEN_QUEDAR_3": filtrar_reporte_normativo(df_estudiantes, "GRUPO 2 — Pueden quedar con 3 módulos"),
+        "G2_REDUCCION_PARCIAL": filtrar_reporte_normativo(df_estudiantes, "GRUPO 2 — Solo pueden reducir parcialmente el adeudo"),
+        "G2_OTRA_RUTA": filtrar_reporte_normativo(df_estudiantes, "GRUPO 2 — Necesitan otra ruta de regularización"),
+        "VALIDAR_DATOS": pd.concat([
+            filtrar_reporte_normativo(df_estudiantes, "GRUPO 1 — Información académica por validar"),
+            filtrar_reporte_normativo(df_estudiantes, "GRUPO 2 — Información académica por validar"),
+        ], ignore_index=True),
+        "SIETE_O_MAS": filtrar_reporte_normativo(df_estudiantes, "7 o más — Deben regularizarse antes de reinscribirse"),
+    }
+
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        df_resumen.to_excel(writer, index=False, sheet_name="RESUMEN")
+        df_concentrado.to_excel(writer, index=False, sheet_name="CONCENTRADO_PLANTELES")
+
+        workbook = writer.book
+        formato_titulo = workbook.add_format({
+            "bold": True, "font_color": "white", "bg_color": "#184C3B",
+            "align": "center", "valign": "vcenter", "border": 1,
+            "text_wrap": True,
+        })
+        formato_texto = workbook.add_format({
+            "text_wrap": True, "valign": "top", "border": 1,
+        })
+
+        _ajustar_hoja_excel_normativa(writer, "RESUMEN", df_resumen, formato_titulo, formato_texto)
+        _ajustar_hoja_excel_normativa(writer, "CONCENTRADO_PLANTELES", df_concentrado, formato_titulo, formato_texto)
+
+        for sheet_name, df_vista in vistas.items():
+            df_salida = _columnas_concentrado_imprimible(df_vista)
+            hoja = sheet_name[:31]
+            df_salida.to_excel(writer, index=False, sheet_name=hoja)
+            _ajustar_hoja_excel_normativa(writer, hoja, df_salida, formato_titulo, formato_texto)
+
+        criterios = pd.DataFrame([
+            {
+                "Grupo": "1 a 3 módulos",
+                "Lectura sencilla": "Cumple el límite académico de módulos para solicitar reinscripción.",
+                "Acción": "Asignar intersemestral, asesorías combinadas, semestral o validación según cada módulo.",
+            },
+            {
+                "Grupo": "4 a 6 módulos",
+                "Lectura sencilla": "No cumple todavía el límite académico de reinscripción.",
+                "Acción": "Determinar si puede quedar con 3, reducir parcialmente o necesita otra ruta.",
+            },
+            {
+                "Grupo": "7 o más módulos",
+                "Lectura sencilla": "Debe reducir el adeudo antes de solicitar reinscripción ordinaria.",
+                "Acción": "Preparar un plan integral de regularización.",
+            },
+            {
+                "Grupo": "Criterio por módulo",
+                "Lectura sencilla": f"pAlcanzado >= {UMBRAL_ASESORIA_INTERSEMESTRAL:.0f}%: intersemestral; menor: semestral.",
+                "Acción": "Los porcentajes vacíos deben validarse antes de asignar una ruta.",
+            },
+        ])
+        criterios.to_excel(writer, index=False, sheet_name="CRITERIOS")
+        _ajustar_hoja_excel_normativa(writer, "CRITERIOS", criterios, formato_titulo, formato_texto)
+
+        ws_resumen = writer.sheets["RESUMEN"]
+        fila_meta = len(df_resumen) + 2
+        ws_resumen.write(fila_meta, 0, "Ámbito seleccionado", formato_titulo)
+        ws_resumen.write(fila_meta, 1, str(plantel_sel), formato_texto)
+        ws_resumen.write(fila_meta + 1, 0, "Relación seleccionada", formato_titulo)
+        ws_resumen.write(fila_meta + 1, 1, str(opcion), formato_texto)
+        ws_resumen.write(fila_meta + 2, 0, "Fecha de generación", formato_titulo)
+        ws_resumen.write(fila_meta + 2, 1, datetime.now().strftime("%Y-%m-%d %H:%M"), formato_texto)
+
+    output.seek(0)
+    return output.getvalue()
+
+
+def exportar_html_reporte_normativo(df_estudiantes, plantel_sel, opcion):
+    """Genera un concentrado HTML horizontal listo para imprimir o guardar como PDF."""
+    resumen = construir_resumen_normativo(df_estudiantes)
+    df_filtrado = filtrar_reporte_normativo(df_estudiantes, opcion)
+    df_filtrado = _columnas_concentrado_imprimible(df_filtrado)
+    df_concentrado = construir_concentrado_por_plantel(df_estudiantes)
+
+    tarjetas = [
+        ("Grupo 1: 1 a 3", resumen.get("uno_a_tres", 0)),
+        ("G1 intersemestral completo", resumen.get("intersemestral_completo", 0)),
+        ("G1 asesorías combinadas", resumen.get("irregular_mixta", 0)),
+        ("G1 asesorías semestrales", resumen.get("irregular_semestral", 0)),
+        ("Grupo 2: 4 a 6", resumen.get("cuatro_a_seis", 0)),
+        ("G2 pueden quedar con 3", resumen.get("rescate_intersemestral_posible", 0)),
+        ("G2 reducción parcial", resumen.get("avance_intersemestral_parcial", 0)),
+        ("7 o más", resumen.get("no_reinscripcion", 0)),
+    ]
+
+    tarjetas_html = "".join(
+        f"<div class='card'><div class='label'>{escape(str(titulo))}</div>"
+        f"<div class='value'>{int(valor):,}</div></div>"
+        for titulo, valor in tarjetas
+    )
+
+    tabla_concentrado = (
+        "<p class='empty'>No hay información para el concentrado.</p>"
+        if df_concentrado.empty
+        else df_concentrado.to_html(index=False, border=0, escape=True)
+    )
+    tabla_estudiantes = (
+        "<p class='empty'>No hay estudiantes para la clasificación seleccionada.</p>"
+        if df_filtrado.empty
+        else df_filtrado.to_html(index=False, border=0, escape=True)
+    )
+
+    html = f"""
+    <html>
+      <head>
+        <meta charset="utf-8" />
+        <title>Concentrado de regularización - {escape(str(plantel_sel))}</title>
+        <style>
+          @page {{ size: landscape; margin: 8mm; }}
+          @media print {{
+            body {{ -webkit-print-color-adjust:exact; print-color-adjust:exact; }}
+            thead {{ display:table-header-group; }}
+            tr {{ page-break-inside:avoid; }}
+            .page-break {{ page-break-before:always; }}
+          }}
+          body {{ font-family:Arial,Helvetica,sans-serif; color:#1d2939; margin:20px; }}
+          h1 {{ color:#184C3B; margin-bottom:4px; }}
+          h2 {{ color:#344054; margin-top:20px; font-size:17px; }}
+          .meta {{ color:#667085; font-size:11px; margin-bottom:12px; }}
+          .rule {{ background:#E8F3EF; border-left:5px solid #006B54; padding:11px; margin:12px 0; font-size:11px; }}
+          .cards {{ display:grid; grid-template-columns:repeat(4,1fr); gap:8px; margin:14px 0 18px 0; }}
+          .card {{ border:1px solid #D0D5DD; border-radius:9px; padding:10px; background:#FFFFFF; }}
+          .label {{ color:#667085; font-size:10px; font-weight:bold; min-height:25px; }}
+          .value {{ color:#101828; font-size:22px; font-weight:800; margin-top:4px; }}
+          table {{ border-collapse:collapse; width:100%; font-size:8px; }}
+          th, td {{ border:1px solid #D0D5DD; padding:4px; vertical-align:top; word-break:break-word; }}
+          th {{ background:#184C3B; color:white; text-align:left; }}
+          tr:nth-child(even) td {{ background:#F9FAFB; }}
+          .empty {{ padding:16px; background:#F9FAFB; border:1px solid #EAECF0; }}
+          .footer {{ margin-top:14px; color:#667085; font-size:9px; }}
+        </style>
+      </head>
+      <body>
+        <h1>Concentrado de estudiantes con oportunidad de regularización</h1>
+        <div class="meta">
+          Ámbito: {escape(str(plantel_sel))} | Generado: {datetime.now().strftime('%Y-%m-%d %H:%M')} |
+          Relación: {escape(str(opcion))}
+        </div>
+        <div class="rule">
+          <strong>Cómo leer el reporte:</strong> el Grupo 1 reúne a quienes adeudan de 1 a 3 módulos y cumplen
+          el límite académico de módulos para solicitar reinscripción. El Grupo 2 reúne a quienes adeudan de 4 a 6;
+          en ellos se indica si pueden quedar con 3 módulos, si solo pueden reducir parcialmente el adeudo o si
+          necesitan otra ruta. La acreditación y la reinscripción deben confirmarse por las instancias correspondientes.
+        </div>
+        <div class="cards">{tarjetas_html}</div>
+        <h2>Concentrado por plantel</h2>
+        {tabla_concentrado}
+        <div class="page-break"></div>
+        <h2>{escape(str(opcion))}: {len(df_filtrado):,} estudiante(s)</h2>
+        {tabla_estudiantes}
+        <div class="footer">Abra este archivo en un navegador y use Ctrl+P para imprimir o guardar como PDF.</div>
+      </body>
+    </html>
+    """
+    return html.encode("utf-8")
+
 def exportar_excel(df, filename="seguimiento_filtrado.xlsx"):
     output = BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
@@ -2936,52 +4640,58 @@ def mostrar_indicadores_academicos():
     st.title(construir_titulo_indicadores())
     st.session_state["_indicadores_dataframe_widget_counter"] = 0
 
-    tabla = cargar_resumen()
-    df_matricula = cargar_matricula()
-
+    # Primero se identifica el tipo de usuario. Para administradores se difiere
+    # la carga pesada de Reprobacion/resumen hasta que se presione Aplicar filtros.
     is_admin = bool(st.session_state.get("administrador", False))
     plantel_usuario = st.session_state.get("plantel_usuario") or st.session_state.get("plantel")
     es_plantel = bool(plantel_usuario) and not is_admin
+
+    # La hoja Matricula es más ligera y permite poblar el filtro de planteles sin
+    # calcular todavía todo el resumen de no competencia.
+    df_matricula = cargar_matricula()
 
     permisos_codes = obtener_permisos_usuario_codigos()
     puede_enviar_email = (not es_plantel) and (PERM_SEND_EMAIL_CODE in permisos_codes)
 
     if not es_plantel:
         df_reprobacion = None
-        planteles_disponibles = sorted(tabla["Plantel"].dropna().astype(str).unique().tolist())
+
+        if df_matricula is not None and not df_matricula.empty and "Plantel" in df_matricula.columns:
+            planteles_disponibles = sorted(
+                df_matricula["Plantel"].dropna().astype(str).str.strip().loc[lambda s: s.ne("")].unique().tolist()
+            )
+        else:
+            # Respaldo ligero: catálogo de planteles. Solo si la hoja Matricula
+            # no contiene nombres válidos.
+            try:
+                df_catalogo_planteles = cargar_planteles_sheet()
+                col_plantel_catalogo = _find_col_like(df_catalogo_planteles, ["Plantel"])
+                planteles_disponibles = sorted(
+                    df_catalogo_planteles[col_plantel_catalogo]
+                    .dropna().astype(str).str.strip().loc[lambda s: s.ne("")].unique().tolist()
+                ) if col_plantel_catalogo else []
+            except Exception:
+                planteles_disponibles = []
+
         opciones_plantel = ["Todos"] + planteles_disponibles
 
         if "indicadores_admin_filtros_aplicados" not in st.session_state:
             st.session_state.indicadores_admin_filtros_aplicados = False
+        if "indicadores_admin_plantel_aplicado" not in st.session_state:
+            st.session_state.indicadores_admin_plantel_aplicado = None
+        if "indicadores_admin_vista_aplicada" not in st.session_state:
+            st.session_state.indicadores_admin_vista_aplicada = None
 
-        vista = st.radio(
+        vista_form = st.radio(
             "Visualización de la gráfica:",
             ["% NO competencia", "Total NO competentes", VISTA_COMPORTAMIENTO_ESTATAL],
             horizontal=True,
             key="indicadores_admin_vista_grafica",
         )
-        es_vista_estatal = vista == VISTA_COMPORTAMIENTO_ESTATAL
+        es_vista_estatal = vista_form == VISTA_COMPORTAMIENTO_ESTATAL
 
-        with st.form("filtros_indicadores_admin"):
-            if es_vista_estatal:
-                st.selectbox(
-                    "Selecciona un plantel",
-                    ["No aplica para comportamiento estatal"],
-                    index=0,
-                    disabled=True,
-                    key="indicadores_admin_plantel_estatal_bloqueado",
-                    help="En comportamiento estatal se toma exclusivamente la fila CONALEP Estado de México de la hoja Seguimiento.",
-                )
-                filtros_aplicados = st.form_submit_button("Aplicar filtros", disabled=True)
-                plantel_sel = "Todos"
-            else:
-                plantel_sel = st.selectbox(
-                    "Selecciona un plantel",
-                    opciones_plantel,
-                    key="indicadores_admin_plantel_sel",
-                )
-                filtros_aplicados = st.form_submit_button("Aplicar filtros")
-
+        # La vista de comportamiento estatal usa exclusivamente la hoja
+        # Seguimiento y conserva su comportamiento inmediato.
         if es_vista_estatal:
             st.markdown(f"### 📈 Comportamiento estatal — {SEGUIMIENTO_ESTATAL_NOMBRE}")
             if not mostrar_grafica_seguimiento_estatal(show_title=False, show_footer=True):
@@ -2991,8 +4701,34 @@ def mostrar_indicadores_academicos():
                 )
             return
 
+        with st.form("filtros_indicadores_admin"):
+            plantel_form = st.selectbox(
+                "Selecciona un plantel",
+                opciones_plantel,
+                key="indicadores_admin_plantel_sel",
+            )
+            filtros_aplicados = st.form_submit_button("Aplicar filtros")
+
         if filtros_aplicados:
             st.session_state.indicadores_admin_filtros_aplicados = True
+            st.session_state.indicadores_admin_plantel_aplicado = plantel_form
+            st.session_state.indicadores_admin_vista_aplicada = vista_form
+
+        if not st.session_state.get("indicadores_admin_filtros_aplicados", False):
+            st.info(
+                "Selecciona **Todos** o un plantel específico y presiona **Aplicar filtros**. "
+                "La gráfica, las tarjetas normativas y las tablas se cargarán únicamente después de confirmar el filtro."
+            )
+            return
+
+        plantel_sel = st.session_state.get("indicadores_admin_plantel_aplicado") or "Todos"
+        vista = st.session_state.get("indicadores_admin_vista_aplicada") or vista_form
+
+        st.caption(f"Filtro aplicado: **{plantel_sel}**. Para cambiarlo, selecciona otra opción y presiona Aplicar filtros.")
+
+        # Carga pesada diferida: se ejecuta solo después de Aplicar filtros.
+        with st.spinner("Cargando indicadores académicos del filtro seleccionado..."):
+            tabla = cargar_resumen()
 
         if plantel_sel == "Todos":
             tabla_vista = tabla.copy()
@@ -3065,80 +4801,100 @@ def mostrar_indicadores_academicos():
                 if not mostrar_grafica_seguimiento_plantel(plantel_sel, show_title=False, show_footer=True):
                     st.info(f"ℹ️ No hay datos de seguimiento semanal para **{plantel_sel}** en la hoja SEGUIMIENTO.")
 
-            st.subheader("📋 Estudiantes agrupados por el número de módulos NO competentes")
-            tabla_con_total = agregar_fila_total(tabla_vista)
-            st.dataframe(tabla_con_total, use_container_width=True)
-            render_botones_descarga_detalle(
-                tabla_con_total,
+            with st.expander(
+                "📋 Distribución de estudiantes por cantidad de módulos NO competentes",
+                expanded=False,
+            ):
+                st.caption(
+                    "Consulta la distribución general por número de módulos. El renglón TOTAL conserva el mismo cálculo del tablero."
+                )
+                tabla_con_total = agregar_fila_total(tabla_vista)
+                st.dataframe(tabla_con_total, use_container_width=True)
+                render_botones_descarga_detalle(
+                    tabla_con_total,
+                    plantel_sel,
+                    tipo="agrupados_no_competentes",
+                    key_prefix="admin_agrupado"
+                )
+
+                total_general = int(tabla_vista["Total estudiantes no competentes"].sum())
+                total_matricula = float(tabla_vista["matriculaTotal"].sum())
+                porcentaje_promedio = round((total_general / total_matricula) * 100, 2) if total_matricula else 0
+                st.markdown(f"#### 👥 Total general de estudiantes NO competentes: **{total_general:,}**")
+                st.markdown(f"#### 📊 Porcentaje respecto a la matrícula: **{porcentaje_promedio}%**")
+
+            # La misma sección se usa para un plantel específico y para el
+            # consolidado ESTATAL cuando el filtro se encuentra en Todos.
+            render_seccion_normativa_plantel(
                 plantel_sel,
-                tipo="agrupados_no_competentes",
-                key_prefix="admin_agrupado"
+                key_prefix="admin_normativa"
             )
 
-            total_general = int(tabla_vista["Total estudiantes no competentes"].sum())
-            total_matricula = float(tabla_vista["matriculaTotal"].sum())
-            porcentaje_promedio = round((total_general / total_matricula) * 100, 2) if total_matricula else 0
-            st.markdown(f"### 👥 Total general de estudiantes NO competentes: **{total_general:,}**")
-            st.markdown(f"### 📊 Porcentaje respecto a la matrícula: **{porcentaje_promedio}%**")
-
         st.markdown("---")
+        st.markdown("## 🔎 Consulta detallada")
+        st.caption(
+            "Abre únicamente el apartado que necesites. Los cálculos, filtros y tablas se conservan sin cambios."
+        )
 
         if plantel_sel == "Todos":
-            if not st.session_state.get("indicadores_admin_filtros_aplicados", False):
-                st.markdown("### ⚠️ Detalle de estudiantes con sus respectivos módulos NO competentes. – Todos")
-                st.info("Presiona **Aplicar filtros** para cargar el detalle general de todos los planteles.")
-            else:
-                with st.spinner("Cargando detalle general de estudiantes NO competentes..."):
-                    df_print = preparar_detalle_no_competentes_presentacion(obtener_detalle_no_competentes("Todos"))
-
-                total_nc_admin = (
-                    df_print["matricula"].nunique()
-                    if not df_print.empty and "matricula" in df_print.columns
-                    else len(df_print)
-                )
-
-                st.markdown("### ⚠️ Detalle de estudiantes con sus respectivos módulos NO competentes. – Todos")
-                st.caption(f"Total de estudiantes NO competentes: {total_nc_admin:,}")
-                if df_print.empty:
-                    st.info("ℹ️ No hay registros de NO competentes para **Todos**.")
+            with st.expander("⚠️ Detalle general de estudiantes NO competentes", expanded=False):
+                if not st.session_state.get("indicadores_admin_filtros_aplicados", False):
+                    st.info("Presiona **Aplicar filtros** para cargar el detalle general de todos los planteles.")
                 else:
-                    mostrar_dataframe_preview(df_print)
-                    render_botones_descarga_detalle(
-                        df_print,
-                        "Todos",
-                        tipo="no_competentes",
-                        key_prefix="admin_todos_nc"
+                    with st.spinner("Cargando detalle general de estudiantes NO competentes..."):
+                        df_print = preparar_detalle_no_competentes_presentacion(obtener_detalle_no_competentes("Todos"))
+
+                    total_nc_admin = (
+                        df_print["matricula"].nunique()
+                        if not df_print.empty and "matricula" in df_print.columns
+                        else len(df_print)
                     )
 
-            if not st.session_state.get("indicadores_admin_filtros_aplicados", False):
-                st.markdown("### 🚨 Estudiantes sin registro de Calificaciones (Detalle) — Todos")
-                st.info("Presiona **Aplicar filtros** para cargar el detalle general de estudiantes sin registro.")
-            else:
-                with st.spinner("Cargando estudiantes sin registro de calificaciones..."):
-                    df_sin_registro = obtener_sin_registro_calificaciones("Todos")
+                    st.caption(f"Total de estudiantes NO competentes: {total_nc_admin:,}")
+                    if df_print.empty:
+                        st.info("ℹ️ No hay registros de NO competentes para **Todos**.")
+                    else:
+                        mostrar_dataframe_preview(df_print)
+                        render_botones_descarga_detalle(
+                            df_print,
+                            "Todos",
+                            tipo="no_competentes",
+                            key_prefix="admin_todos_nc"
+                        )
 
-                total_sin_registro = (
-                    df_sin_registro["matricula"].nunique()
-                    if not df_sin_registro.empty and "matricula" in df_sin_registro.columns
-                    else len(df_sin_registro)
-                )
-
-                st.markdown(f"### 🚨 Estudiantes sin registro de Calificaciones {total_sin_registro} (Detalle) — Todos")
-                if df_sin_registro.empty:
-                    st.info("ℹ️ No hay registros sin evaluación para **Todos**.")
+            with st.expander("🚨 Estudiantes sin registro de calificaciones — Todos", expanded=False):
+                if not st.session_state.get("indicadores_admin_filtros_aplicados", False):
+                    st.info("Presiona **Aplicar filtros** para cargar el detalle general de estudiantes sin registro.")
                 else:
-                    mostrar_dataframe_preview(df_sin_registro)
-                    render_botones_descarga_detalle(
-                        df_sin_registro,
-                        "Todos",
-                        tipo="sin_registro_calificaciones",
-                        key_prefix="admin_todos_sr"
+                    with st.spinner("Cargando estudiantes sin registro de calificaciones..."):
+                        df_sin_registro = obtener_sin_registro_calificaciones("Todos")
+
+                    total_sin_registro = (
+                        df_sin_registro["matricula"].nunique()
+                        if not df_sin_registro.empty and "matricula" in df_sin_registro.columns
+                        else len(df_sin_registro)
                     )
 
-                render_seccion_impresion_por_modulos(
-                    "Todos",
-                    key_prefix="admin_todos_modulos"
-                )
+                    st.caption(f"Total de estudiantes sin registro: {total_sin_registro:,}")
+                    if df_sin_registro.empty:
+                        st.info("ℹ️ No hay registros sin evaluación para **Todos**.")
+                    else:
+                        mostrar_dataframe_preview(df_sin_registro)
+                        render_botones_descarga_detalle(
+                            df_sin_registro,
+                            "Todos",
+                            tipo="sin_registro_calificaciones",
+                            key_prefix="admin_todos_sr"
+                        )
+
+            with st.expander("🧭 Identificación por cantidad de módulos — Todos", expanded=False):
+                if not st.session_state.get("indicadores_admin_filtros_aplicados", False):
+                    st.info("Presiona **Aplicar filtros** para habilitar esta consulta.")
+                else:
+                    render_seccion_impresion_por_modulos(
+                        "Todos",
+                        key_prefix="admin_todos_modulos"
+                    )
         else:
             df_print = preparar_detalle_no_competentes_presentacion(obtener_detalle_no_competentes(plantel_sel))
 
@@ -3148,18 +4904,18 @@ def mostrar_indicadores_academicos():
             else:
                 total_nc_admin = df_print["matricula"].nunique() if "matricula" in df_print.columns else len(df_print)
 
-            st.markdown(f"### ⚠️ Detalle de estudiantes con sus respectivos módulos NO competentes. – {plantel_sel}")
-            st.caption(f"Total de estudiantes NO competentes: {total_nc_admin:,}")
-            if df_print.empty:
-                st.info(f"ℹ️ No hay registros de NO competentes para **{plantel_sel}**.")
-            else:
-                mostrar_dataframe_preview(df_print)
-                render_botones_descarga_detalle(
-                    df_print,
-                    plantel_sel,
-                    tipo="no_competentes",
-                    key_prefix="admin_plantel_nc"
-                )
+            with st.expander(f"⚠️ Detalle de estudiantes NO competentes — {plantel_sel}", expanded=False):
+                st.caption(f"Total de estudiantes NO competentes: {total_nc_admin:,}")
+                if df_print.empty:
+                    st.info(f"ℹ️ No hay registros de NO competentes para **{plantel_sel}**.")
+                else:
+                    mostrar_dataframe_preview(df_print)
+                    render_botones_descarga_detalle(
+                        df_print,
+                        plantel_sel,
+                        tipo="no_competentes",
+                        key_prefix="admin_plantel_nc"
+                    )
 
             df_sin_registro = obtener_sin_registro_calificaciones(plantel_sel)
             if df_sin_registro.empty:
@@ -3171,22 +4927,26 @@ def mostrar_indicadores_academicos():
                     else len(df_sin_registro)
                 )
 
-            st.markdown(f"### 🚨 Estudiantes sin registro de Calificaciones {total_sin_registro} (Detalle) — {plantel_sel}")
-            if df_sin_registro.empty:
-                st.info(f"ℹ️ No hay registros sin evaluación para **{plantel_sel}**.")
-            else:
-                mostrar_dataframe_preview(df_sin_registro)
-                render_botones_descarga_detalle(
-                    df_sin_registro,
-                    plantel_sel,
-                    tipo="sin_registro_calificaciones",
-                    key_prefix="admin_plantel_sr"
-                )
+            with st.expander(
+                f"🚨 Estudiantes sin registro de calificaciones ({total_sin_registro}) — {plantel_sel}",
+                expanded=False,
+            ):
+                if df_sin_registro.empty:
+                    st.info(f"ℹ️ No hay registros sin evaluación para **{plantel_sel}**.")
+                else:
+                    mostrar_dataframe_preview(df_sin_registro)
+                    render_botones_descarga_detalle(
+                        df_sin_registro,
+                        plantel_sel,
+                        tipo="sin_registro_calificaciones",
+                        key_prefix="admin_plantel_sr"
+                    )
 
-            render_seccion_impresion_por_modulos(
-                plantel_sel,
-                key_prefix="admin_plantel_modulos"
-            )
+            with st.expander(f"🧭 Identificación por cantidad de módulos — {plantel_sel}", expanded=False):
+                render_seccion_impresion_por_modulos(
+                    plantel_sel,
+                    key_prefix="admin_plantel_modulos"
+                )
 
         if puede_enviar_email:
             if "confirm_send_open" not in st.session_state:
@@ -3297,6 +5057,9 @@ def mostrar_indicadores_academicos():
             st.error("No se detectó el plantel del usuario en la sesión (plantel_usuario).")
             return
 
+        # El usuario de plantel tiene un ámbito fijo; aquí sí se carga el resumen
+        # directamente porque no requiere confirmar un filtro administrativo.
+        tabla = cargar_resumen()
         tabla_filtrada = tabla[tabla["Plantel"] == plantel_usuario].copy()
 
         if tabla_filtrada.empty:
@@ -3343,34 +5106,48 @@ def mostrar_indicadores_academicos():
             },
         ])
 
-        st.subheader(f"📋 Estudiantes agrupados por el número de módulos NO competentes – {plantel_usuario}")
-        st.dataframe(tabla_filtrada, use_container_width=True)
+        render_seccion_normativa_plantel(
+            plantel_usuario,
+            key_prefix="plantel_normativa"
+        )
+
+        st.markdown("---")
+        st.markdown("## 🔎 Consulta detallada del plantel")
+        st.caption("Abre el apartado que necesites para evitar mostrar todas las tablas al mismo tiempo.")
+
+        with st.expander(
+            f"📋 Distribución por cantidad de módulos NO competentes — {plantel_usuario}",
+            expanded=False,
+        ):
+            st.dataframe(tabla_filtrada, use_container_width=True)
 
         df_exportar = preparar_detalle_no_competentes_presentacion(obtener_detalle_no_competentes(plantel_usuario))
 
-        st.subheader(f"⚠️ Detalle de estudiantes con sus respectivos módulos NO competentes. – {plantel_usuario}")
-        st.caption(f"Total de estudiantes NO competentes: {total_nc:,}")
-        if df_exportar.empty:
-            st.info("ℹ️ No hay registros de NO competentes para este plantel.")
-        else:
-            estudiantes_unicos_nc = (
-                df_exportar["matricula"].nunique()
-                if "matricula" in df_exportar.columns
-                else len(df_exportar)
-            )
-            st.caption(
-                f"Mostrando el detalle completo del plantel: "
-                f"{estudiantes_unicos_nc:,} estudiante(s) único(s), "
-                f"{len(df_exportar):,} registro(s) académico(s)."
-            )
-            mostrar_dataframe_preview(df_exportar)
-            render_botones_descarga_detalle(
-                df_exportar,
-                plantel_usuario,
-                tipo="no_competentes",
-                key_prefix="plantel_nc"
-            )
-
+        with st.expander(
+            f"⚠️ Detalle de estudiantes NO competentes — {plantel_usuario}",
+            expanded=False,
+        ):
+            st.caption(f"Total de estudiantes NO competentes: {total_nc:,}")
+            if df_exportar.empty:
+                st.info("ℹ️ No hay registros de NO competentes para este plantel.")
+            else:
+                estudiantes_unicos_nc = (
+                    df_exportar["matricula"].nunique()
+                    if "matricula" in df_exportar.columns
+                    else len(df_exportar)
+                )
+                st.caption(
+                    f"Mostrando el detalle completo del plantel: "
+                    f"{estudiantes_unicos_nc:,} estudiante(s) único(s), "
+                    f"{len(df_exportar):,} registro(s) académico(s)."
+                )
+                mostrar_dataframe_preview(df_exportar)
+                render_botones_descarga_detalle(
+                    df_exportar,
+                    plantel_usuario,
+                    tipo="no_competentes",
+                    key_prefix="plantel_nc"
+                )
 
         df_sin_registro_plantel = obtener_sin_registro_calificaciones(plantel_usuario)
 
@@ -3383,31 +5160,37 @@ def mostrar_indicadores_academicos():
                 else len(df_sin_registro_plantel)
             )
 
-        st.subheader(f"🚨 Estudiantes sin registro de Calificaciones {total_sin_registro_plantel} (Detalle)")
+        with st.expander(
+            f"🚨 Estudiantes sin registro de calificaciones ({total_sin_registro_plantel})",
+            expanded=False,
+        ):
+            if df_sin_registro_plantel.empty:
+                st.info("ℹ️ No hay registros sin evaluación para este plantel.")
+            else:
+                estudiantes_unicos_sr = (
+                    df_sin_registro_plantel["matricula"].nunique()
+                    if "matricula" in df_sin_registro_plantel.columns
+                    else len(df_sin_registro_plantel)
+                )
+                st.caption(
+                    f"Mostrando el detalle completo del plantel: "
+                    f"{estudiantes_unicos_sr:,} estudiante(s) único(s), "
+                    f"{len(df_sin_registro_plantel):,} registro(s) académico(s)."
+                )
+                mostrar_dataframe_preview(df_sin_registro_plantel)
+                render_botones_descarga_detalle(
+                    df_sin_registro_plantel,
+                    plantel_usuario,
+                    tipo="sin_registro_calificaciones",
+                    key_prefix="plantel_sr"
+                )
 
-        if df_sin_registro_plantel.empty:
-            st.info("ℹ️ No hay registros sin evaluación para este plantel.")
-        else:
-            estudiantes_unicos_sr = (
-                df_sin_registro_plantel["matricula"].nunique()
-                if "matricula" in df_sin_registro_plantel.columns
-                else len(df_sin_registro_plantel)
-            )
-            st.caption(
-                f"Mostrando el detalle completo del plantel: "
-                f"{estudiantes_unicos_sr:,} estudiante(s) único(s), "
-                f"{len(df_sin_registro_plantel):,} registro(s) académico(s)."
-            )
-            mostrar_dataframe_preview(df_sin_registro_plantel)
-            render_botones_descarga_detalle(
-                df_sin_registro_plantel,
+        with st.expander(
+            f"🧭 Identificación por cantidad de módulos — {plantel_usuario}",
+            expanded=False,
+        ):
+            render_seccion_impresion_por_modulos(
                 plantel_usuario,
-                tipo="sin_registro_calificaciones",
-                key_prefix="plantel_sr"
+                key_prefix="plantel_modulos"
             )
-
-        render_seccion_impresion_por_modulos(
-            plantel_usuario,
-            key_prefix="plantel_modulos"
-        )
 
