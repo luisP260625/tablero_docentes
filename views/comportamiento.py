@@ -782,6 +782,282 @@ def _preparar_semcaptura_docente(
 # ==========================================================
 # Preparar Reprobacion
 # ==========================================================
+COL_OTROS_MODULOS_ADEUDADOS = "Otros módulos que adeuda"
+
+
+def _normalizar_texto_expr_pl(
+    columna: str,
+    *,
+    alias: str,
+    quitar_decimal_cero: bool = False,
+) -> pl.Expr:
+    """
+    Normaliza texto usando expresiones nativas de Polars.
+
+    A diferencia de map_elements(), esta transformación no ejecuta una
+    función de Python por cada celda y por ello es mucho más rápida en
+    conjuntos de datos grandes.
+    """
+    expr = (
+        pl.col(columna)
+        .cast(pl.Utf8, strict=False)
+        .fill_null("")
+        .str.strip_chars()
+        .str.to_uppercase()
+        .str.replace_all(r"\s+", " ")
+    )
+
+    # Normalización de caracteres comunes en español.
+    reemplazos = [
+        ("Á", "A"),
+        ("É", "E"),
+        ("Í", "I"),
+        ("Ó", "O"),
+        ("Ú", "U"),
+        ("Ü", "U"),
+    ]
+
+    for origen, destino in reemplazos:
+        expr = expr.str.replace_all(origen, destino)
+
+    if quitar_decimal_cero:
+        expr = expr.str.replace(r"\.0$", "")
+
+    return expr.alias(alias)
+
+
+def _agregar_otros_modulos_adeudados_pl(
+    reprobacion_pl: pl.DataFrame,
+    df_rep_docente: pl.DataFrame,
+    *,
+    sel_plantel: Optional[str],
+    semana_actual: Optional[int],
+) -> pl.DataFrame:
+    """
+    Agrega la cantidad de módulos adicionales que adeuda cada estudiante.
+
+    El cálculo se limita a:
+    - el mismo plantel;
+    - la misma semana;
+    - únicamente las matrículas visibles para el docente consultado.
+
+    Esta versión evita map_elements() sobre toda la hoja Reprobacion.
+    Las operaciones se ejecutan con expresiones nativas y vectorizadas
+    de Polars para reducir de manera importante el tiempo y la memoria.
+    """
+    if df_rep_docente is None or df_rep_docente.is_empty():
+        return df_rep_docente
+
+    if reprobacion_pl is None or reprobacion_pl.is_empty():
+        return df_rep_docente.with_columns(
+            pl.lit(None).cast(pl.Int64).alias(COL_OTROS_MODULOS_ADEUDADOS)
+        )
+
+    col_matricula_real = _find_col_pl(
+        reprobacion_pl,
+        ["matricula", "matrícula", "MATRICULA", "MATRÍCULA"],
+    )
+    col_modulo_real = _find_col_pl(
+        reprobacion_pl,
+        [COL_MODULO, "Modulo", "Módulo", "MODULO"],
+    )
+
+    if not col_matricula_real or not col_modulo_real:
+        return df_rep_docente.with_columns(
+            pl.lit(None).cast(pl.Int64).alias(COL_OTROS_MODULOS_ADEUDADOS)
+        )
+
+    # Evita conflicto si la entrada ya trae la columna calculada.
+    if COL_OTROS_MODULOS_ADEUDADOS in df_rep_docente.columns:
+        df_rep_docente = df_rep_docente.drop(COL_OTROS_MODULOS_ADEUDADOS)
+
+    # ------------------------------------------------------
+    # 1) Matrículas realmente visibles para el docente.
+    # ------------------------------------------------------
+    matriculas_objetivo = (
+        df_rep_docente
+        .select(
+            _normalizar_texto_expr_pl(
+                col_matricula_real,
+                alias="_MATRICULA_NORM",
+                quitar_decimal_cero=True,
+            )
+        )
+        .filter(pl.col("_MATRICULA_NORM") != "")
+        .unique()
+    )
+
+    if matriculas_objetivo.is_empty():
+        return df_rep_docente.with_columns(
+            pl.lit(0).cast(pl.Int64).alias(COL_OTROS_MODULOS_ADEUDADOS)
+        )
+
+    # ------------------------------------------------------
+    # 2) Universo: mismo plantel y misma semana.
+    # ------------------------------------------------------
+    universo = reprobacion_pl
+
+    col_plantel_real = _find_col_pl(universo, [COL_PLANTEL, "Plantel"])
+
+    if col_plantel_real and sel_plantel:
+        plantel_objetivo = _norm_value(sel_plantel)
+
+        universo = universo.filter(
+            _normalizar_texto_expr_pl(
+                col_plantel_real,
+                alias="_PLANTEL_NORM",
+            )
+            == plantel_objetivo
+        )
+
+    col_semana_real = _find_col_pl(universo, [COL_SEMANA, "Semana"])
+
+    if col_semana_real and semana_actual is not None:
+        universo = universo.filter(
+            pl.col(col_semana_real)
+            .cast(pl.Int64, strict=False)
+            == int(semana_actual)
+        )
+
+    if universo.is_empty():
+        return df_rep_docente.with_columns(
+            pl.lit(0).cast(pl.Int64).alias(COL_OTROS_MODULOS_ADEUDADOS)
+        )
+
+    # ------------------------------------------------------
+    # 3) Normalizar solo las dos columnas necesarias y conservar
+    #    únicamente las matrículas del docente consultado.
+    # ------------------------------------------------------
+    universo_objetivo = (
+        universo
+        .select(
+            _normalizar_texto_expr_pl(
+                col_matricula_real,
+                alias="_MATRICULA_NORM",
+                quitar_decimal_cero=True,
+            ),
+            _normalizar_texto_expr_pl(
+                col_modulo_real,
+                alias="_MODULO_NORM",
+            ),
+        )
+        .filter(
+            (pl.col("_MATRICULA_NORM") != "")
+            & (pl.col("_MODULO_NORM") != "")
+        )
+        .join(
+            matriculas_objetivo,
+            on="_MATRICULA_NORM",
+            how="semi",
+        )
+        .unique(["_MATRICULA_NORM", "_MODULO_NORM"])
+    )
+
+    if universo_objetivo.is_empty():
+        return df_rep_docente.with_columns(
+            pl.lit(0).cast(pl.Int64).alias(COL_OTROS_MODULOS_ADEUDADOS)
+        )
+
+    # ------------------------------------------------------
+    # 4) Total de módulos únicos adeudados por estudiante.
+    # ------------------------------------------------------
+    total_por_estudiante = (
+        universo_objetivo
+        .group_by("_MATRICULA_NORM")
+        .agg(
+            pl.len()
+            .cast(pl.Int64)
+            .alias("_TOTAL_MODULOS_ADEUDADOS")
+        )
+    )
+
+    # ------------------------------------------------------
+    # 5) Módulos únicos adeudados con el docente consultado.
+    # ------------------------------------------------------
+    modulos_con_docente = (
+        df_rep_docente
+        .select(
+            _normalizar_texto_expr_pl(
+                col_matricula_real,
+                alias="_MATRICULA_NORM",
+                quitar_decimal_cero=True,
+            ),
+            _normalizar_texto_expr_pl(
+                col_modulo_real,
+                alias="_MODULO_NORM",
+            ),
+        )
+        .filter(
+            (pl.col("_MATRICULA_NORM") != "")
+            & (pl.col("_MODULO_NORM") != "")
+        )
+        .unique(["_MATRICULA_NORM", "_MODULO_NORM"])
+        .group_by("_MATRICULA_NORM")
+        .agg(
+            pl.len()
+            .cast(pl.Int64)
+            .alias("_MODULOS_CON_DOCENTE")
+        )
+    )
+
+    conteo = (
+        total_por_estudiante
+        .join(
+            modulos_con_docente,
+            on="_MATRICULA_NORM",
+            how="left",
+        )
+        .with_columns(
+            pl.col("_MODULOS_CON_DOCENTE")
+            .fill_null(0)
+            .cast(pl.Int64)
+        )
+        .with_columns(
+            pl.when(
+                (
+                    pl.col("_TOTAL_MODULOS_ADEUDADOS")
+                    - pl.col("_MODULOS_CON_DOCENTE")
+                ) > 0
+            )
+            .then(
+                pl.col("_TOTAL_MODULOS_ADEUDADOS")
+                - pl.col("_MODULOS_CON_DOCENTE")
+            )
+            .otherwise(0)
+            .cast(pl.Int64)
+            .alias(COL_OTROS_MODULOS_ADEUDADOS)
+        )
+        .select(
+            "_MATRICULA_NORM",
+            COL_OTROS_MODULOS_ADEUDADOS,
+        )
+    )
+
+    # ------------------------------------------------------
+    # 6) Agregar el resultado a cada fila visible.
+    # ------------------------------------------------------
+    return (
+        df_rep_docente
+        .with_columns(
+            _normalizar_texto_expr_pl(
+                col_matricula_real,
+                alias="_MATRICULA_NORM",
+                quitar_decimal_cero=True,
+            )
+        )
+        .join(
+            conteo,
+            on="_MATRICULA_NORM",
+            how="left",
+        )
+        .with_columns(
+            pl.col(COL_OTROS_MODULOS_ADEUDADOS)
+            .fill_null(0)
+            .cast(pl.Int64)
+        )
+        .drop("_MATRICULA_NORM")
+    )
+
 def _preparar_reprobacion_docente(
     reprobacion_raw: Any,
     *,
@@ -866,7 +1142,38 @@ def _preparar_reprobacion_docente(
 
         return pd.DataFrame(), f"ℹ️ No hay registros en 'Reprobacion' para el docente **{sel_docente}**."
 
+    # Agregar únicamente la cantidad de módulos adicionales que cada
+    # estudiante adeuda con otros docentes, sin mostrar información ajena.
+    df_rep = _agregar_otros_modulos_adeudados_pl(
+        reprobacion_pl,
+        df_rep,
+        sel_plantel=sel_plantel,
+        semana_actual=semana_actual,
+    )
+
     df_rep_out = df_rep.to_pandas()
+
+    # Colocar la nueva columna inmediatamente después de MODULO para que sea
+    # visible y fácil de interpretar en la tabla.
+    col_modulo_salida = _find_col_pd(
+        df_rep_out,
+        [COL_MODULO, "Modulo", "Módulo", "MODULO"],
+    )
+
+    if (
+        col_modulo_salida
+        and COL_OTROS_MODULOS_ADEUDADOS in df_rep_out.columns
+    ):
+        columnas_salida = [
+            c for c in df_rep_out.columns
+            if c != COL_OTROS_MODULOS_ADEUDADOS
+        ]
+        posicion_modulo = columnas_salida.index(col_modulo_salida) + 1
+        columnas_salida.insert(
+            posicion_modulo,
+            COL_OTROS_MODULOS_ADEUDADOS,
+        )
+        df_rep_out = df_rep_out[columnas_salida]
 
     # No mostrar status / estatus
     df_rep_out = _drop_columns_by_norm(
