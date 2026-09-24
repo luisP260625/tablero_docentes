@@ -52,7 +52,9 @@ df_modulos = (
     .reset_index(name="modulos_nc")
 )
 
-df_modulos["categoria"] = df_modulos["modulos_nc"].apply(lambda x: str(x) if x <= 10 else "11 o más")
+df_modulos["categoria"] = df_modulos["modulos_nc"].apply(
+    lambda x: str(x) if x <= 10 else "11 o más"
+)
 
 resumen = (
     df_modulos.groupby(["Plantel", "categoria"])
@@ -73,7 +75,9 @@ if "Plantel" in df_matricula.columns:
 if "matriculaTotal" not in tabla.columns:
     tabla["matriculaTotal"] = 0
 
-tabla["matriculaTotal"] = pd.to_numeric(tabla["matriculaTotal"], errors="coerce").fillna(0)
+tabla["matriculaTotal"] = pd.to_numeric(
+    tabla["matriculaTotal"], errors="coerce"
+).fillna(0)
 
 columnas_excluir = {"Plantel", "matriculaTotal"}
 columnas_nc = [c for c in tabla.columns if c not in columnas_excluir]
@@ -113,6 +117,21 @@ try:
 except Exception as e:
     print(f"No se pudo convertir Datos: {e}")
 
+print("Leyendo hoja SemCaptura...")
+try:
+    df_semcaptura = pd.read_excel(
+        EXCEL_PATH,
+        sheet_name="SemCaptura",
+        engine=ENGINE
+    )
+    df_semcaptura.to_parquet(
+        f"{CACHE_DIR}/semcaptura.parquet",
+        index=False
+    )
+    print(f"SemCaptura convertida: {len(df_semcaptura)} filas")
+except Exception as e:
+    print(f"No se pudo convertir SemCaptura: {e}")
+
 print("Leyendo hoja Planteles...")
 try:
     df_planteles = pd.read_excel(
@@ -121,12 +140,10 @@ try:
         engine=ENGINE
     )
 
-    # Normalizar columnas problemáticas a texto
     for col in df_planteles.columns:
         if df_planteles[col].dtype == "object":
             df_planteles[col] = df_planteles[col].astype("string")
 
-    # Limpieza extra para columnas típicas de esta hoja
     for col in ["Usuario", "Plantel", "Email", "Ccp", "Permisos"]:
         if col in df_planteles.columns:
             df_planteles[col] = df_planteles[col].astype("string").str.strip()
