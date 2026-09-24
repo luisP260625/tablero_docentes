@@ -385,7 +385,7 @@ def cargar_semcaptura():
 # ==========================================================
 # REPROBACION
 # ==========================================================
-@st.cache_data(ttl=3600, show_spinner="Cargando Reprobacion...")
+@st.cache_resource(ttl=3600, show_spinner="Cargando Reprobacion...")
 def _cargar_reprobacion_cacheada(excel_mtime: float):
     """
     Carga la hoja Reprobacion.
